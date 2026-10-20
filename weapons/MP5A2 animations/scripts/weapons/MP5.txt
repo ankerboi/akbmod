@@ -1,0 +1,60 @@
+"H&k_MP5.Foley"
+{
+	"channel"		"CHAN_ITEM"
+	"volume"		"1.0"
+	"CompatibilityAttenuation"	"1.0"
+	"pitch"		"95,105"
+
+	"wave"			"weapons/H&K Mp5/MP5-Foley.wav"
+}
+
+"H&k_MP5.BoltPullBack"
+{
+	"channel"			"CHAN_ITEM"
+	"volume"			"1.0"
+	"CompatibilityAttenuation"	"1.0"
+	"pitch"				"95,105"
+
+	"wave"			"weapons/H&K MP5/MP5-Bolt_Pull_Back.wav"
+}
+
+"H&k_MP5.BoltSlap"
+{
+	"channel"			"CHAN_ITEM"
+	"volume"			"1.0"
+	"CompatibilityAttenuation"	"1.0"
+	"pitch"				"95,105"
+
+	"wave"			"weapons/H&K MP5/MP5-Bolt_Slap.wav"
+}
+
+"H&k_MP5.ClipIn"
+{
+	"channel"			"CHAN_ITEM"
+	"volume"			"1.0"
+	"CompatibilityAttenuation"	"1.0"
+	"pitch"				"95,105"
+
+	"wave"			"weapons/H&K MP5/MP5-Clip_In.wav"
+
+}
+
+"H&k_MP5.ClipOut"
+{
+	"channel"		"CHAN_ITEM"
+	"volume"		"1.0"
+	"CompatibilityAttenuation"	"1.0"
+	"pitch"		"95,105"
+
+	"wave"			"weapons/H&K MP5/MP5-Clip_Out.wav"
+}
+
+"H&K_MP5.Single"
+{
+	"channel"		"CHAN_ITEM"
+	"volume"		"1.0"
+	"CompatibilityAttenuation"	"1.0"
+	"pitch"		"95,110"
+
+	"wave"			"weapons/H&K MP5/MP5-Single.wav"
+}
