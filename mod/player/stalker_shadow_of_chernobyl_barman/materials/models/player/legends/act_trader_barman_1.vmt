@@ -1,0 +1,5 @@
+"VertexLitGeneric"
+{
+	"$basetexture" "models/player/legends/act_trader_barman_1"
+        "$bumpmap" "models/player/legends/act_trader_barman_1_n"
+}
