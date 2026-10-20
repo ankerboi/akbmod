@@ -184,7 +184,7 @@ def default_cfg():
         "weapons": [
             Wpn(n="AWP", dmg=100, rpm=45, mag=5, spr=.00035, auto=0),
             Wpn(n="AK-47", dmg=28, rpm=600, mag=30, spr=.012, auto=1),
-            Wpn(n="Knife", dmg=40, rpm=120, mag=0, spr=0, auto=1, melee=1, range=64),
+            Wpn(n="Knife", dmg=1000, rpm=120, mag=0, spr=0, auto=1, melee=1, range=64),
         ],
         "bots": 2,
         "frags": 30,
@@ -403,6 +403,24 @@ def checker_tex():
     return {"t": make_texture(a, 64, 64), "w": 64, "h": 64, "tr": False}
 
 
+def sky_sphere_list(R):
+    """Display list of a sphere seen from the inside, equirectangular UVs (panorama image)."""
+    N, M = 48, 24
+    lid = gl.glGenLists(1)
+    gl.glNewList(lid, gl.GL_COMPILE)
+    gl.glBegin(gl.GL_QUADS)
+    for j in range(M):
+        for i in range(N):
+            for di, dj in ((0, 0), (1, 0), (1, 1), (0, 1)):
+                lon = 2 * math.pi * (i + di) / N
+                lat = math.pi / 2 - math.pi * (j + dj) / M
+                gl.glTexCoord2f(1.0 - (i + di) / N, (j + dj) / M)
+                gl.glVertex3f(R * math.cos(lat) * math.cos(lon), R * math.cos(lat) * math.sin(lon), R * math.sin(lat))
+    gl.glEnd()
+    gl.glEndList()
+    return lid
+
+
 # --------------------------------------------------------------------------
 # WAD / BSP
 # --------------------------------------------------------------------------
@@ -421,6 +439,9 @@ PROBES = _fib_dirs(48)
 
 class World:
     feet_offset = 36
+
+    def draw_sky(self, x, y, z):
+        pass
 
     def draw(self):
         raise NotImplementedError
@@ -552,7 +573,8 @@ class FadMapWorld(World):
             self.B.append(v)
             col = b.get("c") or (176, 160, 144)
             self.meta.append((int(b.get("t", -1)), int(b.get("tt", b.get("t", -1)) if b.get("tt") is not None else b.get("t", -1)),
-                              float(b.get("tile", 128) or 128), tuple(col)))
+                              float(b.get("tile", 128) or 128), tuple(col),
+                              [int(v) for v in ((b.get("f") or []) + [-1] * 6)[:6]]))
         if not self.B:
             raise ValueError("the map has no boxes")
         self.spawns = [[], []]
@@ -585,6 +607,43 @@ class FadMapWorld(World):
         self._tids = None
         self._white = None
         self._list = None
+        # skybox image from the map builder (equirectangular panorama)
+        self._sky_raw = None
+        self._sky_tid = None
+        self._sky_list = None
+        sk = d.get("sky")
+        if sk:
+            try:
+                if "png" in sk:
+                    surf = pygame.image.load(io.BytesIO(base64.b64decode(sk["png"])), "x.png").convert_alpha()
+                    w, h = surf.get_size()
+                    data = pygame.image.tostring(surf, "RGBA", False)
+                else:
+                    w, h = int(sk["w"]), int(sk["h"])
+                    data = zlib.decompress(base64.b64decode(sk["raw"]))
+                self._sky_raw = (data, w, h)
+            except Exception as ex:
+                print("map skybox failed:", ex)
+
+    def draw_sky(self, x, y, z):
+        if self._sky_raw is None:
+            return
+        if self._sky_tid is None:
+            data, w, h = self._sky_raw
+            self._sky_tid = make_texture(np.frombuffer(data, np.uint8).reshape(h, w, 4), w, h)
+            self._sky_list = sky_sphere_list(5000.0)
+        gl.glUseProgram(0)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_TEXTURE_2D)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._sky_tid)
+        c = 0.30 if not FX.day else 1.0          # night maps get a dark sky
+        gl.glColor3f(c, c, c)
+        gl.glPushMatrix()
+        gl.glTranslatef(x, y, z)
+        gl.glCallList(self._sky_list)
+        gl.glPopMatrix()
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glColor4f(1, 1, 1, 1)
 
     def solid(self, x, y, z):
         for b in self.B:
@@ -642,10 +701,12 @@ class FadMapWorld(World):
             self._tids.append(make_texture(arr, w, h))
         self._list = gl.glGenLists(1)
         gl.glNewList(self._list, gl.GL_COMPILE)
-        for b, (t, tt, tile, col) in zip(self.B, self.meta):
-            for f in self._faces(b):
+        for b, (t, tt, tile, col, fo) in zip(self.B, self.meta):
+            for fi, f in enumerate(self._faces(b)):
                 n = f[4]
                 ti = tt if n[2] > .5 else t
+                if fo[fi] >= 0:
+                    ti = fo[fi]            # per-face texture from the map builder
                 tid = self._tids[ti] if 0 <= ti < len(self._tids) else None
                 gl.glBindTexture(gl.GL_TEXTURE_2D, tid or self._white)
                 sh = self._shade(n)
@@ -3824,6 +3885,7 @@ class Game:
         self.net_notice = ""
         self.net_joined = False
         self._bot_names = []
+        self.res = (RENDER_W, RENDER_H)   # resolution the game renders at (typed in Settings > Video), stretched to the window
         self.aspect = 0.0  # 0 = match the window; else forced aspect (stretched to fill); 1.0 = 1:1
         self.fullscreen = False
         self.show_fps = False
@@ -3841,6 +3903,9 @@ class Game:
         self.death_killer = "UNKNOWN"
         self.player_name = "Player"
         self.streak = 0
+        self.xp = 0              # total XP (saved in the settings file)
+        self.xp_pops = []        # floating "+100" popups
+        self.rank_flash = 0.0    # "RANK UP" banner timer
         self.xh = dict(DEFAULT_XH)   # crosshair settings
         self.vmA = {"vm": None, "w": -1, "s": 0, "t": 0.0, "loop": True}
 
@@ -4446,6 +4511,9 @@ class Game:
         v.anim = fresh_anim()
         if k.isP and v is not k:
             self.streak += 1
+            self.give_xp(XP_KNIFE if (w and w.melee) else XP_KILL, "KNIFE KILL" if (w and w.melee) else "KILL")
+            if self.streak >= 3:
+                self.give_xp(25, "STREAK x%d" % self.streak)
         if v.isP:
             self.streak = 0
             self.death_killer = k.name or "UNKNOWN"
@@ -4456,6 +4524,14 @@ class Game:
                            "v": self.net.my_id, "w": k.w})
         if self.score[k.team] >= CFG["frags"]:
             self.over = 6.0
+
+    def give_xp(self, n, label=""):
+        old = xp_info(self.xp)[0]
+        self.xp += n
+        self.xp_pops.append({"txt": "+%d" % n, "sub": label, "t": 1.6})
+        self.xp_pops = self.xp_pops[-5:]
+        if xp_info(self.xp)[0] > old:
+            self.rank_flash = 3.0
 
     def fire(self, e, extra=0.0):
         w = CFG["weapons"][e.w]
@@ -5391,6 +5467,10 @@ class Game:
             t["t"] -= dt
             if t["t"] <= 0:
                 self.tracers.remove(t)
+        for pp_ in self.xp_pops:
+            pp_["t"] -= dt
+        self.xp_pops = [pp_ for pp_ in self.xp_pops if pp_["t"] > 0]
+        self.rank_flash = max(0.0, self.rank_flash - dt)
         self.flash = max(0.0, self.flash - dt * 2.5)
         self.shake = max(0.0, self.shake - dt * SHAKE_DECAY * max(0.2, self.shake))
         cvm = CFG["weapons"][P.w].vm
@@ -5489,9 +5569,8 @@ class RenderTarget:
             gl.glBlitFramebuffer(0, 0, self.w, self.h, 0, 0, self.w, self.h, gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
         ww, wh = max(1, ww), max(1, wh)
-        sc = min(ww / self.w, wh / self.h)
-        vw, vh = self.w * sc, self.h * sc
-        vx, vy = (ww - vw) / 2, (wh - vh) / 2
+        vw, vh = ww, wh                  # stretched to fill the whole window (no black bars)
+        vx, vy = 0, 0
         self.view = (vx, vy, vw, vh)
         gl.glViewport(0, 0, ww, wh)
         gl.glDisable(gl.GL_DEPTH_TEST)
@@ -5643,6 +5722,9 @@ class Menu:
         self.room = ""        # online: room name field
         self.ip = ""          # online: direct-join field
         self.edit = None      # which online text field has focus
+        self.quit_req = False
+        self.resw = str(RENDER_W)   # video: typed resolution
+        self.resh = str(RENDER_H)
         self.pfp_path = ""    # profile picture file
         self.pfp_tex = None
         self.pfp_status = ""
@@ -5714,14 +5796,17 @@ class Menu:
                 self.bind_press(pygame.key.name(event.key))
             return True
         if self.edit:
-            lim = {"room": 28, "name": 16}.get(self.edit, 40)
+            lim = {"room": 28, "name": 16, "resw": 5, "resh": 5}.get(self.edit, 40)
             cur = getattr(self, self.edit)
             if event.key in (pygame.K_RETURN, pygame.K_ESCAPE):
+                if self.edit in ("resw", "resh") and event.key == pygame.K_RETURN:
+                    self.apply_res()
                 self.edit = None
                 save_settings(self.g, self)
             elif event.key == pygame.K_BACKSPACE:
                 setattr(self, self.edit, cur[:-1])
-            elif event.unicode and event.unicode.isprintable() and len(cur) < lim:
+            elif event.unicode and event.unicode.isprintable() and len(cur) < lim and (
+                    event.unicode.isdigit() or self.edit not in ("resw", "resh")):
                 setattr(self, self.edit, cur + event.unicode)
             return True
         if self.focus:
@@ -5743,9 +5828,9 @@ class Menu:
 
     def _draw(self, W, H):
         g, gfx = self.g, self.gfx
-        s = max(.4, min((W - 24) / 1000, (H - 24) / 600, 1.5))
-        ox, oy = (W - 1000 * s) / 2, (H - 600 * s) / 2
-        ox, oy = round(ox), round(oy)
+        s = max(.4, min(W / 1000, H / 600))      # fill the whole window: layout grows to LW x LH units
+        LW, LH = W / s, H / s
+        ox, oy = 0, 0
         self.xf = (ox, oy, s)
         gfx.set_xf(ox, oy, s)
         self.hot = []
@@ -5757,8 +5842,8 @@ class Menu:
         gl.glTranslatef(ox, oy, 0)
         gl.glScalef(s, s, 1)
 
-        gfx.rect(0, 0, 1000, 600, c255(10, 10, 10))          # content: #0a0a0a
-        gfx.rect(0, 0, 240, 600, c255(22, 22, 22))           # sidebar: #161616
+        gfx.rect(0, 0, LW, LH, c255(10, 10, 10))          # content: #0a0a0a
+        gfx.rect(0, 0, 240, LH, c255(22, 22, 22))           # sidebar: #161616
         # profile block: avatar with green rim + username
         gfx.rect(18, 16, 40, 40, c255(157, 211, 103))
         if self.pfp_tex:
@@ -5791,8 +5876,8 @@ class Menu:
         nav("Loadout", "loadout", 168)
         nav("Settings", "settings", 212)
         if g.net.active:
-            gfx.text("ONLINE: " + g.net.room[:18], 20, 552, 11, (104, 104, 104), mono=True)
-        gfx.text("FAD-MOD", 20, 574, 12, (154, 154, 154), bold=True)
+            gfx.text("ONLINE: " + g.net.room[:18], 20, LH - 48, 11, (104, 104, 104), mono=True)
+        gfx.text("FAD-MOD", 20, LH - 26, 12, (154, 154, 154), bold=True)
 
         def button(x, y, w, h, label, fn, primary=False):
             hv = hover(x, y, w, h)
@@ -5801,9 +5886,11 @@ class Menu:
             else:
                 fill = c255(42, 42, 42) if hv else c255(24, 24, 24)
             gfx.rect(x, y, w, h, fill)
-            col = (229, 57, 53) if label in ("Close room", "Leave room", "Cancel", "Remove") else (255, 255, 255)
+            col = (229, 57, 53) if label in ("Close room", "Leave room", "Cancel", "Remove", "Quit") else (255, 255, 255)
             gfx.text(label, x + w / 2, y + h / 2 - 9, 13, col, bold=True, anchor="c")
             self.hot.append((x, y, w, h, fn, None))
+
+        button(20, LH - 100, 200, 38, "Quit", lambda: setattr(self, "quit_req", True))
 
         def panel(x, y, w, h, title, sub=None):
             gfx.rect(x, y, w, h, c255(17, 17, 17))
@@ -5822,7 +5909,7 @@ class Menu:
                 setter(lo + (hi - lo) * tt)
             self.hot.append((x - 8, y, w + 16, 20, None, drag))
 
-        cx, cw = 280, 680
+        cx, cw = 280, max(680, int(LW - 320))
         if self.page == "settings":
             for i, (sub, lab) in enumerate((("controls", "Controls"), ("sounds", "Sounds"),
                                             ("viewmodel", "Viewmodel"), ("crosshair", "Crosshair"),
@@ -5915,7 +6002,7 @@ class Menu:
 
             # --- roster / room browser ---
             if net.active:
-                panel(cx, ly, cw, 578 - ly, "Players in the room")
+                panel(cx, ly, cw, LH - 22 - ly, "Players in the room")
                 rows = [(g.P.name or "You", g.P.team, True)] + [(p["n"], p["tm"], False) for p in net.players.values()]
                 for i, (nm, tm, me) in enumerate(rows[:NET_MAX_PLAYERS]):
                     xx = cx + 20 + (i % 2) * 330
@@ -5926,7 +6013,7 @@ class Menu:
                     gfx.text("BLACK" if tm == 0 else "YELLOW", xx + 308, yy + 6, 12, col, bold=True, anchor="r")
             elif not net.mode:
                 rooms = sorted(net.rooms.values(), key=lambda r: r["n"].lower())
-                panel(cx, ly, cw, 578 - ly, "Room browser", "Rooms on the internet and on your network - refreshes automatically.")
+                panel(cx, ly, cw, LH - 22 - ly, "Room browser", "Rooms on the internet and on your network - refreshes automatically.")
                 gfx.text("Room list: " + net.broker_state(), cx + cw - 20, ly + 16, 11, (119, 119, 119), anchor="r")
                 if not rooms:
                     gfx.text("No rooms found yet. Host one, or ask a friend to - rooms appear here by themselves.", cx + 20, ly + 56, 13, (130, 130, 130))
@@ -5953,7 +6040,7 @@ class Menu:
                 lines = [msg[i:i + 56] for i in range(0, min(len(msg), 168), 56)]
                 tw = max(gfx.text_w(l, 12, False, True) for l in lines) + 32
                 th = 16 + 17 * len(lines)
-                tx, ty = 960 - tw, 580 - th
+                tx, ty = LW - 40 - tw, LH - 20 - th
                 gfx.rect(tx, ty, tw, th, c255(41, 41, 41))          # toast: #292929
                 for i, l in enumerate(lines):
                     gfx.text(l, tx + 16, ty + 9 + i * 17, 12, col if bad else (255, 255, 255), mono=True)
@@ -6240,17 +6327,22 @@ class Menu:
         else:
             gfx.text("DISPLAY", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Video.", cx, 48, 34, (255, 255, 255), bold=True)
-            gfx.text("Pick a screen shape. The game is drawn in that shape, then stretched to fill your window.",
+            gfx.text("Type the resolution you want. Only the game is stretched to fill the window; menus stay normal.",
                      cx, 96, 13, (154, 154, 154))
-            panel(cx, 126, cw, 150, "Aspect ratio",
-                  "Stretched 4:3 makes players and weapons look wider, like the old stretched-res trick.")
-            opts = ((0.0, "Window"), (16 / 9, "16:9"), (16 / 10, "16:10"), (4 / 3, "4:3"), (1.0, "1:1"))
-            for i, (val, lab) in enumerate(opts):
-                bx = cx + 20 + i * 128
-                button(bx, 190, 120, 44, lab, lambda v=val: (setattr(g, "aspect", v), save_settings(g, self)),
-                       abs(g.aspect - val) < 1e-6)
-            now = "Window (default)" if not g.aspect else next((l for v, l in opts if abs(g.aspect - v) < 1e-6), "Custom")
-            gfx.text("Now: " + now, cx + 20, 248, 12, (170, 170, 170))
+            panel(cx, 126, cw, 150, "Resolution",
+                  "Smaller / narrower = stretched look (players and weapons look wider). Press Enter or Apply.")
+            for fx_, key_, lab_ in ((cx + 20, "resw", "Width"), (cx + 190, "resh", "Height")):
+                gfx.text(lab_.upper(), fx_, 172, 11, (189, 189, 189), bold=True)
+                on_ = self.edit == key_
+                gfx.box(fx_, 192, 140, 36, c255(10, 10, 10), c255(170, 170, 170) if on_ else c255(42, 42, 42))
+                val_ = getattr(self, key_)
+                gfx.text(val_ + ("|" if on_ and int(time.time() * 2) % 2 == 0 else ""), fx_ + 12, 200, 14, (255, 255, 255))
+                self.hot.append((fx_, 192, 140, 36, lambda k=key_: setattr(self, "edit", k), None))
+            gfx.text("x", cx + 172, 200, 16, (154, 154, 154), bold=True, anchor="c")
+            button(cx + 360, 192, 110, 36, "Apply", self.apply_res, True)
+            button(cx + 480, 192, 150, 36, "Reset 1280x720",
+                   lambda: (setattr(self, "resw", "1280"), setattr(self, "resh", "720"), self.apply_res()))
+            gfx.text("Now: %d x %d" % g.res, cx + 20, 248, 12, (170, 170, 170))
             panel(cx, 292, cw, 92, "Field of view",
                   "Changes how much of the world you see. The viewmodel (your weapon) stays the same.")
             gfx.text(f"{int(round(g.fov_cfg))}", cx + cw - 20, 14 + 292, 13, (255, 255, 255), bold=True, anchor="r")
@@ -6301,6 +6393,18 @@ class Menu:
         self.pfp_tex = None
         self.pfp_path = ""
         self.pfp_status = ""
+        save_settings(self.g, self)
+
+    def apply_res(self):
+        try:
+            w = int(self.resw or 0)
+            h = int(self.resh or 0)
+        except ValueError:
+            w = h = 0
+        w = max(160, min(7680, w or self.g.res[0]))
+        h = max(120, min(4320, h or self.g.res[1]))
+        self.g.res = (w, h)
+        self.resw, self.resh = str(w), str(h)
         save_settings(self.g, self)
 
     def reset_keys(self):
@@ -6621,6 +6725,7 @@ def render_scene(game, W, H):
         gl.glRotatef(P.slk * (1.2 + 2.5 * lat), 0, 0, 1)           # slight lean into the slide
     glu.gluLookAt(ex, ey, ez, ex + fx, ey + fy, ez + fz, 0, 0, 1)
 
+    game.world.draw_sky(ex, ey, ez)
     FX.begin(0)
     game.world.draw()
 
@@ -6749,6 +6854,20 @@ def spray_pattern(n):
     return up, -right   # yaw grows to the left in this game
 
 
+XP_KILL, XP_KNIFE = 100, 150
+XP_YELLOW = (255, 214, 0)
+
+
+def xp_info(xp):
+    """(rank, xp into this rank, xp needed for the next rank). Rank 1 needs 600 XP, each next one 100 more."""
+    lvl, need = 1, 600
+    while xp >= need:
+        xp -= need
+        lvl += 1
+        need += 100
+    return lvl, xp, need
+
+
 def draw_crosshair(gfx, cx, cy, xh):
     """CS:GO style crosshair: four lines with a gap, optional centre dot and black outline."""
     s, t, gap, a = xh["size"], xh["thick"], xh["gap"], xh["a"]
@@ -6787,6 +6906,7 @@ def draw_scoreboard(game, gfx, W, H):
         gfx.text(str(game.score[team]), x + colw - 10, top + 28, 22, col, bold=True, anchor="r")
         y = top + 62
         gfx.text("PLAYER", x + 10, y, 11, (154, 154, 154), bold=True)
+        gfx.text("RANK", x + colw - 120, y, 11, (154, 154, 154), bold=True, anchor="r")
         gfx.text("K", x + colw - 70, y, 11, (154, 154, 154), bold=True, anchor="r")
         gfx.text("D", x + colw - 12, y, 11, (154, 154, 154), bold=True, anchor="r")
         y += 20
@@ -6797,6 +6917,8 @@ def draw_scoreboard(game, gfx, W, H):
                 gfx.rect(x, y - 2, colw, rh - 2, (42 / 255, 42 / 255, 42 / 255, 1))
             c = (255, 193, 7) if e.isP else ((255, 255, 255) if e.alive else (130, 130, 130))
             gfx.text(e.name or "UNKNOWN", x + 10, y, 14, c, bold=bool(e.isP), mono=True)
+            if e.isP:
+                gfx.text(str(xp_info(game.xp)[0]), x + colw - 120, y, 14, (255, 214, 0), bold=True, anchor="r", mono=True)
             gfx.text(str(e.kills), x + colw - 70, y, 14, c, anchor="r", mono=True)
             gfx.text(str(e.deaths), x + colw - 12, y, 14, c, anchor="r", mono=True)
             y += rh
@@ -6829,6 +6951,19 @@ def render_hud(game, gfx, W, H, menu_visible):
         gfx.rect(W / 2 - 1, 0, 2, H, (0, 0, 0, .8))
     elif P.alive:
         draw_crosshair(gfx, W / 2, H / 2, game.xh)
+
+    # XP popups (yellow, rise and fade next to the crosshair)
+    if P.alive:
+        for i, pp_ in enumerate(reversed(game.xp_pops)):
+            a_ = min(1.0, pp_["t"] / 0.5)
+            yy_ = H / 2 + 34 + i * 24 - (1.6 - pp_["t"]) * 10
+            gfx.text(pp_["txt"], W / 2 + 28, yy_, 20, XP_YELLOW, alpha=a_, bold=True, mono=True)
+            gfx.text(pp_["sub"], W / 2 + 28 + gfx.text_w(pp_["txt"], 20, True, True) + 8, yy_ + 6, 12,
+                     (255, 240, 160), alpha=a_, bold=True)
+    lv_ = xp_info(game.xp)[0]
+    if game.rank_flash > 0:
+        gfx.text("RANK UP!", W / 2, H * 0.22, 40, XP_YELLOW, alpha=min(1.0, game.rank_flash), bold=True, anchor="c")
+        gfx.text("RANK %d" % lv_, W / 2, H * 0.22 + 46, 22, (255, 255, 255), alpha=min(1.0, game.rank_flash), bold=True, anchor="c")
 
     # score
     sc = game.score
@@ -6929,6 +7064,7 @@ def load_settings(game, menu):
             if isinstance(b.get(k), str):
                 game.binds[k] = b[k]
         game.sens = float(j.get("sens", BASE_SENS))
+        game.xp = max(0, int(j.get("xp", 0) or 0))
         game.hand_swap = bool(j.get("hand_swap", False))
         game.bots_on = bool(j.get("bots_on", True))
         aj = j.get("arms")
@@ -6948,8 +7084,11 @@ def load_settings(game, menu):
                 game.pm_saved[tk] = pmj[tk]
         game.fov_cfg = max(50.0, min(110.0, float(j.get("fov", 75.0) or 75.0)))
         game.fov = game.fov_cfg
-        ar = float(j.get("aspect", 0) or 0)
-        game.aspect = ar if 1.0 <= ar <= 2.5 else 0.0
+        game.aspect = 0.0
+        rs = j.get("res")
+        if isinstance(rs, list) and len(rs) == 2:
+            game.res = (max(160, min(7680, int(rs[0]))), max(120, min(4320, int(rs[1]))))
+        menu.resw, menu.resh = str(game.res[0]), str(game.res[1])
         game.want_fullscreen = bool(j.get("fullscreen", False))
         game.show_fps = bool(j.get("show_fps", False))
         FX.day = bool(j.get("day", False))
@@ -6994,8 +7133,8 @@ def set_fullscreen(game, on):
 def save_settings(game, menu):
     try:
         SETTINGS_FILE.write_text(json.dumps({
-            "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "hand_swap": game.hand_swap, "bots_on": game.bots_on, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "day": bool(FX.day), "aspect": game.aspect, "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "fov": game.fov_cfg, "vm_offset": game.vm_adj,
-            "shot_sound": game.custom_shot_path, "hit_sound": game.custom_hit_path, "sens": game.sens, "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh,
+            "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "hand_swap": game.hand_swap, "bots_on": game.bots_on, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "day": bool(FX.day), "res": list(game.res), "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "fov": game.fov_cfg, "vm_offset": game.vm_adj,
+            "shot_sound": game.custom_shot_path, "hit_sound": game.custom_hit_path, "sens": game.sens, "xp": int(game.xp), "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh,
         }, indent=2))
     except Exception:
         pass
@@ -7079,6 +7218,7 @@ def main():
         if not v:
             game.keys.clear()
             menu.set_page("play")
+            save_settings(game, menu)      # keeps your XP
 
     menu = Menu(game, gfx, launch, file_dialog)
     load_settings(game, menu)
@@ -7147,10 +7287,18 @@ def main():
     clock = pygame.time.Clock()
     last = time.perf_counter()
     running = True
-    rt = RenderTarget(RENDER_W, RENDER_H)
+    rt = RenderTarget(*game.res)
     while running:
         win_w, win_h = pygame.display.get_window_size()
-        W, H = (RENDER_W, RENDER_H) if rt.ok else (win_w, win_h)
+        if (rt.w, rt.h) != tuple(game.res):          # resolution changed in Settings > Video
+            old = rt
+            rt = RenderTarget(*game.res)
+            try:
+                gl.glDeleteFramebuffers(2, [old.fbo, old.res_fbo])
+                gl.glDeleteTextures([old.tex])
+            except Exception:
+                pass
+        W, H = (rt.w, rt.h) if rt.ok else (win_w, win_h)
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
@@ -7196,7 +7344,7 @@ def main():
                         P.yaw -= ev.rel[0] * sens
                         P.pitch = max(-1.5, min(1.5, P.pitch - ev.rel[1] * sens))
                 else:
-                    menu.mouse_move(rt.to_render(ev.pos) if rt.ok else ev.pos)
+                    menu.mouse_move(ev.pos)
             elif ev.type == pygame.MOUSEBUTTONDOWN:
                 if game.lock:
                     btn = ev.button
@@ -7228,7 +7376,7 @@ def main():
                     if ev.button in (6, 7) and menu.waiting:
                         menu.bind_press("Mouse" + str(ev.button - 2))
                     else:
-                        menu.mouse_down(rt.to_render(ev.pos) if rt.ok else ev.pos, ev.button)
+                        menu.mouse_down(ev.pos, ev.button)
             elif ev.type == pygame.MOUSEBUTTONUP:
                 if ev.button == 1:
                     game.keys["mouse1"] = False
@@ -7241,6 +7389,8 @@ def main():
                 else:
                     menu.wheel(ev.y)
 
+        if menu.quit_req:
+            running = False
         now = time.perf_counter()
         raw_dt = now - last
         dt = min(.05, raw_dt)
@@ -7258,12 +7408,17 @@ def main():
                 set_lock(False)
             menu.set_page("online")
 
-        if rt.ok:
-            rt.begin()
         if game.lock:
+            if rt.ok:
+                rt.begin()                      # in-game: drawn at your typed resolution, stretched later
             render_scene(game, W, H)
             render_hud(game, gfx, W, H, False)
+            if rt.ok:
+                rt.present(win_w, win_h)
         else:
+            # menu: drawn straight to the window at its real size (never stretched)
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+            W, H = win_w, win_h
             gl.glViewport(0, 0, W, H)
             gl.glClearColor(.03, .03, .03, 1)
             gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
@@ -7278,8 +7433,6 @@ def main():
             if menu.name.strip() != game.P.name and menu.name.strip():
                 game.player_name = menu.name.strip()
                 game.P.name = game.player_name
-        if rt.ok:
-            rt.present(win_w, win_h)
         pygame.display.flip()
         clock.tick()   # no FPS cap
 

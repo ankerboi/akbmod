@@ -20,8 +20,12 @@ Controls
            Shift + Up/Down = longer / shorter      Shift + Left/Right = narrower / wider
            Shift + PageUp/PageDown = taller / shorter
            Del = delete      Ctrl+D = duplicate      R = turn a spawn (Shift+R = other way)
-  Texture  "Add image" (or drop an image file on the window), then click it in the right panel.
-           Shift+click = top face only, Ctrl+click = sides only.      [ and ] = texture size
+  Skybox   "Set image" in the left panel (or drop an image on the empty sky) = skybox.
+           Use a wide panorama (2:1) for best results.
+Texture  DRAG an image file from your PC and DROP it on the face you want (that one face gets it).
+           Or "Add image", then click it in the right panel (whole selected box),
+           Shift+click = top only, Ctrl+click = sides only, or DRAG it from the panel onto a face.
+           [ and ] = texture size
   Files    Ctrl+S save project   Ctrl+O open   F5 compile   Ctrl+Z undo   Ctrl+Y redo
            G = next grid size    F = look at selection     F1 = help
 """
@@ -82,17 +86,20 @@ LW, RW, SB = 196, 236, 26           # left panel, right panel, status bar sizes
 # Map data
 # --------------------------------------------------------------------------
 class Box:
-    __slots__ = ("b", "t", "tt", "tile", "col")
+    __slots__ = ("b", "t", "tt", "tile", "col", "f")
 
-    def __init__(self, b, t=-1, tt=None, tile=128.0, col=DEFAULT_COL):
+    def __init__(self, b, t=-1, tt=None, tile=128.0, col=DEFAULT_COL, f=None):
         self.b = [float(v) for v in b]
         self.t = int(t)                          # texture of the sides + bottom (-1 = flat colour)
         self.tt = self.t if tt is None else int(tt)   # texture of the top
         self.tile = float(tile)                  # world units per texture repeat
         self.col = tuple(col)
+        # per-face texture override: [top, bottom, -y, +y, -x, +x]; -1 = use t / tt
+        f = list(f) if f else []
+        self.f = [int(v) for v in (f + [-1] * 6)[:6]]
 
     def copy(self):
-        return Box(list(self.b), self.t, self.tt, self.tile, self.col)
+        return Box(list(self.b), self.t, self.tt, self.tile, self.col, self.f)
 
     def fix(self):
         b = self.b
@@ -148,6 +155,24 @@ def make_gl_tex(data, w, h, mip=True, clamp=False):
     return tid
 
 
+def sky_sphere_list(R):
+    """Display list of a sphere seen from the inside, equirectangular UVs (panorama image)."""
+    N, M = 48, 24
+    lid = gl.glGenLists(1)
+    gl.glNewList(lid, gl.GL_COMPILE)
+    gl.glBegin(gl.GL_QUADS)
+    for j in range(M):
+        for i in range(N):
+            for di, dj in ((0, 0), (1, 0), (1, 1), (0, 1)):
+                lon = 2 * math.pi * (i + di) / N
+                lat = math.pi / 2 - math.pi * (j + dj) / M
+                gl.glTexCoord2f(1.0 - (i + di) / N, (j + dj) / M)
+                gl.glVertex3f(R * math.cos(lat) * math.cos(lon), R * math.cos(lat) * math.sin(lon), R * math.sin(lat))
+    gl.glEnd()
+    gl.glEndList()
+    return lid
+
+
 def load_image(path, max_side=1024):
     """Any image file -> opaque RGBA Surface, shrunk to max_side."""
     s = pygame.image.load(str(path))
@@ -199,6 +224,7 @@ class MapDoc:
         self.boxes = []
         self.spawns = []
         self.tex = []
+        self.sky = None
         self.path = None
         self.name = "untitled"
         self.dirty = False
@@ -216,16 +242,19 @@ class MapDoc:
 
     def to_dict(self, compiled=False, cam=None, max_side=1024):
         boxes = self.boxes
-        used = sorted({t for b in boxes for t in (b.t, b.tt) if t >= 0}) if compiled else list(range(len(self.tex)))
+        used = sorted({t for b in boxes for t in (b.t, b.tt, *b.f) if t >= 0}) if compiled else list(range(len(self.tex)))
         remap = {old: i for i, old in enumerate(used)}
         d = {
             "format": MAP_FORMAT, "version": MAP_VERSION, "name": self.name,
             "textures": [encode_tex(self.tex[i], max_side) for i in used],
             "boxes": [{"b": [round(v, 3) for v in b.b], "t": remap.get(b.t, -1), "tt": remap.get(b.tt, -1),
-                       "tile": b.tile, "c": list(b.col)} for b in boxes],
+                       "tile": b.tile, "c": list(b.col),
+                       "f": [remap.get(v, -1) for v in b.f]} for b in boxes],
             "spawns": [[{"p": [round(s.x, 2), round(s.y, 2), round(s.z, 2)], "yaw": round(s.yaw, 1)}
                         for s in self.spawns if s.team == t] for t in (0, 1)],
         }
+        if self.sky is not None:
+            d["sky"] = encode_tex(self.sky, 2048)
         if cam:
             d["cam"] = cam
         return d
@@ -234,7 +263,7 @@ class MapDoc:
         if d.get("format") != MAP_FORMAT:
             raise ValueError("not a FAD-MOD map file")
         self.tex = [decode_tex(t) for t in d.get("textures", [])]
-        self.boxes = [Box(b["b"], b.get("t", -1), b.get("tt"), b.get("tile", 128), b.get("c", DEFAULT_COL))
+        self.boxes = [Box(b["b"], b.get("t", -1), b.get("tt"), b.get("tile", 128), b.get("c", DEFAULT_COL), b.get("f"))
                       for b in d.get("boxes", [])]
         for b in self.boxes:
             b.fix()
@@ -243,6 +272,7 @@ class MapDoc:
             for s in lst:
                 p = s["p"]
                 self.spawns.append(Spawn(t, p[0], p[1], p[2], s.get("yaw", 0)))
+        self.sky = decode_tex(d["sky"]) if d.get("sky") else None
         self.name = d.get("name", "untitled")
         return d.get("cam")
 
@@ -276,7 +306,7 @@ def compile_doc(doc, out_path):
         if c[3] - c[0] < 1 or c[4] - c[1] < 1 or c[5] - c[2] < 1:
             dropped += 1
             continue
-        key = (c, b.t, b.tt, b.tile, b.col)
+        key = (c, b.t, b.tt, b.tile, b.col, tuple(b.f))
         if key in seen:
             dups += 1
             continue
@@ -337,6 +367,7 @@ def compile_doc(doc, out_path):
 
     tmp = MapDoc()
     tmp.boxes, tmp.spawns, tmp.tex, tmp.name = boxes, spawns, doc.tex, doc.name
+    tmp.sky = doc.sky
     d = tmp.to_dict(compiled=True, max_side=512)
     d["void_z"] = round(min(b[2] for b in bl) - 800.0, 1)
     d["bounds"] = [round(min(b[i] for b in bl), 1) for i in range(3)] + [round(max(b[i + 3] for b in bl), 1) for i in range(3)]
@@ -499,6 +530,8 @@ class App:
         self.doc = MapDoc()
         self.doc.new_default()
         self.undo, self.redo = [], []
+        self.sky_list = None
+        self.texdrag = None              # (texture index, key mods) while dragging a thumbnail
         self.tool = BOX
         self.gi = 2                      # grid index
         self.height = 128.0              # height of new boxes
@@ -615,7 +648,7 @@ class App:
         return o + d * t
 
     # ----- textures -----
-    def add_texture(self, path):
+    def add_texture(self, path, apply=True):
         try:
             s = load_image(path)
         except Exception as ex:
@@ -625,9 +658,55 @@ class App:
         t.upload()
         self.doc.tex.append(t)
         self.cur_tex = len(self.doc.tex) - 1
-        self.apply_texture(self.cur_tex, 0)
+        if apply:
+            self.apply_texture(self.cur_tex, 0)
         self.msg("Added texture %s" % t.name)
         return self.cur_tex
+
+    def set_sky(self, path):
+        try:
+            surf = load_image(path, 2048)
+        except Exception as ex:
+            self.msg("Cannot read that image: %s" % str(ex)[:60])
+            return
+        if self.doc.sky is not None and self.doc.sky.gid:
+            gl.glDeleteTextures([self.doc.sky.gid])
+        t = Tex(Path(path).name, surf)
+        t.upload()
+        self.doc.sky = t
+        self.doc.dirty = True
+        self.msg("Skybox: %s" % t.name)
+
+    def clear_sky(self):
+        if self.doc.sky is not None:
+            if self.doc.sky.gid:
+                gl.glDeleteTextures([self.doc.sky.gid])
+            self.doc.sky = None
+            self.doc.dirty = True
+            self.msg("Skybox removed")
+
+    def pick_sky(self):
+        p = ask_open(IMG_KINDS, "Skybox image")
+        if p:
+            self.set_sky(p)
+        elif _tk_dialog(lambda fd: True) is None:
+            self.msg("No file dialog here: drop an image on the empty sky instead.")
+
+    def draw_sky(self):
+        sky = self.doc.sky
+        if sky is None or not sky.gid:
+            return
+        if self.sky_list is None:
+            self.sky_list = sky_sphere_list(2000.0)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_TEXTURE_2D)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, sky.gid)
+        gl.glColor3f(1, 1, 1)
+        gl.glPushMatrix()
+        gl.glTranslatef(float(self.cam[0]), float(self.cam[1]), float(self.cam[2]))
+        gl.glCallList(self.sky_list)
+        gl.glPopMatrix()
+        gl.glEnable(gl.GL_DEPTH_TEST)
 
     def apply_texture(self, ti, mods=0):
         """Make ti the current texture; if a box is selected, put it on that box (shift = top only, ctrl = sides only)."""
@@ -641,7 +720,30 @@ class App:
                 obj.t = ti
             else:
                 obj.t = obj.tt = ti
+                obj.f = [-1] * 6
             self.dirty_list = True
+
+    FACE_OF = {(0, 0, 1): 0, (0, 0, -1): 1, (0, -1, 0): 2, (0, 1, 0): 3, (-1, 0, 0): 4, (1, 0, 0): 5}
+    FACE_NAMES = ("top", "bottom", "front", "back", "left", "right")
+
+    def texture_face_at(self, ti, pos):
+        """Put texture ti on the single box face under screen position pos. Returns True if a face was hit."""
+        if ti < 0 or not self.in_view(pos):
+            return False
+        hit, o, d = self.pick_all(pos, False)
+        if not hit or hit[1] != "box":
+            return False
+        fi = self.FACE_OF.get(tuple(hit[3]))
+        if fi is None:
+            return False
+        self.push_undo()
+        box = self.doc.boxes[hit[2]]
+        box.f[fi] = ti
+        self.sel = ("box", hit[2])
+        self.cur_tex = ti
+        self.dirty_list = True
+        self.msg("Textured the %s face of box %d" % (self.FACE_NAMES[fi], hit[2] + 1))
+        return True
 
     # ----- editing -----
     def new_box(self, b):
@@ -766,7 +868,7 @@ class App:
         pygame.display.set_caption("FAD-MOD Map Builder - %s%s" % (self.doc.name, "*" if self.doc.dirty else ""))
 
     def new_map(self):
-        for t in self.doc.tex:
+        for t in self.doc.tex + ([self.doc.sky] if self.doc.sky else []):
             if t.gid:
                 gl.glDeleteTextures([t.gid])
         self.doc = MapDoc()
@@ -805,10 +907,10 @@ class App:
         except Exception as ex:
             self.msg("Cannot open: %s" % str(ex)[:70])
             return
-        for t in self.doc.tex:
+        for t in self.doc.tex + ([self.doc.sky] if self.doc.sky else []):
             if t.gid:
                 gl.glDeleteTextures([t.gid])
-        for t in doc.tex:
+        for t in doc.tex + ([doc.sky] if doc.sky else []):
             t.upload()
         doc.path = path if str(path).endswith(".fadproj") else None
         doc.name = Path(path).stem
@@ -854,7 +956,15 @@ class App:
             if p.lower().endswith((".fadproj", ".fadmap")):
                 self.open_project(p)
             else:
-                self.add_texture(p)
+                pos = getattr(ev, "pos", None)
+                if not pos:
+                    pos = pygame.mouse.get_pos()
+                if self.in_view(pos) and self.pick_all(pos, False)[0] is None:
+                    self.set_sky(p)          # dropped on the empty sky
+                    return
+                ti = self.add_texture(p, apply=False)
+                if ti >= 0 and not self.texture_face_at(ti, pos):
+                    self.msg("Added %s. Drop an image right on a box face to texture just that face." % self.doc.tex[ti].name, 6)
         elif t == pygame.KEYDOWN:
             self.on_key(ev)
         elif t == pygame.MOUSEMOTION:
@@ -996,6 +1106,10 @@ class App:
             else:
                 self.msg("Click on a floor (top of a box) to place a spawn point")
 
+    def start_texdrag(self, ti):
+        self.cur_tex = ti
+        self.texdrag = (ti, pygame.key.get_mods())
+
     def place_plane(self, pos):
         hit, o, d = self.pick_all(pos, False)
         if not hit:
@@ -1008,6 +1122,14 @@ class App:
         return float(snap(p[2], self.grid))
 
     def on_up(self, ev):
+        if ev.button == 1 and self.texdrag:
+            ti, mods = self.texdrag
+            self.texdrag = None
+            if self.in_view(ev.pos):
+                self.texture_face_at(ti, ev.pos)       # dragged onto a face
+            else:
+                self.apply_texture(ti, mods)           # plain click on the thumbnail
+            return
         if ev.button == 3 and self.look:
             self.look = False
             try:
@@ -1124,9 +1246,11 @@ class App:
         gl.glNewList(self.list_id, gl.GL_COMPILE)
         gl.glEnable(gl.GL_TEXTURE_2D)
         for b in self.doc.boxes:
-            for f in box_faces(b.b):
+            for fi, f in enumerate(box_faces(b.b)):
                 n = f[4]
                 ti = b.tt if n[2] > .5 else b.t
+                if b.f[fi] >= 0:
+                    ti = b.f[fi]
                 tex = self.doc.tex[ti] if 0 <= ti < len(self.doc.tex) else None
                 gl.glBindTexture(gl.GL_TEXTURE_2D, tex.gid if tex else self.white)
                 s = shade(n)
@@ -1224,6 +1348,7 @@ class App:
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
         self.set_camera()
+        self.draw_sky()
         if self.dirty_list or self.list_id is None:
             self.build_list()
         gl.glEnable(gl.GL_TEXTURE_2D)
@@ -1416,6 +1541,15 @@ class App:
         self.text(str(int(tv)), x + 34 + (LW - 24 - 68) / 2, y + 5, 14, (255, 255, 255), "c")
         self.button(x + LW - 24 - 34, y, 34, 26, "+", lambda: self.step_tile(1))
         y += 40
+        self.text("SKYBOX", x, y, 11, (130, 140, 155))
+        y += 18
+        sbw = (LW - 36) // 2
+        self.button(x, y, sbw, 26, "Set image", self.pick_sky)
+        self.button(x + sbw + 12, y, sbw, 26, "Clear", self.clear_sky)
+        y += 30
+        sk = self.doc.sky.name if self.doc.sky else "none"
+        self.text(sk[:24], x, y, 11, (150, 160, 175))
+        y += 26
         self.text("F1 = help", x, y, 12, (130, 140, 155))
         # ---- right panel: textures ----
         rx = W - RW + 10
@@ -1449,7 +1583,7 @@ class App:
             self.outline(cx, cy, th, th, (1, 0.85, 0.1, 1) if sel else (0.3, 0.33, 0.4, 1), 3.0 if sel else 1.0)
             self.text(nm[:11] + ("." if len(nm) > 11 else ""), cx, cy + th + 2, 11, (170, 178, 190))
             if top <= self.mouse[1] < bot:
-                self.hot.append((cx, max(cy, top), th, min(th, bot - cy), lambda ti=ti: self.apply_texture(ti, pygame.key.get_mods())))
+                self.hot.append((cx, max(cy, top), th, min(th, bot - cy), lambda ti=ti: self.start_texdrag(ti)))
         gl.glDisable(gl.GL_SCISSOR_TEST)
         # ---- right panel: selection info ----
         py = H - SB - 180
@@ -1472,8 +1606,8 @@ class App:
             self.text("sides  " + tn(obj.t), rx, py + 62, 12, (190, 198, 210))
             self.text("top    " + tn(obj.tt), rx, py + 80, 12, (190, 198, 210))
             self.text("tile   %d" % obj.tile, rx, py + 98, 12, (190, 198, 210))
-            self.text("Shift+click texture = top", rx, py + 120, 11, (120, 128, 140))
-            self.text("Ctrl+click texture = sides", rx, py + 135, 11, (120, 128, 140))
+            self.text("Drop / drag an image on a face", rx, py + 120, 11, (120, 128, 140))
+            self.text("= texture just that face", rx, py + 135, 11, (120, 128, 140))
         else:
             self.text("%s spawn" % TEAM_NAMES[obj.team], rx, py, 14, (*[int(c * 255) for c in TEAM_COL[obj.team]],))
             self.text("at  %d, %d, %d" % (obj.x, obj.y, obj.z), rx, py + 22, 13)
@@ -1487,6 +1621,12 @@ class App:
         self.text(info, 10, H - SB + 5, 13, (170, 178, 190))
         if self.msgs:
             self.text(self.msgs[-1][0][:170], W - 10, H - SB + 5, 13, (255, 220, 120), "r")
+        if self.texdrag and self.texdrag[0] >= 0:
+            t_ = self.doc.tex[self.texdrag[0]]
+            gl.glEnable(gl.GL_TEXTURE_2D)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, t_.gid)
+            gl.glColor4f(1, 1, 1, 0.8)
+            self.quad(self.mouse[0] + 8, self.mouse[1] + 8, 48, 48)
         # crosshair hint while flying
         if self.look:
             self.rect(self.W / 2 - 1, self.H / 2 - 8, 2, 16, (1, 1, 1, 0.6))
