@@ -117,7 +117,7 @@ DEFAULT_BINDS = {
     "forward": "w", "backward": "s", "left": "a", "right": "d",
     "jump": "space", "slide": "c", "reload": "r",
     "weapon1": "1", "weapon2": "2", "weapon3": "3",
-    "swaphand": "v", "crouch": "left ctrl",
+    "swaphand": "v", "crouch": "left ctrl", "melee": "e",
 }
 DEFAULT_XH = {"size": 6, "thick": 2, "gap": 3, "dot": 0, "outline": 1, "r": 0, "g": 255, "b": 0, "a": 1.0}
 BIND_META = [
@@ -126,7 +126,7 @@ BIND_META = [
     ("jump", "Jump"), ("slide", "Slide"), ("reload", "Reload"),
     ("weapon1", "Weapon slot 1"), ("weapon2", "Weapon slot 2"),
     ("weapon3", "Weapon slot 3"), ("swaphand", "Switch hand"),
-    ("crouch", "Crouch"),
+    ("crouch", "Crouch"), ("melee", "Melee attack"),
 ]
 BASE_SENS = 0.0022
 STEP_H = 18  # max step / slope rise per move
@@ -138,7 +138,7 @@ VM_NEAR, VM_FAR = 0.1, 1000.0  # viewmodel clip planes
 
 SKIP_TEX = re.compile(r"^(sky|aaatrigger|clip|null|origin|hint|skip|trigger|bevel|noclip|black_hidden)")
 
-WJR, WJH, WJV, WJMAX = 16, 260, 290, 3
+WJR, WJH, WJV, WJMAX = 16, 260, 210, 3   # WJV = wall-jump upward speed (was 290; normal jump is 270)
 TICK = 1 / 64
 
 # CS 1.6 style player animation tuning --------------------------------------
@@ -153,6 +153,62 @@ VM_LAND = 1.0         # gun dip when landing (was 2.2)
 VM_IDLE_ANIM = False    # False = the weapon holds a still pose when you stand still; its animation only plays while you move. True = always play the idle animation
 SHAKE = 0.6            # screen shake when you shoot: 0 = off, 0.3 = light, 0.6 = medium, 1 = strong
 SHAKE_DECAY = 7.0      # how fast the shake dies down (higher = shorter)
+# weapon held by other players / bots (the weapon model only, no arms) ------------
+HELD_WPN = True                     # False = players / bots hold nothing visible
+HELD_WPN_ANCHOR = (0.28, 0.50, 0.40)   # point of the gun held by the RIGHT hand (fractions of its length / width / height): the grip
+HELD_WPN_FORE = (0.62, 0.50, 0.55)     # point of the gun held by the LEFT hand: the foregrip / handguard
+HELD_WPN_LEVEL = 0.0                   # 0..1: how level the gun is kept (0 = muzzle follows the hands exactly, 1 = perfectly level)
+HELD_KNIFE_ANCHOR = (0.15, 0.50, 0.50) # point of the knife inside the fist. Low x = the hand holds the back end, so the whole knife points out in front
+HELD_KNIFE_FLIP = False                # True = turn the knife around (use if the blade points back at the body instead of out in front)
+HELD_KNIFE_REACH = 17.0                # how far in front of the chest the knife hand is held (was 10)
+HELD_KNIFE_SIDE = 8.0                  # how far out to the right (was 6)
+HELD_KNIFE_DROP = 6.0                  # how far below the chest (was 8)
+# Per-weapon hand positions on the gun, matched on the weapon name (first match wins):
+#   (name regex, right-hand point, left-hand point), each = (along the gun 0..1 from the butt, across, height 0..1 from the bottom)
+# The arms are posed to reach exactly these two points, so move a hand by editing its numbers here.
+HELD_ANCHORS = [
+    (r"awp|scout|sniper", (0.24, 0.50, 0.28), (0.39, 0.50, 0.34)),   # hands on the stock (grip + forestock)
+    (r"(^|[^a-z])ak",     (0.28, 0.50, 0.40), (0.42, 0.50, 0.29)),   # left hand lower, under the handguard
+]
+HELD_WPN_OFS = (0.0, 0.0, 0.0)         # extra shift of the gun in the hand: forward, left, up (game units)
+ANIM_HZ = 60           # player / bot model animation rate at ANY distance (was 50 / 30 / 15 by distance)
+ANIM_STEP = 1.0 / ANIM_HZ
+
+# L4D2 style melee shove (E key) ---------------------------------------------
+SHOVE_TIME = 0.55      # total length of the shove animation + cooldown (seconds)
+SHOVE_HIT_AT = 0.28    # fraction of the animation where the hit lands (the strike peak)
+SHOVE_RANGE = 78.0     # reach in game units
+SHOVE_ARC = 55.0       # half-angle of the hit cone (degrees) - hits everything inside it, like L4D2
+SHOVE_DMG = 50         # damage to enemies hit (100 HP = dies in 2 shoves)
+SHOVE_STAGGER = 0.9    # seconds a hit bot is stunned (can't shoot)
+SHOVE_SHAKE = 0.4      # screen shake on impact
+SHOVE_ROT = 1          # if the gun swings the wrong way (up/down or left/right), flip to -1
+SHOVE_BODY = True      # other players / bots see a two-hand push when you shove (False = off)
+SHOVE_BODY_LEAN = 0.10 # how far the body leans into the strike (radians at the peak)
+SHOVE_BODY_SCALE = 3.0 # size of the gun swing seen on other players (first person values x this)
+# (fwd, left, up, yaw, pitch-up, roll) keyframes: p = 0..1 through the animation
+SHOVE_KEYS = [
+    (0.00,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0),
+    (0.14, -2.2, -1.2, -0.6, -14.0,  20.0,  12.0),   # wind-up: pull the gun back to the hip, muzzle up
+    (0.28,  3.2,  1.4,  0.2,  16.0,  -8.0, -14.0),   # strike: gun thrust forward and swept across
+    (0.38,  3.6,  1.6,  0.3,  18.0,  -9.0, -15.0),   # impact hold
+    (0.70,  0.8,  0.3,  0.0,   4.0,  -2.0,  -3.0),   # drag back
+    (1.00,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0),
+]
+
+
+def shove_pose(p):
+    """Interpolated (fwd, left, up, yaw, pitch_up, roll) of the shove at progress p (0..1)."""
+    p = max(0.0, min(1.0, p))
+    k = SHOVE_KEYS
+    for a, b in zip(k, k[1:]):
+        if p <= b[0]:
+            t = (p - a[0]) / max(1e-6, b[0] - a[0])
+            t = t * t * (3 - 2 * t)
+            return tuple(a[i] + (b[i] - a[i]) * t for i in range(1, 7))
+    return tuple(k[-1][1:])
+
+
 MAXS, FRIC, STOPS, ACC, AIRACC, AIRCAP, JUMPV, BHCAP = 250, 5.2, 80, 5.5, 12, 30, 270, 1.1
 
 DEATH_RX = re.compile(r"^(death|die|dead|crouch_?die|head$|gutshot|forward$|back$|left$|right$)", re.I)
@@ -1514,7 +1570,7 @@ class DirSrcFiles:
         self.files = {}
         for r in self.roots:
             try:
-                subs = [c for c in r.iterdir() if c.is_dir() and c.name.lower() in ("models", "materials")]
+                subs = [c for c in r.iterdir() if c.is_dir() and c.name.lower() in ("models", "materials", "sound")]
             except Exception:
                 subs = []
             for sub in subs:
@@ -1567,7 +1623,7 @@ class ZipSrcFiles:
             if i.is_dir():
                 continue
             nm = i.filename.replace("\\", "/").lower()
-            m = re.search(r"(^|/)(models|materials)/", nm)
+            m = re.search(r"(^|/)(models|materials|sound)/", nm)
             key = nm[m.start() + (1 if m.group(1) else 0):] if m else nm
             self.files[key] = i.file_size
             self._info[key] = i
@@ -1731,7 +1787,12 @@ class SrcData:
         self.parts = []
         for p in srcm.parts:
             tri = np.ascontiguousarray(p["tri"], np.uint32)
-            self.parts.append({"idx": tri, "mat": self._material(p["mat"])})
+            try:
+                _tn = srcm.tex_names[srcm.skin[p["mat"]]]
+            except Exception:
+                _tn = ""
+            _arm = bool(re.search(r"(?<![a-z])(hands?|sleeves?|gloves?|fingers?|palms?|arms?)(?![a-z])|_arms?$", _tn, re.I))
+            self.parts.append({"idx": tri, "mat": self._material(p["mat"]), "arm": _arm})
         # CS:S style view-models have the hands built in: no separate arms model then
         # (whole words only: a "handguard" / "handle" texture is part of the gun, not a hand)
         self.has_hands = (any(re.search(r"(?<![a-z])(hands?|sleeves?|gloves?|fingers?|palms?)(?![a-z])|^arms?$|_arms?$", t, re.I)
@@ -1890,6 +1951,8 @@ class SrcInst:
                         bad=r"last|empty|dry|miss|alt|secondary|zoom")
         if kind == "slash":
             return pick(r"^midslash", r"slash", r"stab_?miss", r"^stab", r"swing", bad=r"back")
+        if kind == "shove":     # L4D2 shove / melee sequence, when the model has one
+            return pick(r"shov", r"^melee", r"melee|bash|butt|push|bayonet", bad=r"back|knife_|miss_")[:1]
         if kind == "reload":
             if self.want_empty:
                 hit = pick(r"^reload_?empty", r"^reload")
@@ -2036,13 +2099,29 @@ class SrcInst:
         gl.glDisableClientState(gl.GL_TEXTURE_COORD_ARRAY)
         gl.glDisableClientState(gl.GL_VERTEX_ARRAY)
 
+    def draw_world(self):
+        """The weapon alone (no arms pack, no built-in hands): what a player / bot holds."""
+        if self.vtx is None:
+            return
+        gl.glEnableClientState(gl.GL_VERTEX_ARRAY)
+        gl.glEnableClientState(gl.GL_TEXTURE_COORD_ARRAY)
+        try:
+            self._draw_set(self.d, self.vtx, True)
+        finally:
+            gl.glDisable(gl.GL_ALPHA_TEST)
+        tex2d(True)
+        gl.glDisableClientState(gl.GL_TEXTURE_COORD_ARRAY)
+        gl.glDisableClientState(gl.GL_VERTEX_ARRAY)
+
     @staticmethod
-    def _draw_set(data, v):
+    def _draw_set(data, v, skip_arm=False):
         gl.glVertexPointer(3, gl.GL_FLOAT, 0, v)
         gl.glTexCoordPointer(2, gl.GL_FLOAT, 0, data.uv)
         gl.glColor4f(1, 1, 1, 1)
         order = sorted(data.parts, key=lambda p: (p["mat"]["add"] or p["mat"]["blend"]))
         for p in order:
+            if skip_arm and p.get("arm"):
+                continue
             mt = p["mat"]
             if mt["t"]:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, mt["t"])
@@ -2230,6 +2309,7 @@ class SrcPlayerInst:
                 self._seg = (t_, c_)
                 self.leg = t_ + c_
         self.vtx = None
+        self.grip_g = None      # (right-hand pos, forward, left, up) in game axes, set by _solve
         self._key = None
         self.rest_min = float(m.v_pos[:, 2].min())
         self._skin_rest()
@@ -2323,7 +2403,7 @@ class SrcPlayerInst:
         """(hip, knee, ankle) for one leg; the ankle keeps the foot about flat unless p is given."""
         return (a, k, -0.12 * (a - k) if p is None else p)
 
-    def animate(self, dt, state, spd=0.0, pitch=0.0, kick=0.0, vz=0.0, melee=False, reload=None):
+    def animate(self, dt, state, spd=0.0, pitch=0.0, kick=0.0, vz=0.0, melee=False, reload=None, hold=None, shove=None):
         """state: idle | run | crouch | slide | jump.  spd = ground speed, vz = vertical speed,
         kick = 0..1 shot pulse (recoil for guns, slash for a knife), reload = None or 0..1 progress.
         Every pose weight is smoothed, so walking into a crouch, a jump or a slide never pops."""
@@ -2397,25 +2477,34 @@ class SrcPlayerInst:
         arm_drop = 0.5 * run * g * ground * (0.5 + 0.5 * math.cos(2.0 * p)) + 0.3 * sl
         squat = max(cw, 0.6 * sl)
         rl = None if reload is None else max(0.0, min(1.0, float(reload)))
+        # shove: 0..1 progress of the push. Body leans back to wind up, then into the push, then recovers.
+        if shove is not None:
+            sp_ = max(0.0, min(1.0, float(shove)))
+            _push = shove_pose(sp_)[0] / 3.6              # forward thrust, 0..1 at the strike
+            lean += SHOVE_BODY_LEAN * _push
+            twist += 0.12 * shove_pose(sp_)[3] / 20.0
+            shove = round(sp_, 3)
         # ---- skip the solve if nothing visible changed ----
         flat = [x for lg in legs for x in lg]
         key = tuple(round(x, 3) for x in flat + [lean, twist, hip_yaw, pitch, S["k"], air, arm_drop, squat,
-                                                  -1.0 if rl is None else rl]) + (bool(melee),)
+                                                  -1.0 if rl is None else rl]) + (bool(melee), shove, None if hold is None else (round(hold[0], 2), round(hold[1], 2)))
         self._snap = (legs, lean)
         if key == self._key:
             return
         self._key = key
         self._solve(legs, lean, twist, pitch, S["k"], rl, melee, ground=True, hip_yaw=hip_yaw,
-                    air_arms=air * (1.0 - sl), arm_drop=arm_drop, squat=squat)
+                    air_arms=air * (1.0 - sl), arm_drop=arm_drop, squat=squat, hold=hold, shove=shove)
 
     # ---- core solver ----
     def _solve(self, legs, lean, twist, pitch, kick, reload, melee, ground=True, root=None, extra=None,
-               hip_yaw=0.0, air_arms=0.0, arm_drop=0.0, squat=0.0, ik=None, arm_local=None):
+               hip_yaw=0.0, air_arms=0.0, arm_drop=0.0, squat=0.0, ik=None, arm_local=None, hold=None, shove=None):
         m, ix, Wp = self.m, self.ix, self.Wp
         nb = m.nb
         F, L, U = self.F, self.L, self.U
         I3 = self._I3
         E = {}
+        self.grip_g = None
+        _grip = None
         # spine: lean + share of the aim pitch + twist (the hips' own yaw is counter-rotated so the shoulders stay square)
         sp = self.spine
         w = np.array([1.0, 1.2, 1.5, 1.5][-len(sp):] if len(sp) <= 4 else [1.0] * len(sp))
@@ -2489,17 +2578,35 @@ class SrcPlayerInst:
                     if melee:
                         s_ = 1.0 - max(0.0, min(1.0, kick))          # 0 at the start of a slash .. 1 at the end
                         sw = math.sin(s_ * math.pi) if kick > 0 else 0.0
-                        Tr = C + Fa * (10 + 8 * sw) - La * (6 - 9 * s_ * (kick > 0)) - Ua * (8 - 8 * sw)
+                        Tr = C + Fa * (HELD_KNIFE_REACH + 8 * sw) - La * (HELD_KNIFE_SIDE - 9 * s_ * (kick > 0)) - Ua * (HELD_KNIFE_DROP - 8 * sw)
                         Tl = C + Fa * 4 + La * 5 - Ua * 17
                     else:
-                        Tr = C + Fa * (8.0 - back) - La * 3.0 - Ua * (12.0 - up)
-                        Tl = C + Fa * (21.0 - back) + La * 1.0 - Ua * (7.0 - up)
+                        if hold is not None:
+                            # hands go exactly where the held gun wants them: right hand on the grip,
+                            # left hand on the foregrip (hold = forward / up distance between the two hands)
+                            sep = max(4.0, min(float(hold[0]), 26.0))
+                            Tr = C + Fa * (max(1.0, 21.0 - sep) - back) - La * 3.0 - Ua * (12.0 - up)
+                            Tl = Tr + Fa * sep + Ua * float(hold[1])
+                        else:
+                            Tr = C + Fa * (8.0 - back) - La * 3.0 - Ua * (12.0 - up)
+                            Tl = C + Fa * (21.0 - back) + La * 1.0 - Ua * (7.0 - up)
                         if reload is not None:
                             down = _sstep(0.0, 0.22, reload) - _sstep(0.68, 0.92, reload)
                             slap = 1.5 * math.sin(max(0.0, min(1.0, (reload - 0.4) / 0.2)) * math.pi)
                             pouch = C + Fa * 6 + La * 5 - Ua * (19.0 + slap)
                             Tl = Tl + (pouch - Tl) * down
                             Tr = Tr + (C + Fa * 7 - La * 3 - Ua * 14 - Tr) * down * 0.5
+                    if shove is not None:
+                        # same motion as the first person shove: gun pulled back to the hip, thrust forward and
+                        # swept across, held, then dragged back. Both hands move with the gun.
+                        sf, sl, su, syaw, spit, _sr = shove_pose(float(shove))
+                        k_ = SHOVE_BODY_SCALE
+                        off = Fa * (sf * k_) + La * (sl * k_) + Ua * (su * k_)
+                        Tr = Tr + off
+                        Tl = Tl + off
+                        sep_ = max(4.0, min(float(hold[0]), 26.0)) if hold is not None else 13.0
+                        Tl = Tl + La * (sep_ * math.sin(math.radians(syaw * SHOVE_ROT)))
+                        Tl = Tl + Ua * (sep_ * math.sin(math.radians(spit * SHOVE_ROT)))
                     if air_arms > 0:                                  # arms lift and open for balance
                         Tr = Tr + U * (3.5 * air_arms) - La * (3.0 * air_arms)
                         Tl = Tl + U * (3.5 * air_arms) + La * (3.0 * air_arms)
@@ -2507,6 +2614,9 @@ class SrcPlayerInst:
                         Tr = Tr - U * (2.5 * arm_drop)
                         Tl = Tl - U * (2.5 * arm_drop)
                     T = Tl if left else Tr
+                    if not left:
+                        _grip = (np.array(Tr, np.float64), np.array(Fa), np.array(La), np.array(Ua),
+                                 np.array(Tl, np.float64), bool((not melee) and reload is None))
                     pole = -Ua * 1.0 + (La if left else -La) * 0.55
                 fa = l_fa if left else r_fa
                 Dua, Dfa = self._arm(i, fa, Dp, Pn[i], T, pole)
@@ -2522,6 +2632,10 @@ class SrcPlayerInst:
                 mf = 0.5 * (Pn[ix["l_foot"]] + Pn[ix["r_foot"]])
                 rmf = 0.5 * (Wp[ix["l_foot"]] + Wp[ix["r_foot"]])
                 shift = shift - F * float(np.dot(mf - rmf, F)) * min(1.0, squat) * 0.9
+        if _grip is not None:
+            Rg = self.Rg
+            self.grip_g = (Rg @ (_grip[0] + shift), Rg @ _grip[1], Rg @ _grip[2], Rg @ _grip[3],
+                           Rg @ (_grip[4] + shift), _grip[5])
         self._skin(D, Pn, shift)
 
     def _skin_rest(self):
@@ -2953,8 +3067,8 @@ NET_GAME_PORT = 27778          # preferred UDP game port (any free one is used i
 NET_MAGIC = "AKBARENA2"
 NET_PROTO = 2
 NET_MAX_PLAYERS = 6
-NET_STATE_HZ = 25
-NET_DROPPABLE = ("st", "shot")  # sent without resend, newest state wins
+NET_STATE_HZ = 40      # how often your position is sent online (was 25)
+NET_DROPPABLE = ("st", "shot", "shove")  # sent without resend, newest state wins
 
 BROKER_ROOT = "akbarena-v2"
 BROKER_HOSTS = ("broker.hivemq.com", "broker.emqx.io", "test.mosquitto.org")   # free, no account, tried in order
@@ -3420,7 +3534,7 @@ class Net:
         self.pub = xor or mapped
         if self.pub and self.mode == "host":
             self.t_ann = 0.0
-            self.status = "Hosting '%s' - friends can join from the room browser, no port forwarding needed." % self.room
+            self.status = "Hosting '%s' - friends can join from the server browser, no port forwarding needed." % self.room
 
     # ----- sockets -----
     def _open_udp(self, port=0, tries=1):
@@ -3484,7 +3598,7 @@ class Net:
         self.start_discovery()
         sock = self._open_udp(NET_GAME_PORT, 20)
         if sock is None:
-            self.status = "Could not open a network port for the room."
+            self.status = "Could not open a network port for the server."
             return False
         self.sock = sock
         self.port = sock.getsockname()[1]
@@ -3544,7 +3658,7 @@ class Net:
         self.conn = UConn(sock, cands)
         self.conn.send({"t": "hello", "g": NET_MAGIC, "v": NET_PROTO, "n": pname, "map": map_sig,
                         "cid": self.cid})
-        self.status = "Connecting to the room ..."
+        self.status = "Connecting to the server ..."
         return True
 
     def leave(self, status=None):
@@ -3671,7 +3785,7 @@ class Net:
                 if m.get("v") != NET_PROTO or m.get("g") != NET_MAGIC:
                     why = "Game version mismatch."
                 elif len(self.peers) + 1 >= NET_MAX_PLAYERS:
-                    why = "Room is full."
+                    why = "Server is full."
                 elif m.get("map") != self.map_sig:
                     why = f"Different map. The host uses '{self.map_sig}', you have '{m.get('map')}'. Load the same map first."
                 if why:
@@ -3752,7 +3866,7 @@ class Net:
                 msgs.append({"t": "failed"})
                 return
         if self.mode == "joining" and (c.dead or now - self.join_t0 > 12.0):
-            self.leave("Could not reach the room. The host may have left, or one of your networks "
+            self.leave("Could not reach the server. The host may have left, or one of your networks "
                        "blocks direct connections (try another network or hotspot).")
             msgs.append({"t": "failed"})
 
@@ -3832,6 +3946,9 @@ class Ent:
         self.steep = False  # touching a too-steep slope (you just slide down it)
         self.shootT = 0.0
         self.reloadT = 0.0
+        self.shoveT = 0.0       # seconds left in the melee shove (0 = not shoving)
+        self.shoveD = SHOVE_TIME
+        self.shoveHit = True    # False until the hit of this shove has landed
         self.remote = False     # online player driven by network state
         self.nid = -1
         self.tx = self.ty = self.tz = None
@@ -3867,6 +3984,7 @@ class Game:
         self.pm_cache = {}
         self._new_pl = 0
         self.vm_msg = ""
+        self.shove_seq = False   # True when the weapon model has its own shove / melee sequence
         self.world = None
         self.ents = []
         self.P = None
@@ -3905,6 +4023,8 @@ class Game:
         self.streak = 0
         self.xp = 0              # total XP (saved in the settings file)
         self.xp_pops = []        # floating "+100" popups
+        self.hm = 0.0            # hit marker timer (CoD style X at the crosshair)
+        self.hm_kill = False     # red marker when the hit was a kill
         self.rank_flash = 0.0    # "RANK UP" banner timer
         self.xh = dict(DEFAULT_XH)   # crosshair settings
         self.vmA = {"vm": None, "w": -1, "s": 0, "t": 0.0, "loop": True}
@@ -3980,6 +4100,8 @@ class Game:
         e.anim = fresh_anim()
         e.shootT = 0.0
         e.reloadT = 0.0
+        e.shoveT = 0.0
+        e.shoveHit = True
 
     def reset_game(self):
         self.ents = []
@@ -4127,6 +4249,12 @@ class Game:
                     snd = self.custom_shot
                 if g > .004:
                     self.audio.play(g, snd, pan)
+        elif t == "shove":
+            e = self.remotes.get(f)
+            if e and e.alive:
+                e.shoveD = max(0.2, min(1.5, float(m.get("d", SHOVE_TIME))))
+                e.shoveT = e.shoveD
+                e.shoveHit = True            # the damage is sent by the shover; this is only the look
         elif t == "hit":
             P = self.P
             if P.alive and not self.over:
@@ -4535,7 +4663,7 @@ class Game:
 
     def fire(self, e, extra=0.0):
         w = CFG["weapons"][e.w]
-        if e.cool > 0 or not e.alive:
+        if e.cool > 0 or not e.alive or e.shoveT > 0:
             return
         if not w.melee and e.ammo[e.w] <= 0:
             e.ammo[e.w] = w.mag
@@ -4648,12 +4776,16 @@ class Game:
         if best:
             if e.isP and self.custom_hit:
                 self.audio.play(.6, self.custom_hit)
+            killed_ = False
             if best.remote:
                 self.net.send({"t": "hit", "to": best.nid, "d": w.dmg, "w": e.w})  # the victim applies it
             else:
                 best.hp -= w.dmg * (1 if e.isP else .7)
                 if best.hp <= 0:
+                    killed_ = True
                     self.kill(best, e)
+            if e.isP:
+                self.hm, self.hm_kill = HM_TIME, killed_
         if not w.melee:
             tl = min(bt, 115 if e.isP else 85)
             # your own tracer starts a little ahead of the eye, right on the aim line,
@@ -4741,6 +4873,8 @@ class Game:
 
     def vm_play(self, vm, kind):
         c = vm.find(kind)
+        if kind == "shove" and not c:
+            return 0.0
         if not c and kind == "slash":
             kind = "shoot"
             c = vm.find("shoot")
@@ -4875,7 +5009,18 @@ class Game:
         else:
             state = "idle"
         A["state"] = state
-        pm.animate(dt, state, spd, e.pitch, kick, float(e.vz), melee, reload)
+        hold = None
+        if HELD_WPN and wpn is not None and not melee:
+            hp = held_points(wpn)
+            if hp is not None:
+                d_ = hp[1] - hp[0]
+                hold = (float(d_[0]), float(d_[2]))     # how far forward / up the left hand is from the right hand
+        shove = None
+        if SHOVE_BODY and e.shoveT > 0:
+            shove = 1.0 - e.shoveT / max(1e-3, e.shoveD)
+            if not e.isP:                    # your own timer already runs in Game.update
+                e.shoveT = max(0.0, e.shoveT - dt)
+        pm.animate(dt, state, spd, e.pitch, kick, float(e.vz), melee, reload, hold, shove)
 
     # ----- assets -----
     def bind_assets(self):
@@ -4884,6 +5029,7 @@ class Game:
         names = [n for n in asset["mdl"] if not re.match(r"^[pw]_", n)]
         for i, w in enumerate(CFG["weapons"]):
             w.vm = None
+            w.wvm = None
             pick = self.wm_pick.get(i)
             if pick not in asset["mdl"]:
                 pick = None
@@ -4903,6 +5049,11 @@ class Game:
                 o = w.ofs or [0, 0, 0]
                 w.vm_ofs = (o[0], o[1], o[2])
                 w.vm_flip = bool(w.flip) if w.flip is not None else w.vm.is_mirrored()
+                try:   # the same weapon without any arms, for the players / bots that hold it
+                    w.wvm = SrcInst(asset["mdl"][w._m].load(), None)
+                except Exception as ex:
+                    print("held-weapon model failed:", ex)
+                    w.wvm = None
                 msg.append(f"{w.n} <- {w._m}")
             except Exception as ex:
                 msg.append(f"{w._m}: {ex}")
@@ -4920,7 +5071,82 @@ class Game:
             if n and n in asset["wav"]:
                 w.snd = asset["wav"][n]
                 msg.append(f"{w.n} sound: {n}")
+        # sounds shipped inside the weapon pack (.vpk / .zip / folder): use them for the weapon they belong to
+        for w in CFG["weapons"]:
+            if w.snd is None and w._m:
+                try:
+                    sn = self.pack_weapon_sound(w)
+                except Exception as ex:
+                    print("pack sound failed:", ex)
+                    sn = None
+                if sn is not None:
+                    w.snd = sn
+                    msg.append(f"{w.n} sound: from the pack")
         self.vm_msg = (" Weapons: " + ", ".join(msg) + ".") if msg else ""
+
+    _SND_BAD = re.compile(r"clip|bolt|draw|reload|slide|deploy|insert|empty|pull|release|cock|rattle|pump|magin|magout|"
+                          r"mag_|zoom|holster|ready|select|click|safety|shell|brass|impact|ricochet|bullet|"
+                          r"step|foot|jump|land|death|pain|glass|flesh|wood|concrete|nearby")
+    _SND_FIRE = re.compile(r"fire|shoot|shot|attack|primary|gunfire|slash|swing|miss|stab|(^|[^a-z])1$")
+
+    def pack_sound_files(self, arch):
+        """Audio files (.wav/.ogg/.mp3) inside a Source pack, cached."""
+        cache = self.__dict__.setdefault("_pack_snd", {})
+        k = id(arch)
+        if k not in cache:
+            cache[k] = [n for n in getattr(arch, "files", {})
+                        if n.replace("\\", "/").lower().endswith((".wav", ".ogg", ".mp3"))
+                        and (n.lower().startswith("sound/") or "/sound/" in n.lower())]
+        return cache[k]
+
+    def pack_weapon_sound(self, w):
+        """Best firing sound for weapon w from the pack its view-model came from (or None)."""
+        spec = self.asset["mdl"].get(w._m)
+        arch = getattr(spec, "arch", None)
+        if arch is None or not hasattr(arch, "read"):
+            return None
+        files = self.pack_sound_files(arch)
+        if not files:
+            return None
+        base = re.sub(r"\.mdl$", "", str(w._m).lower())
+        base = re.sub(r"\s*\(.*\)", "", base)
+        base = re.sub(r"^v_", "", base)
+        toks = {key_norm(base), key_norm(re.sub(r"^(rif|snip|smg|pist|shot|mach|pistol|rifle|sniper)_", "", base))}
+        toks = {t for t in toks if len(t) >= 3}
+        mates = [m for m, sp in self.asset["mdl"].items() if getattr(sp, "arch", None) is arch and not _is_arms_mdl(m)]
+        scored = []
+        for n in files:
+            low = n.replace("\\", "/").lower()
+            nm = low.rsplit("/", 1)[-1]
+            stem = re.sub(r"\.\w+$", "", nm)
+            if self._SND_BAD.search(stem) and not (w.melee and re.search(r"slash|swing|miss|stab", stem)):
+                continue
+            sc = 0
+            pk = key_norm(low)
+            if any(t in pk for t in toks):
+                sc += 10
+            elif len(mates) > 1:
+                continue            # several weapons in this pack: only take sounds that name this one
+            if self._SND_FIRE.search(stem):
+                sc += 5
+            if w.melee and not re.search(r"slash|swing|miss|stab|knife", low):
+                continue
+            if not w.melee and re.search(r"knife|melee", low):
+                continue
+            scored.append((-sc, low, n))
+        if not scored:
+            return None
+        scored.sort()
+        n = scored[0][2]
+        ck = self.__dict__.setdefault("_pack_snd_obj", {})
+        key = (id(arch), n)
+        if key not in ck:
+            try:
+                ck[key] = pygame.mixer.Sound(io.BytesIO(arch.read(n)))
+            except Exception as ex:
+                print("cannot load pack sound", n, ex)
+                ck[key] = None
+        return ck[key]
 
     def spatial(self, x, y, z, base):
         """3D sound: (gain, pan) for a sound at (x, y, z) as heard by the local player.
@@ -5144,7 +5370,7 @@ class Game:
         def want(nm):
             nm = nm.replace("\\", "/").lower()
             parts = nm.split("/")
-            return nm.endswith(".vpk") or (not nm.endswith("/") and ("models" in parts[:-1] or "materials" in parts[:-1]))
+            return nm.endswith(".vpk") or (not nm.endswith("/") and ("models" in parts[:-1] or "materials" in parts[:-1] or "sound" in parts[:-1]))
         if not (out / ".done").exists():
             out.mkdir(parents=True, exist_ok=True)
             if path.suffix.lower() == ".rar":
@@ -5181,7 +5407,7 @@ class Game:
         """Load a .fadmap made with the FAD-MOD Map Builder. Returns a status string."""
         path = Path(path)
         if self.net.active:
-            return "Leave the online room before loading a map."
+            return "Leave the online server before loading a map."
         try:
             raw = path.read_bytes()
             world = FadMapWorld(json.loads(raw.decode("utf-8")))
@@ -5398,6 +5624,11 @@ class Game:
                         e.held = 1
                     if not K.get("mouse1"):
                         e.held = 0
+                    if e.shoveT > 0:
+                        e.shoveT = max(0.0, e.shoveT - dt)
+                        if not e.shoveHit and (1.0 - e.shoveT / max(1e-3, e.shoveD)) >= SHOVE_HIT_AT:
+                            e.shoveHit = True
+                            self.shove_strike()
                 else:
                     self.bot(e, dt)
         elif self.over:
@@ -5443,7 +5674,7 @@ class Game:
                 # posing a model is the heaviest per-bot cost: close bots update often, far ones rarely
                 e.aacc += dt
                 d2 = (e.x - P.x) ** 2 + (e.y - P.y) ** 2
-                step = 1 / 50 if d2 < 640000 else (1 / 30 if d2 < 3240000 else 1 / 15)
+                step = ANIM_STEP   # every player model is posed at ANIM_HZ, however far away
                 if e.aacc >= step:
                     self.update_entity_anim(e, e.aacc)
                     e.aacc = 0.0
@@ -5471,11 +5702,68 @@ class Game:
             pp_["t"] -= dt
         self.xp_pops = [pp_ for pp_ in self.xp_pops if pp_["t"] > 0]
         self.rank_flash = max(0.0, self.rank_flash - dt)
+        self.hm = max(0.0, self.hm - dt)
         self.flash = max(0.0, self.flash - dt * 2.5)
         self.shake = max(0.0, self.shake - dt * SHAKE_DECAY * max(0.2, self.shake))
         cvm = CFG["weapons"][P.w].vm
         if cvm and P.alive and not (P.zoom and P.w == 0):
             self.vm_tick(cvm, dt)
+
+    def melee_pressed(self):
+        """E: L4D2 style shove. Works with every weapon, can't be used while reloading or mid-shove."""
+        P = self.P
+        if not (P and P.alive and not self.over) or P.shoveT > 0 or P.reloadT > 0:
+            return
+        P.zoom = 0
+        dur = SHOVE_TIME
+        cvm = CFG["weapons"][P.w].vm
+        self.shove_seq = False
+        if cvm:
+            d = self.vm_play(cvm, "shove")      # the model's own shove animation, if it has one
+            if d > 0.2:
+                self.shove_seq = True
+                dur = min(d, 1.5)
+        P.shoveD = dur
+        P.shoveT = dur
+        P.shoveHit = False
+        P.cool = max(P.cool, dur)               # can't shoot until the shove is over
+        if self.net.active:
+            self.net.send({"t": "shove", "d": round(dur, 2)}, droppable=True)
+
+    def shove_strike(self):
+        """The moment of impact: everything enemy inside the cone in front of you is hit."""
+        P = self.P
+        hit_any = False
+        killed_any = False
+        for v in self.ents:
+            if v is P or not v.alive or v.team == P.team:
+                continue
+            dx, dy, dz = v.x - P.x, v.y - P.y, v.z - P.z
+            dist = math.hypot(dx, dy)
+            if dist > SHOVE_RANGE or abs(dz) > 52:
+                continue
+            if dist > 18:
+                da = math.atan2(dy, dx) - P.yaw
+                da = math.atan2(math.sin(da), math.cos(da))
+                if abs(da) > math.radians(SHOVE_ARC):
+                    continue
+            if not self.los(P, v):
+                continue
+            hit_any = True
+            if v.remote:
+                self.net.send({"t": "hit", "to": v.nid, "d": SHOVE_DMG, "w": P.w})
+            else:
+                v.hp -= SHOVE_DMG
+                v.cool = max(v.cool, SHOVE_STAGGER)    # staggered: a shoved bot can't shoot for a moment
+                v.aim = -0.6
+                if v.hp <= 0:
+                    killed_any = True
+                    self.kill(v, P)
+        if hit_any:
+            self.hm, self.hm_kill = HM_TIME, killed_any
+        self.shake = min(1.0, self.shake + (SHOVE_SHAKE if hit_any else SHOVE_SHAKE * .35))
+        if hit_any and self.custom_hit:
+            self.audio.play(.6, self.custom_hit)
 
     def select_weapon(self, i):
         P = self.P
@@ -5732,6 +6020,16 @@ class Menu:
         self.snd_status = ""
         self.vm_prev = 0      # weapon shown in the viewmodel preview
         self.vm_dd = False    # preview dropdown open?
+        self.cm_open = False      # Play tab: match settings panel shown?
+        self.dd = None            # Play tab: which dropdown is open (mode / time / bots)
+        self._dd_was = None       # dropdown that was open when the mouse went down
+        self.play_online = False  # Play tab: create match as Online (host server) instead of Offline
+        self.sb_tab = "all"       # server browser tab: all | net | lan
+        self.sb_sort = "n"        # server browser sort column
+        self.sb_rev = False
+        self.sb_sel = None        # selected server id
+        self.sb_click = (None, 0.0)
+        self.sb_scroll = 0
         self.lo_tab = "weapons"   # Loadout tab: "weapons" | "players"
         self.lo_slot = 0          # weapon slot being edited
         self.lo_team = "CT"       # team being edited
@@ -5763,6 +6061,8 @@ class Menu:
         mx, my = self.to_logical(pos)
         self.focus = False
         self.edit = None
+        self._dd_was = self.dd      # a click anywhere closes an open dropdown
+        self.dd = None
         for (x, y, w, h, click, drag) in reversed(self.hot):
             if x <= mx <= x + w and y <= my <= y + h:
                 if drag:
@@ -5886,7 +6186,7 @@ class Menu:
             else:
                 fill = c255(42, 42, 42) if hv else c255(24, 24, 24)
             gfx.rect(x, y, w, h, fill)
-            col = (229, 57, 53) if label in ("Close room", "Leave room", "Cancel", "Remove", "Quit") else (255, 255, 255)
+            col = (229, 57, 53) if label in ("Close server", "Leave server", "Cancel", "Remove", "Quit") else (255, 255, 255)
             gfx.text(label, x + w / 2, y + h / 2 - 9, 13, col, bold=True, anchor="c")
             self.hot.append((x, y, w, h, fn, None))
 
@@ -5920,7 +6220,7 @@ class Menu:
             net = g.net
             gfx.text("READY WHEN YOU ARE", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Enter the arena.", cx, 48, 34, (255, 255, 255), bold=True)
-            gfx.text("Play offline against bots, or host / join a room with friends. No port forwarding needed.",
+            gfx.text("Create a match, or join a server from the server browser. No port forwarding needed.",
                      cx, 96, 13, (154, 154, 154))
 
             def field(x, y, w, h, key, ph):
@@ -5935,21 +6235,14 @@ class Menu:
             def pname():
                 return self.name.strip() or "Player"
 
-            def toggle_day():
-                FX.day = not FX.day
-                save_settings(g, self)
-
-            def toggle_bots():
-                g.bots_on = not g.bots_on
-                g.reset_game()
-                save_settings(g, self)
+            overlays = []     # open dropdown lists: drawn last so they sit on top
 
             def do_host():
                 if not self.check_ready():
                     return
                 g.player_name = pname()
                 g.P.name = g.player_name
-                ok = g.net_host(self.room.strip() or (pname() + "'s room"))
+                ok = g.net_host(self.room.strip() or (pname() + "'s server"))
                 self.status = net.status
                 if ok:
                     self.on_launch()
@@ -5965,44 +6258,89 @@ class Menu:
                 if self.check_ready():
                     self.on_launch()
 
-            def do_leave():
-                g.net_leave("Left the room.")
-                self.status = "Left the room."
+            def do_create():
+                self.cm_open = False
+                if self.play_online:
+                    do_host()
+                else:
+                    do_offline()
 
-            # --- top panel: host / current room / offline match ---
+            def do_leave():
+                g.net_leave("Left the server.")
+                self.status = "Left the server."
+
+            def set_mode(v):
+                self.play_online = (v == "online")
+
+            def set_time(v):
+                FX.day = (v == "day")
+                save_settings(g, self)
+
+            def set_bots(v):
+                on = (v == "on")
+                if on != g.bots_on:
+                    g.bots_on = on
+                    g.reset_game()
+                    save_settings(g, self)
+
+            def dropdown(x, y, w, key, label, value, opts, setter, enabled=True):
+                gfx.text(label, x, y - 17, 11, (119, 119, 119), bold=True)
+                openn = self.dd == key
+                hv = enabled and hover(x, y, w, 34)
+                gfx.box(x, y, w, 34, c255(36, 36, 36) if (hv or openn) else c255(24, 24, 24),
+                        c255(90, 90, 90) if openn else c255(42, 42, 42))
+                gfx.text(value, x + 12, y + 9, 13, (255, 255, 255) if enabled else (100, 100, 100), bold=True)
+                gfx.text("^" if openn else "v", x + w - 16, y + 9, 12, (154, 154, 154) if enabled else (70, 70, 70), anchor="c")
+                if enabled:
+                    self.hot.append((x, y, w, 34, lambda k=key: setattr(self, "dd", None if self._dd_was == k else k), None))
+                    if openn:
+                        overlays.append((x, y + 35, w, opts, setter, value))
+
+            # --- top panel: current server / create match ---
             if net.mode == "host":
                 panel(cx, 128, cw, 112, "Hosting: " + net.room[:40],
-                      "Your room is listed in the room browser. Friends join with one click.")
+                      "Your server is listed in the server browser. Friends join with one click.")
                 gfx.text("Players: %d / %d" % (len(net.peers) + 1, NET_MAX_PLAYERS),
                          cx + 20, 180, 13, (200, 200, 200))
-                button(cx + 20, 202, 150, 32, "Close room", do_leave)
+                button(cx + 20, 202, 150, 32, "Close server", do_leave)
                 button(cx + 182, 202, 150, 32, "Back to game", self.on_launch, True)
                 ly = 252
             elif net.mode == "client":
-                panel(cx, 128, cw, 112, "In room: " + net.room[:40], "Connected to the host. Players: %d" % (len(net.players) + 1))
-                button(cx + 20, 202, 150, 32, "Leave room", do_leave)
+                panel(cx, 128, cw, 112, "On server: " + net.room[:40], "Connected to the host. Players: %d" % (len(net.players) + 1))
+                button(cx + 20, 202, 150, 32, "Leave server", do_leave)
                 button(cx + 182, 202, 150, 32, "Back to game", self.on_launch, True)
                 ly = 252
             elif net.mode == "joining":
-                panel(cx, 128, cw, 112, "Connecting ...", "Reaching the host. This can take a few seconds.")
+                panel(cx, 128, cw, 112, "Connecting ...", "Reaching the server. This can take a few seconds.")
                 button(cx + 20, 202, 150, 32, "Cancel", do_leave)
                 ly = 252
             else:
-                panel(cx, 128, cw, 150, "Play", "Host a room or play offline against bots. Change your name in Profile.")
-                field(cx + 20, 176, 640, 36, "room", "Room name")
-                button(cx + 20, 226, 150, 36, "Host room >", do_host, True)
-                button(cx + 180, 226, 160, 36, "Offline match >", do_offline, True)
-                button(cx + 350, 226, 96, 36, "Bots: ON" if g.bots_on else "Bots: OFF", toggle_bots)
-                button(cx + 456, 226, 100, 36, "Time: Day" if FX.day else "Time: Night", toggle_day)
-                button(cx + 566, 226, 94, 36, "Load map", lambda: self.pick("map"))
-                miss = self.missing()
-                if miss:
-                    gfx.text("Pick mods in Loadout first: " + ", ".join(miss), cx + 20, 266, 11, (255, 193, 7))
-                ly = 290
+                if self.cm_open:
+                    online = self.play_online
+                    byy = 330 if online else 272
+                    panel(cx, 128, cw, byy + 38 + 24 - 128, "Create match", "Pick your options, then press Start match. Change your name in Profile.")
+                    dropdown(cx + 20, 204, 150, "mode", "MODE", "Online" if online else "Offline",
+                             [("Offline", "offline"), ("Online", "online")], set_mode)
+                    dropdown(cx + 182, 204, 150, "time", "TIME", "Day" if FX.day else "Night",
+                             [("Night", "night"), ("Day", "day")], set_time)
+                    dropdown(cx + 344, 204, 150, "bots", "BOTS", ("On" if g.bots_on else "Off") if not online else "Off (online)",
+                             [("On", "on"), ("Off", "off")], set_bots, enabled=not online)
+                    if online:
+                        gfx.text("SERVER NAME", cx + 20, 255, 11, (119, 119, 119), bold=True)
+                        field(cx + 20, 272, 474, 34, "room", "Server name")
+                    button(cx + 20, byy, 170, 38, "Start match >", do_create, True)
+                    button(cx + 202, byy, 100, 38, "Load map", lambda: self.pick("map"))
+                    button(cx + 314, byy, 100, 38, "Back", lambda: setattr(self, "cm_open", False))
+                    miss = self.missing()
+                    if miss:
+                        gfx.text("Pick mods in Loadout first: " + ", ".join(miss), cx + 430, byy + 12, 11, (255, 193, 7))
+                    ly = LH
+                else:
+                    ly = 128
 
-            # --- roster / room browser ---
+            # --- roster / server browser ---
             if net.active:
-                panel(cx, ly, cw, LH - 22 - ly, "Players in the room")
+                panel(cx, ly, cw, LH - 22 - ly, "Players on the server")
                 rows = [(g.P.name or "You", g.P.team, True)] + [(p["n"], p["tm"], False) for p in net.players.values()]
                 for i, (nm, tm, me) in enumerate(rows[:NET_MAX_PLAYERS]):
                     xx = cx + 20 + (i % 2) * 330
@@ -6011,26 +6349,122 @@ class Menu:
                     gfx.box(xx, yy, 320, 28, team_tint(col), c255(42, 42, 42))
                     gfx.text(nm[:20] + ("  (you)" if me else ""), xx + 10, yy + 6, 13, (0, 0, 0) if tm == 0 else (255, 214, 0), bold=me, mono=True)
                     gfx.text("BLACK" if tm == 0 else "YELLOW", xx + 308, yy + 6, 12, col, bold=True, anchor="r")
-            elif not net.mode:
-                rooms = sorted(net.rooms.values(), key=lambda r: r["n"].lower())
-                panel(cx, ly, cw, LH - 22 - ly, "Room browser", "Rooms on the internet and on your network - refreshes automatically.")
-                gfx.text("Room list: " + net.broker_state(), cx + cw - 20, ly + 16, 11, (119, 119, 119), anchor="r")
-                if not rooms:
-                    gfx.text("No rooms found yet. Host one, or ask a friend to - rooms appear here by themselves.", cx + 20, ly + 56, 13, (130, 130, 130))
-                for i, r in enumerate(rooms[:6]):
-                    yy = ly + 46 + i * 34
+            elif not net.mode and not self.cm_open:
+                allr = net.rooms
+                shown = list(allr.values())
+                keyf = {"n": lambda r: r["n"].lower(), "h": lambda r: r["h"].lower(),
+                        "map": lambda r: r["map"], "p": lambda r: r["p"]}
+                shown.sort(key=keyf.get(self.sb_sort, keyf["n"]), reverse=self.sb_rev)
+
+                by, bh = ly, LH - 22 - ly
+                gfx.rect(cx, by, cw, bh, c255(17, 17, 17))
+                gfx.text("Server browser", cx + 20, by + 12, 14, (255, 255, 255), bold=True)
+                button(cx + 20, by + 36, 150, 28, "Create match",
+                       lambda: setattr(self, "cm_open", not self.cm_open), True)
+
+                # column header
+                hy = by + 68
+                cols = [("n", "Server name", 34), ("h", "Host", int(cw * 0.40)), ("map", "Map", int(cw * 0.58)),
+                        ("p", "Players", int(cw * 0.76)), (None, "Type", int(cw * 0.88))]
+                gfx.rect(cx, hy, cw, 24, c255(28, 28, 28))
+                gfx.rect(cx, hy + 23, cw, 1, c255(42, 42, 42))
+                for i, (ck, cl, co) in enumerate(cols):
+                    nxt = cols[i + 1][2] if i + 1 < len(cols) else cw
+                    arrow = ("  ^" if not self.sb_rev else "  v") if (ck and self.sb_sort == ck) else ""
+                    gfx.text(cl + arrow, cx + co, hy + 5, 11, (200, 200, 200) if ck and self.sb_sort == ck else (140, 140, 140), bold=True)
+                    if i:
+                        gfx.rect(cx + co - 8, hy + 4, 1, 16, c255(48, 48, 48))
+                    if ck:
+                        def sort_by(k=ck):
+                            if self.sb_sort == k:
+                                self.sb_rev = not self.sb_rev
+                            else:
+                                self.sb_sort, self.sb_rev = k, False
+                        self.hot.append((cx + co - 8, hy, nxt - co, 24, sort_by, None))
+
+                # rows
+                RH = 26
+                ry0 = hy + 24
+                vis = max(1, int((by + bh - 52 - ry0) // RH))
+                self.sb_scroll = max(0, min(self.sb_scroll, max(0, len(shown) - vis)))
+                if not shown:
+                    gfx.text("No servers found yet.", cx + cw / 2, ry0 + 40, 14, (150, 150, 150), bold=True, anchor="c")
+                    gfx.text("Create an online match, or ask a friend to - servers show up here by themselves.",
+                             cx + cw / 2, ry0 + 64, 12, (110, 110, 110), anchor="c")
+                sel = next((r for r in shown if r["id"] == self.sb_sel), None)
+                if not sel:
+                    self.sb_sel = None
+                for i, r in enumerate(shown[self.sb_scroll:self.sb_scroll + vis]):
+                    yy = ry0 + i * RH
                     full = r["p"] >= r["m"]
                     other = r["map"] != g.map_sig()
-                    gfx.box(cx + 20, yy, cw - 40, 30, c255(17, 17, 17), c255(24, 24, 24))
-                    gfx.text(r["n"][:26], cx + 32, yy + 7, 14, (255, 255, 255), bold=True, mono=True)
-                    gfx.text("by " + r["h"][:14], cx + 290, yy + 8, 12, (140, 140, 140), mono=True)
-                    gfx.text("%d/%d" % (r["p"], r["m"]), cx + 430, yy + 8, 12, (200, 200, 200), mono=True)
-                    if other:
-                        gfx.text("other map", cx + 480, yy + 8, 11, (255, 193, 7))
-                    if full:
-                        gfx.text("FULL", cx + cw - 36, yy + 8, 12, (150, 150, 150), anchor="r")
+                    is_sel = r["id"] == self.sb_sel
+                    hv = hover(cx, yy, cw, RH)
+                    if is_sel:
+                        gfx.rect(cx, yy, cw, RH, c255(38, 48, 30))
+                        gfx.rect(cx, yy, 3, RH, c255(157, 211, 103))
                     else:
-                        button(cx + cw - 110, yy + 2, 80, 26, "Join", lambda r=r: do_join(r), True)
+                        gfx.rect(cx, yy, cw, RH, c255(30, 30, 30) if hv else (c255(21, 21, 21) if i % 2 else c255(17, 17, 17)))
+                    dot = (229, 57, 53) if full else ((255, 193, 7) if other else (157, 211, 103))
+                    gfx.rect(cx + 14, yy + 9, 8, 8, (dot[0] / 255, dot[1] / 255, dot[2] / 255, 1.0))
+                    gfx.text(r["n"][:26], cx + cols[0][2], yy + 6, 13, (255, 255, 255), bold=is_sel, mono=True)
+                    gfx.text(r["h"][:14], cx + cols[1][2], yy + 7, 12, (170, 170, 170), mono=True)
+                    mp = r["map"]
+                    gfx.text("arena" if mp == "arena" else "custom_" + mp[:5], cx + cols[2][2], yy + 7, 12,
+                             (255, 193, 7) if other else (200, 200, 200), mono=True)
+                    gfx.text("%d/%d" % (r["p"], r["m"]), cx + cols[3][2], yy + 7, 12,
+                             (229, 57, 53) if full else (200, 200, 200), mono=True)
+                    gfx.text("LAN" if r.get("src") == "lan" else "Internet", cx + cols[4][2], yy + 7, 12, (140, 140, 140), mono=True)
+
+                    def pick_row(r=r):
+                        now_ = time.time()
+                        if self.sb_click[0] == r["id"] and now_ - self.sb_click[1] < 0.45 and r["p"] < r["m"]:
+                            do_join(r)
+                        self.sb_sel = r["id"]
+                        self.sb_click = (r["id"], now_)
+                    self.hot.append((cx, yy, cw, RH, pick_row, None))
+                if len(shown) > vis:      # scroll hint
+                    gfx.text("scroll for more (%d-%d of %d)" % (self.sb_scroll + 1, min(len(shown), self.sb_scroll + vis), len(shown)),
+                             cx + cw - 20, by + bh - 74, 11, (110, 110, 110), anchor="r")
+
+                # bottom bar: Refresh / Connect
+                fy = by + bh - 46
+                gfx.rect(cx, fy, cw, 46, c255(22, 22, 22))
+                gfx.rect(cx, fy, cw, 1, c255(42, 42, 42))
+
+                def do_refresh():
+                    net.lan_rooms.clear()
+                    try:
+                        t = "%s/rooms/+" % BROKER_ROOT
+                        net.broker.unsub(t)
+                        net.broker.sub(t)
+                    except Exception:
+                        pass
+                    self.sb_scroll = 0
+
+                def do_connect():
+                    if sel and sel["p"] < sel["m"]:
+                        do_join(sel)
+                button(cx + 14, fy + 7, 110, 32, "Refresh", do_refresh)
+                ok_conn = bool(sel) and sel["p"] < sel["m"]
+                if ok_conn:
+                    button(cx + 134, fy + 7, 130, 32, "Connect", do_connect, True)
+                else:
+                    gfx.box(cx + 134, fy + 7, 130, 32, c255(20, 20, 20), c255(32, 32, 32))
+                    gfx.text("Connect", cx + 199, fy + 16, 13, (80, 80, 80), bold=True, anchor="c")
+                gfx.text("%d server%s" % (len(shown), "" if len(shown) == 1 else "s"), cx + cw - 20, fy + 16, 12, (140, 140, 140), anchor="r")
+                if sel and sel["map"] != g.map_sig():
+                    gfx.text("This server uses another map.", cx + 284, fy + 16, 11, (255, 193, 7))
+
+            # --- open dropdown lists (on top of everything) ---
+            for (ox_, oy_, ow_, opts_, setter_, cur_) in overlays:
+                gfx.box(ox_, oy_, ow_, 32 * len(opts_) + 2, c255(17, 17, 17), c255(90, 90, 90))
+                for i, (lab, val) in enumerate(opts_):
+                    iy = oy_ + 1 + i * 32
+                    hv = hover(ox_, iy, ow_, 32)
+                    gfx.rect(ox_ + 1, iy, ow_ - 2, 32, c255(46, 46, 46) if hv else c255(17, 17, 17))
+                    gfx.text(lab, ox_ + 12, iy + 9, 13, (255, 255, 255) if lab == cur_ else (190, 190, 190), bold=(lab == cur_))
+                    self.hot.append((ox_ + 1, iy, ow_ - 2, 32, lambda v=val, f=setter_: f(v), None))
 
             # --- status line (map loaded, join errors, connection progress) ---
             msg = net.status if net.mode else self.status
@@ -6048,7 +6482,7 @@ class Menu:
             gfx.text("YOUR IDENTITY", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Profile.", cx, 48, 34, (255, 255, 255), bold=True)
             gfx.text("Change your username and profile picture.", cx, 96, 13, (154, 154, 154))
-            panel(cx, 128, cw, 250, "Your profile", "Your username is shown to other players in online rooms and on the scoreboard.")
+            panel(cx, 128, cw, 250, "Your profile", "Your username is shown to other players on online servers and on the scoreboard.")
             px, py = cx + 20, 176
             gfx.box(px - 2, py - 2, 164, 164, c255(10, 10, 10), c255(42, 42, 42))
             if self.pfp_tex:
@@ -6422,6 +6856,7 @@ class Menu:
             p = "play"
         self.page = p
         self.vm_dd = False
+        self.dd = None
         self.waiting = None
         self.focus = False
 
@@ -6431,6 +6866,8 @@ class Menu:
         self.lo_page = 0
 
     def wheel(self, dy):
+        if self.page == "play" and dy:
+            self.sb_scroll = max(0, self.sb_scroll + (-1 if dy > 0 else 1))
         if self.page == "loadout" and dy:
             self.lo_page = max(0, self.lo_page + (-1 if dy > 0 else 1))
 
@@ -6692,6 +7129,64 @@ def draw_box(cx, cy, cz, hx, hy, hz, color):
     tex2d(True)
 
 
+def held_points(w):
+    """(right-hand point, left-hand point) on weapon w's model, in the model's own units (cached)."""
+    vm = getattr(w, "wvm", None) if w else None
+    if vm is None or vm.vtx is None:
+        return None
+    hp = getattr(vm, "_hp", None)
+    if hp is None:
+        v = vm.pos[0]
+        lo, hi = v.min(axis=0), v.max(axis=0)
+        ext = hi - lo
+        name = str(w.n or "").lower()
+        g, h = HELD_WPN_ANCHOR, HELD_WPN_FORE
+        if w.melee:
+            g = h = ((1.0 - HELD_KNIFE_ANCHOR[0],) + tuple(HELD_KNIFE_ANCHOR[1:])) if HELD_KNIFE_FLIP else HELD_KNIFE_ANCHOR
+        else:
+            for rx, gg, hh in HELD_ANCHORS:
+                if re.search(rx, name):
+                    g, h = gg, hh
+                    break
+        ofs = np.array(HELD_WPN_OFS, np.float64)
+        hp = vm._hp = (lo + ext * np.array(g, np.float64) + ofs, lo + ext * np.array(h, np.float64) + ofs)
+    return hp
+
+
+def draw_held_weapon(w, grip):
+    """Draw weapon w (weapon-only model) in a player's right hand. grip = (pos, fwd, left, up) in the player's own space."""
+    vm = getattr(w, "wvm", None) if w else None
+    if vm is None or vm.vtx is None:
+        return
+    G, H = held_points(w)
+    an = tuple(float(x) for x in G)
+    p, f, l, u, tl, two = grip
+    if w.melee and HELD_KNIFE_FLIP:
+        f, l = -f, -l          # knife turned around (yaw 180) so the blade points the other way
+    if two and not w.melee:
+        # turn the gun so its foregrip lands on the left hand while the grip stays in the right hand
+        gv = np.asarray(H) - np.asarray(G)                              # grip -> foregrip, in the gun's own axes
+        v_w = f * gv[0] + l * gv[1] + u * gv[2]                         # ... in the player's axes
+        wv = np.asarray(tl) - np.asarray(p)                             # right hand -> left hand
+        wv = wv - u * float(np.dot(wv, u)) * HELD_WPN_LEVEL             # keep the muzzle from tipping up
+        nv, nw = float(np.linalg.norm(v_w)), float(np.linalg.norm(wv))
+        if nv > 1e-3 and nw > 1e-3 and float(np.dot(v_w, wv)) / (nv * nw) > 0.7:
+            R = _arc(v_w, wv)
+            f, l, u = R @ f, R @ l, R @ u
+    mat = np.array([f[0], f[1], f[2], 0, l[0], l[1], l[2], 0, u[0], u[1], u[2], 0, p[0], p[1], p[2], 1], np.float32)
+    gl.glPushMatrix()
+    gl.glMultMatrixf(mat)
+    gl.glTranslatef(-an[0], -an[1], -an[2])
+    flip = bool(w.vm_flip)
+    if flip:
+        gl.glScalef(1, -1, 1)
+        gl.glFrontFace(gl.GL_CW)
+    vm.draw_world()
+    if flip:
+        gl.glFrontFace(gl.GL_CCW)
+    gl.glPopMatrix()
+
+
 def render_scene(game, W, H):
     P = game.P
     gl.glViewport(0, 0, W, H)
@@ -6744,6 +7239,9 @@ def render_scene(game, W, H):
             gl.glScalef(PLAYER_SCALE, PLAYER_SCALE, PLAYER_SCALE)   # shrink around the feet
             gl.glRotatef(gy if gy is not None else math.degrees(e.yaw), 0, 0, 1)  # legs yaw; torso twists on top
             e.pm.draw()
+            _gg = getattr(e.pm, "grip_g", None)
+            if HELD_WPN and e.alive and _gg is not None and 0 <= e.w < len(CFG["weapons"]):
+                draw_held_weapon(CFG["weapons"][e.w], _gg)
             gl.glPopMatrix()
         else:
             gl.glPushMatrix()
@@ -6810,6 +7308,15 @@ def render_scene(game, W, H):
     gl.glTranslatef(0, math.sin(P.ph) * VM_BOB_SIDE * P.bob,
                     -(math.sin(P.ph) ** 2) * VM_BOB_UP * P.bob
                     + P.air * .4 - P.land * VM_LAND)
+    if P.alive and P.shoveT > 0 and not game.shove_seq:
+        # L4D2 style shove: pull back, thrust forward and sweep across, then recover
+        sf, sl, su, syaw, spit, sroll = shove_pose(1.0 - P.shoveT / max(1e-3, P.shoveD))
+        if game.hand_swap:
+            sl, syaw, sroll = -sl, -syaw, -sroll
+        gl.glTranslatef(sf, sl, su)
+        gl.glRotatef(syaw * SHOVE_ROT, 0, 0, 1)
+        gl.glRotatef(-spit * SHOVE_ROT, 0, 1, 0)
+        gl.glRotatef(sroll * SHOVE_ROT, 1, 0, 0)
     if not hide and P.alive:
         if w.vm:
             gl.glPushMatrix()
@@ -6866,6 +7373,28 @@ def xp_info(xp):
         lvl += 1
         need += 100
     return lvl, xp, need
+
+
+HM_TIME = 0.28   # how long the hit marker shows (seconds)
+
+
+def draw_hitmarker(cx, cy, t, kill):
+    """Call of Duty style hit marker: four short diagonal ticks around the crosshair.
+    White on a hit, red on a kill. Pops out a little, then settles and fades."""
+    k = 1.0 + 0.7 * (t / HM_TIME)
+    a = min(1.0, t / 0.12)
+    d1, d2 = 5.0 * k, 12.0 * k
+    col = (1.0, 0.18, 0.18) if kill else (1.0, 1.0, 1.0)
+    gl.glDisable(gl.GL_TEXTURE_2D)
+    for width, c, al in ((5.0, (0.0, 0.0, 0.0), a * 0.55), (2.5, col, a)):
+        gl.glLineWidth(width)
+        gl.glColor4f(c[0], c[1], c[2], al)
+        gl.glBegin(gl.GL_LINES)
+        for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            gl.glVertex2f(cx + sx * d1, cy + sy * d1)
+            gl.glVertex2f(cx + sx * d2, cy + sy * d2)
+        gl.glEnd()
+    gl.glLineWidth(1.0)
 
 
 def draw_crosshair(gfx, cx, cy, xh):
@@ -6951,6 +7480,8 @@ def render_hud(game, gfx, W, H, menu_visible):
         gfx.rect(W / 2 - 1, 0, 2, H, (0, 0, 0, .8))
     elif P.alive:
         draw_crosshair(gfx, W / 2, H / 2, game.xh)
+    if P.alive and game.hm > 0:
+        draw_hitmarker(W / 2, H / 2, game.hm, game.hm_kill)
 
     # XP popups (yellow, rise and fade next to the crosshair)
     if P.alive:
@@ -7330,6 +7861,8 @@ def main():
                             game.select_weapon(i)
                     if name == b["swaphand"]:
                         game.hand_swap = not game.hand_swap
+                    if name == b["melee"]:
+                        game.melee_pressed()
                     if name == "f":
                         FX.flash = not FX.flash
                 else:
@@ -7363,6 +7896,8 @@ def main():
                                 game.select_weapon(i)
                         if code == b["swaphand"]:
                             game.hand_swap = not game.hand_swap
+                        if code == b["melee"]:
+                            game.melee_pressed()
                     elif btn == 1:
                         game.keys["mouse1"] = True
                     elif btn == 3:
