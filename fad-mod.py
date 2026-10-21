@@ -5,13 +5,13 @@ AKB / ARENA - Browser TDM, rewritten as a native Python game.
 Run:       python fad-mod.py   (missing packages install automatically)
 
 Mouse look uses SDL relative mode (raw input, OS pointer acceleration off).
-Mods in the "mod" folder are listed in Loadout but NOT equipped automatically - pick the ones you want
+Mods in the "mod" folder are listed in Skins but NOT equipped automatically - pick the ones you want
 (or drag & drop files) before joining a map, or play with none (nothing is ever created for you):
   mod/weapon/   weapon mods (Source engine: CS:GO / L4D2 .vpk packages — models + animations only)
   mod/player/   player models (Source only — loose, .zip / .7z / .rar / .vpk; posed in code)
   mod/arms/     arms/hands packs
   mod/sound/    custom sounds (shoot.wav / hit.wav)
-Drag & drop .vpk / .mdl / .wav / .json onto the window, or use Loadout buttons (needs tkinter).
+Drag & drop .vpk / .mdl / .wav / .json onto the window, or use Skins buttons (needs tkinter).
 
 CS 1.6 (GoldSrc) maps/models and CS:S hand meshes are not supported.
 
@@ -116,7 +116,7 @@ def mod_folders(*names):
 DEFAULT_BINDS = {
     "forward": "w", "backward": "s", "left": "a", "right": "d",
     "jump": "space", "slide": "c", "reload": "r",
-    "weapon1": "1", "weapon2": "2", "weapon3": "3",
+    "weapon1": "1", "weapon2": "2",
     "swaphand": "v", "crouch": "left ctrl", "melee": "e",
 }
 DEFAULT_XH = {"size": 6, "thick": 2, "gap": 3, "dot": 0, "outline": 1, "r": 0, "g": 255, "b": 0, "a": 1.0}
@@ -124,8 +124,8 @@ BIND_META = [
     ("forward", "Move forward"), ("backward", "Move backward"),
     ("left", "Move left"), ("right", "Move right"),
     ("jump", "Jump"), ("slide", "Slide"), ("reload", "Reload"),
-    ("weapon1", "Weapon slot 1"), ("weapon2", "Weapon slot 2"),
-    ("weapon3", "Weapon slot 3"), ("swaphand", "Switch hand"),
+    ("weapon1", "Primary weapon"), ("weapon2", "Knife"),
+    ("swaphand", "Switch hand"),
     ("crouch", "Crouch"), ("melee", "Melee attack"),
 ]
 BASE_SENS = 0.0022
@@ -169,6 +169,7 @@ HELD_KNIFE_DROP = 6.0                  # how far below the chest (was 8)
 HELD_ANCHORS = [
     (r"awp|scout|sniper", (0.24, 0.50, 0.28), (0.39, 0.50, 0.34)),   # hands on the stock (grip + forestock)
     (r"(^|[^a-z])ak",     (0.28, 0.50, 0.40), (0.42, 0.50, 0.29)),   # left hand lower, under the handguard
+    (r"nova|xm1014|mag7|sawed|shotgun|(^|[^a-z])m3", (0.26, 0.50, 0.36), (0.50, 0.50, 0.30)),   # shotgun: grip + pump forend
 ]
 HELD_WPN_OFS = (0.0, 0.0, 0.0)         # extra shift of the gun in the hand: forward, left, up (game units)
 ANIM_HZ = 60           # player / bot model animation rate at ANY distance (was 50 / 30 / 15 by distance)
@@ -238,9 +239,14 @@ class Wpn:
 def default_cfg():
     return {
         "weapons": [
-            Wpn(n="AWP", dmg=100, rpm=45, mag=5, spr=.00035, auto=0),
-            Wpn(n="AK-47", dmg=28, rpm=600, mag=30, spr=.012, auto=1),
+            Wpn(n="AWP", cls="Sniper rifle", dmg=100, rpm=45, mag=5, spr=.00035, auto=0,
+                match=r"snip|hunting|scout|sg55|g3sg|dragunov|svd|barrett|awm|(^|[^a-z])m24|m82"),
+            Wpn(n="AK-47", cls="Assault rifle", dmg=28, rpm=600, mag=30, spr=.012, auto=1),
             Wpn(n="Knife", dmg=1000, rpm=120, mag=0, spr=0, auto=1, melee=1, range=64),
+            # pump shotgun: `pellets` rays per shot, each doing `dmg` (damage fades with distance up to `range`);
+            # `match` = file-name pattern used to auto-pick a shotgun view-model from your weapon packs
+            Wpn(n="Shotgun", cls="Pump shotgun", dmg=16, rpm=70, mag=8, spr=.045, auto=0, pellets=9, range=1400, recoil=.14,
+                match=r"nova|xm1014|mag7|sawed|shotgun|(^|[^a-z])m3"),
         ],
         "bots": 2,
         "frags": 30,
@@ -1115,21 +1121,7 @@ class SrcModel:
         S = lambda o: struct.unpack_from("<h", b, o)[0]
         cs = lambda o: b[o:b.index(b"\0", o)].decode("latin1")
         self.name = b[12:76].split(b"\0")[0].decode("latin1")
-        # ---- bones
-        nb, bo = I(156), I(160)
-        self.bones = []
-        for i in range(nb):
-            p = bo + i * 216
-            self.bones.append({
-                "name": cs(p + I(p)), "par": I(p + 4),
-                "pos": np.array(struct.unpack_from("<3f", b, p + 32)),
-                "quat": struct.unpack_from("<4f", b, p + 44),
-                "rot": struct.unpack_from("<3f", b, p + 60),
-                "ps": struct.unpack_from("<3f", b, p + 72),
-                "rs": struct.unpack_from("<3f", b, p + 84),
-                "p2b": np.vstack([np.array(struct.unpack_from("<12f", b, p + 96)).reshape(3, 4), [0, 0, 0, 1]]),
-            })
-        self.nb = nb
+        self._parse_bones()
         # ---- textures / skins
         self.tex_names = [cs(I(208) + i * 64 + I(I(208) + i * 64)) for i in range(I(204))]
         self.cd = [cs(I(I(216) + i * 4)).replace("\\", "/").lower() for i in range(I(212))]
@@ -1207,7 +1199,36 @@ class SrcModel:
                 self.parts.append({"mat": mat, "tri": tri, "glob": None})
         # the loop above needs the group's glob table per triangle: redo cleanly
         self.parts = self._build_parts(vtx, nbody, bpo)
-        # ---- sequences + animation descs
+        self._parse_seqs()
+        self.includes = []
+
+    def _parse_bones(self):
+        b = self.b
+        I = lambda o: struct.unpack_from("<i", b, o)[0]
+        F = lambda o: struct.unpack_from("<f", b, o)[0]
+        S = lambda o: struct.unpack_from("<h", b, o)[0]
+        cs = lambda o: b[o:b.index(b"\0", o)].decode("latin1")
+        nb, bo = I(156), I(160)
+        self.bones = []
+        for i in range(nb):
+            p = bo + i * 216
+            self.bones.append({
+                "name": cs(p + I(p)), "par": I(p + 4),
+                "pos": np.array(struct.unpack_from("<3f", b, p + 32)),
+                "quat": struct.unpack_from("<4f", b, p + 44),
+                "rot": struct.unpack_from("<3f", b, p + 60),
+                "ps": struct.unpack_from("<3f", b, p + 72),
+                "rs": struct.unpack_from("<3f", b, p + 84),
+                "p2b": np.vstack([np.array(struct.unpack_from("<12f", b, p + 96)).reshape(3, 4), [0, 0, 0, 1]]),
+            })
+        self.nb = nb
+
+    def _parse_seqs(self):
+        b = self.b
+        I = lambda o: struct.unpack_from("<i", b, o)[0]
+        F = lambda o: struct.unpack_from("<f", b, o)[0]
+        S = lambda o: struct.unpack_from("<h", b, o)[0]
+        cs = lambda o: b[o:b.index(b"\0", o)].decode("latin1")
         self.sounds_ev = {}
         na, ao = I(180), I(184)
         self.anims = []
@@ -1229,7 +1250,12 @@ class SrcModel:
                 q = p + I(p + 28) + e * 80
                 if I(q + 4) in (5004, 5005) and I(q + 8) == 0:
                     evs.append((F(q), b[q + 12:q + 76].split(b"\0")[0].decode("latin1")))
-            self.seqs.append({"label": cs(p + I(p + 4)), "flags": I(p + 12),
+            try:
+                _ao = I(p + 8)
+                _act = cs(p + _ao) if _ao else ""
+            except Exception:
+                _act = ""
+            self.seqs.append({"label": cs(p + I(p + 4)), "flags": I(p + 12), "act": _act,
                               "fps": d["fps"] if d else 30.0, "n": d["n"] if d else 1,
                               "grp": 0, "anim": 1 if d else -1, "desc": d, "events": sorted(evs),
                               "loop": bool(I(p + 12) & 1), "descs": descs})
@@ -1243,6 +1269,57 @@ class SrcModel:
         except Exception:
             pass
         self._cache = {}
+
+    def attach_includes(self, vpk, mdl_name, _depth=0):
+        """L4D2 / CS:GO view-models keep their animations in another .mdl ($includemodel, e.g.
+        v_knife_t.mdl -> v_knife_anim.mdl). Add those sequences to this model."""
+        b = self.b
+        try:
+            ni, io = struct.unpack_from("<ii", b, 336)
+        except Exception:
+            return
+        if not 0 < ni < 64 or not 0 < io < len(b):
+            return
+        folder = mdl_name.replace("\\", "/").rsplit("/", 1)[0] if "/" in mdl_name else ""
+        for k in range(ni):
+            try:
+                p = io + k * 8
+                lo = struct.unpack_from("<i", b, p + 4)[0]
+                nm = b[p + lo:b.index(b"\0", p + lo)].decode("latin1").replace("\\", "/").lower()
+            except Exception:
+                continue
+            cands = [nm, folder.lower() + "/" + nm.rsplit("/", 1)[-1]]
+            hit = next((c for c in cands if vpk.has(c)), None)
+            if not hit or hit.lower() == mdl_name.lower():
+                continue
+            try:
+                am = SrcModel.__new__(SrcModel)
+                am.b = vpk.read(hit)
+                if am.b[:4] != b"IDST":
+                    continue
+                am.version = struct.unpack_from("<i", am.b, 4)[0]
+                am._parse_bones()
+                am._parse_seqs()
+                am._cache = {}
+                if _depth < 3:
+                    am.attach_includes(vpk, hit, _depth + 1)
+            except Exception as ex:
+                print("include model failed:", nm, ex)
+                continue
+            names = {bn["name"].lower(): i for i, bn in enumerate(am.bones)}
+            remap = [names.get(bn["name"].lower(), -1) for bn in self.bones]
+            have = {sq["label"].lower() for sq in self.seqs}
+            for sq in am.seqs:
+                d = sq.get("desc")
+                if d is None or sq["label"].lower() in have:
+                    continue
+                if "src" in d:
+                    continue
+                d["raw"] = dict(d)
+                d["src"], d["remap"] = am, remap
+                sq2 = dict(sq)
+                self.seqs.append(sq2)
+            self.includes.append(am)
 
     def attach_ani(self, ani_bytes):
         """Attach a companion .ani (IDAG) file so FRAMEANIM / block animations can be decoded."""
@@ -1434,6 +1511,19 @@ class SrcModel:
         c = self._cache.get(key)
         if c is not None:
             return c
+        if d.get("src") is not None:      # animation lives in an included .mdl: decode there, map bones by name
+            sm = d["src"]
+            p2, q2 = sm.decode_frame(d["raw"], frame)
+            pos = np.array([bn["pos"] for bn in self.bones])
+            quat = np.array([bn["quat"] for bn in self.bones], np.float64)
+            if d["flags"] & 0x4:
+                pos[:] = 0
+                quat[:] = (0, 0, 0, 1)
+            for i, j in enumerate(d["remap"]):
+                if j >= 0:
+                    pos[i], quat[i] = p2[j], q2[j]
+            self._cache[key] = (pos, quat)
+            return pos, quat
         b = self.b
         nb = self.nb
         pos = np.array([bn["pos"] for bn in self.bones])
@@ -1782,6 +1872,10 @@ class SrcData:
     def __init__(self, arch, mdl_name):
         self.arch = arch
         self.model = srcm = SrcModel(*_find_vpk_model(arch, mdl_name))
+        try:
+            srcm.attach_includes(arch, mdl_name)
+        except Exception as ex:
+            print("include animations failed:", ex)
         self.name = mdl_name
         self.seqs = srcm.seqs
         self.parts = []
@@ -1874,7 +1968,7 @@ class SrcData:
                 if info["t"]:
                     return info
         # No .vtf in the pack (common for L4D2 arms-only VPKs): bake a solid texture from the fill
-        # so the mesh is visible in both the game viewmodel and the Loadout preview.
+        # so the mesh is visible in both the game viewmodel and the Skins preview.
         if info.get("fill") and not info["t"]:
             info["t"] = SrcData._solid_tex(info["fill"])
         return info
@@ -1926,9 +2020,64 @@ class SrcInst:
 
     # ---- sequence lookup (CS:GO v_ model names) ----
     def find(self, kind):
+        r = self._find_label(kind)
+        if r or kind == "idle":
+            return r
+        r = self._find_alt(kind)
+        if not r and kind == "draw":     # only an additive *_layer draw exists (L4D2): play it on top of the idle pose
+            r = [i for i, s in enumerate(self.seqs) if s["desc"] is not None and (s["flags"] & 0x4)
+                 and re.search(r"ACT_VM_(DRAW|DEPLOY|PULLOUT)$", str(s.get("act") or ""), re.I)
+                 and not re.search(r"item|helping", s["label"], re.I)][:1]
+        return r
+
+    def _find_alt(self, kind):
+        """Fallback for packs whose sequences carry a weapon prefix (awm_fire, awm_reload, sniper_draw ...)
+        or custom labels: match the sequence's ACT_VM_* activity name first, then a prefix-tolerant label.
+        Skips the *_layer / *_raw helper sequences and additive (delta) sequences - those are not base clips."""
+        S = self.seqs
+
+        def usable(i):
+            s = S[i]
+            if s["desc"] is None or (s["flags"] & 0x4):
+                return False
+            lab = s["label"].lower()
+            if re.search(r"(^|_)(layer|raw)$|^look_poses$|^@", lab):
+                return False
+            return not str(s.get("act") or "").upper().endswith("_LAYER")
+        ok = [i for i in range(len(S)) if usable(i)]
+
+        def by_act(rx, bad=None):
+            return [i for i in ok if re.search(rx, str(S[i].get("act") or ""), re.I)
+                    and not (bad and re.search(bad, str(S[i].get("act") or ""), re.I))]
+
+        def by_lab(rx, bad=None):
+            return [i for i in ok if re.search(rx, S[i]["label"].lower())
+                    and not (bad and re.search(bad, S[i]["label"].lower()))]
+        if kind == "draw":
+            return (by_act(r"^ACT_VM_(DEPLOY|DRAW|PULLOUT|RAISE|DRAW_FIRST)$")
+                    or by_lab(r"(^|_)(draw|deploy|pullout|ready|raise)$", r"first"))[:1]
+        if kind == "shoot":
+            return (by_act(r"^ACT_VM_(PRIMARYATTACK|FIRE|SHOOT)$")
+                    or by_act(r"^ACT_VM_PRIMARYATTACK", r"LAST|EMPTY|DRY|SILENC|SECONDARY")
+                    or by_lab(r"(^|_)(fire|shoot|attack|primary)\d*$", r"last|empty|dry|alt|secondary|zoom"))[:1]
+        if kind == "reload":
+            if self.want_empty:
+                hit = by_act(r"^ACT_VM_RELOAD_EMPTY") or by_lab(r"(^|_)reload_?empty")
+            else:
+                hit = []
+            hit = (hit or by_act(r"^ACT_VM_RELOAD$") or by_act(r"^ACT_VM_RELOAD", r"EMPTY|START|END|INSERT|LOOP")
+                   or by_lab(r"(^|_)reload\d*$", r"empty|dry|start|end|insert|loop"))
+            return hit[:1]
+        if kind == "shove":
+            return (by_lab(r"shov") or by_act(r"^ACT_VM_(MELEE|BASH|SHOVE)") or by_lab(r"(^|_)(melee|bash|butt|push)$"))[:1]
+        if kind == "slash":
+            return (by_act(r"^ACT_VM_(MISS|HIT)CENTER") or by_lab(r"(^|_)(slash|stab|swing)"))[:1]
+        return []
+
+    def _find_label(self, kind):
         S = self.seqs
         lab = [s["label"].lower() for s in S]
-        ok = [i for i, s in enumerate(S) if s["desc"] is not None]
+        ok = [i for i, s in enumerate(S) if s["desc"] is not None and not (s["flags"] & 0x4)]
 
         def pick(*rxs, bad=None):
             for rx in rxs:
@@ -1979,13 +2128,28 @@ class SrcInst:
             f1 = 0 if loop else n - 1
         p0, q0 = m.decode_frame(s["desc"], f0)
         if f1 == f0 or fr <= 1e-4:
-            return p0, q0
-        p1, q1 = m.decode_frame(s["desc"], f1)
-        dot = (q0 * q1).sum(1, keepdims=True)
-        q1 = np.where(dot < 0, -q1, q1)
-        q = q0 + (q1 - q0) * fr
-        q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-9)
-        return p0 + (p1 - p0) * fr, q
+            p, q = p0, q0
+        else:
+            p1, q1 = m.decode_frame(s["desc"], f1)
+            dot = (q0 * q1).sum(1, keepdims=True)
+            q1 = np.where(dot < 0, -q1, q1)
+            q = q0 + (q1 - q0) * fr
+            q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-9)
+            p = p0 + (p1 - p0) * fr
+        if s["flags"] & 0x4:     # additive (delta) layer: add it on top of the idle pose
+            idl = self.find("idle")
+            bi = idl[0] if idl and not (self.seqs[idl[0]]["flags"] & 0x4) else -1
+            if bi >= 0:
+                bp, bq = m.decode_frame(self.seqs[bi]["desc"], 0)
+                x1, y1, z1, w1 = bq[:, 0], bq[:, 1], bq[:, 2], bq[:, 3]
+                x2, y2, z2, w2 = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+                q = np.stack([w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                              w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                              w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+                              w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2], 1)
+                q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-9)
+                p = bp + p
+        return p, q
 
     def begin_fade(self, dur=FADE_TIME):
         if self.snap_cur is not None:
@@ -2983,7 +3147,7 @@ def src_scan(arch):
         # view-model naming: v_*.mdl (any folder)
         if not re.match(r"^v_[^/]*\.mdl$", b):
             continue
-        # Skip truncated downloads so Loadout only lists usable models
+        # Skip truncated downloads so Skins only lists usable models
         if hasattr(arch, "complete") and not arch.complete(nm):
             continue
         # Prefer entries that still have their .vvd / .vtx on disk
@@ -3927,6 +4091,8 @@ class Ent:
         self.zoom = 0
         self.acc = 0.0
         self.jreq = 0
+        self.js = None          # jump stats: the jump being measured (None = not in a tracked jump)
+        self.last_land = -9.0   # time.time() of the last landing (to tell a bunnyhop from a standing jump)
         self.sl = 0.0
         self.scd = 0.0
         self.so = 0.0
@@ -3978,8 +4144,9 @@ class Game:
         self.arms_want = None     # name remembered from settings
         self.arms_off = False     # "No arms" chosen
         self.pm_cfg = {"CT": None, "T": None}
-        self.wm_pick = {}  # weapon slot index -> chosen view-model filename (Loadout tab)
-        self.manual_mods = True   # loaded mods are only listed in Loadout; nothing is equipped until you pick it
+        self.primary = 1   # index in CFG["weapons"] of the one gun you carry (the knife is always with you)
+        self.wm_pick = {}  # weapon slot index -> chosen view-model filename (Skins tab)
+        self.manual_mods = True   # loaded mods are only listed in Skins; nothing is equipped until you pick it
         self.pm_saved = {"CT": None, "T": None}  # remembered team models (from settings)
         self.pm_cache = {}
         self._new_pl = 0
@@ -4007,6 +4174,9 @@ class Game:
         self.aspect = 0.0  # 0 = match the window; else forced aspect (stretched to fill); 1.0 = 1:1
         self.fullscreen = False
         self.show_fps = False
+        self.show_speed = False   # speed meter (units per second) in the HUD
+        self.show_jstats = True   # print jump stats (distance, speed, strafes ...) in the chat
+        self.chat = []            # chat lines: {"tag", "text", "t"} (t = seconds left)
         self.fps_val = 0.0
         self.vm_adj = [0.0, 0.0, 0.0]  # viewmodel x (forward), y (right), z (up)
         self.custom_shot = self.custom_hit = None
@@ -4076,6 +4246,7 @@ class Game:
         e.px, e.py, e.pz = e.x, e.y, e.z
         e.acc = 0.0
         e.jreq = 0
+        e.js = None
         e.sl = 0.0
         e.scd = 0.0
         e.so = 0.0
@@ -4088,7 +4259,7 @@ class Game:
             e.yaw = math.radians(s[3])     # spawn point facing from the map builder
         e.pitch = 0.0
         e.ammo = [w.mag for w in CFG["weapons"]]
-        e.w = 1
+        e.w = self.primary if e.isP else 1
         e.cool = 0.0
         e.zoom = 0
         e.pun_p = e.pun_y = 0.0
@@ -4155,7 +4326,11 @@ class Game:
 
     def net_join(self, room, rid=None):
         """room: a room-browser entry (dict), or a list of (ip, port) addresses to try."""
+        self.join_msg = ""
         if isinstance(room, dict):
+            ok, self.join_msg = self.use_map_sig(str(room.get("map", "arena")))
+            if not ok:
+                return False
             return self.net.join_room(room, self.player_name, self.map_sig())
         return self.net.join(room, rid, self.player_name, self.map_sig())
 
@@ -4596,6 +4771,54 @@ class Game:
                 e.vy *= cap / sp
         self.pm_move(e, dt)
 
+    # ----- jump stats (printed in the chat) -----
+    def chat_add(self, text, tag="JUMP", life=9.0):
+        self.chat.append({"tag": tag, "text": text, "t": life})
+        self.chat = self.chat[-6:]
+
+    def js_tick(self, e, s, g0, v0, dt):
+        """Measure every jump: takeoff speed, distance, max speed, height, strafes and sync.
+        g0 / v0 = on walkable ground / horizontal speed BEFORE this physics tick."""
+        g1 = self.walkable(e)
+        v1 = math.hypot(e.vx, e.vy)
+        js = e.js
+        if js is None:
+            if g0 and not g1 and e.vz > 100 and e.sl <= 0 and e.alive:     # left the ground by jumping
+                e.js = {"x": e.px, "y": e.py, "z": e.pz, "pre": v0, "max": v1, "h": 0.0, "n": 0, "ls": 0,
+                        "gain": 0, "ticks": 0, "wj": e.wj,
+                        "bhop": (time.time() - e.last_land) < 0.25}
+            return
+        if e.sl > 0 or not e.alive:
+            e.js = None
+            return
+        js["ticks"] += 1
+        js["max"] = max(js["max"], v1)
+        js["h"] = max(js["h"], e.z - js["z"])
+        if v1 > v0 + 1e-3:
+            js["gain"] += 1
+        if s and s != js["ls"]:
+            js["n"] += 1
+            js["ls"] = s
+        if not (g1 and not g0):
+            return                                                         # still in the air
+        e.js = None
+        e.last_land = time.time()
+        dist = math.hypot(e.x - js["x"], e.y - js["y"])
+        dz = e.z - js["z"]
+        if not self.show_jstats or not e.isP or dist < 20 or dist > 4000 or js["ticks"] * dt < 0.15:
+            return
+        if int(e.wj) > int(js["wj"]):
+            kind = "Wall jump"
+        elif js["bhop"]:
+            return                                  # bunnyhops are not printed
+        else:
+            kind = "Jump"
+        if abs(dz) > 2:
+            kind += " (%+.0f)" % dz
+        sync = 100.0 * js["gain"] / max(1, js["ticks"])
+        self.chat_add("%s: %.1f units | Pre: %.0f | Max: %.0f | Height: %.1f | Strafes: %d | Sync: %.0f%%"
+                      % (kind, dist, js["pre"], js["max"], js["h"], js["n"], sync))
+
     def can_hop(self, e, wx, wy):
         """True when the obstacle in the walking direction is low enough to jump onto / over
         (the jump apex is ~45 units). Tall walls return False."""
@@ -4638,6 +4861,7 @@ class Game:
         self.feed = self.feed[:5]
         v.anim = fresh_anim()
         if k.isP and v is not k:
+            self.hm, self.hm_kill = HM_TIME, True     # red hit marker on every kill (bots, online players, knife)
             self.streak += 1
             self.give_xp(XP_KNIFE if (w and w.melee) else XP_KILL, "KNIFE KILL" if (w and w.melee) else "KILL")
             if self.streak >= 3:
@@ -4676,6 +4900,12 @@ class Game:
                 d = self.vm_play(w.vm, "reload")
                 if d > 0.3:
                     dur = min(d, 6.0)
+            if w.pellets and int(w.pellets) > 1:
+                # shotgun: the whole reload takes as long as the AWP's, so the animation is slowed to fit
+                tgt = self.awp_reload_len()
+                if e.isP and w.vm and w.vm.find("reload") and dur > 0.3:
+                    self.vmA["spd"] = dur / tgt
+                dur = tgt
             e.cool = dur
             e.reloadT = dur
             e.zoom = 0   # scope out when a reload starts
@@ -4685,7 +4915,7 @@ class Game:
         e.cool = 60 / w.rpm
         if e.isP and not w.melee:
             _n = str(w.n or "").lower()
-            _snip = ("awp" in _n or "scout" in _n or (not w.auto and 0 < (w.mag or 0) <= 10))
+            _snip = ("awp" in _n or "scout" in _n or (not w.auto and not w.pellets and 0 < (w.mag or 0) <= 10))
             self.shake = min(1.0, self.shake + (0.9 if _snip else 0.28))
         if e.isP and w.vm:
             self.vm_play(w.vm, "slash" if w.melee else "shoot")
@@ -4694,7 +4924,7 @@ class Game:
         cp = math.cos(pp)
         sp = (w.spr or 0) + extra
         sniper = ("awp" in str(w.n or "").lower() or "scout" in str(w.n or "").lower()
-                  or (not w.melee and not w.auto and 0 < (w.mag or 0) <= 10))
+                  or (not w.melee and not w.auto and not w.pellets and 0 < (w.mag or 0) <= 10))
         if e.isP and sniper:
             # CS:GO style AWP: pin-point when scoped and standing still, wild when unscoped,
             # in the air, and a bit off while moving
@@ -4706,11 +4936,6 @@ class Game:
             else:
                 sp = 0.0
         e.shootT = .15
-        d = [cp * math.cos(yy) + (random.random() - .5) * sp * 2,
-             cp * math.sin(yy) + (random.random() - .5) * sp * 2,
-             math.sin(pp) + (random.random() - .5) * sp * 2]
-        m = math.sqrt(d[0] ** 2 + d[1] ** 2 + d[2] ** 2)
-        d = [x / m for x in d]
         if e.isP and not w.melee:
             if w.auto:
                 # CS:GO style spray: every bullet moves the aim along a fixed pattern
@@ -4735,71 +4960,87 @@ class Game:
                  e.pz + (e.z - e.pz) * al + 17 + e.so]
         else:
             o = [e.x, e.y, e.z + 17 + e.so]
-        rg = w.range or 3000
-        tw = rg
-        step = 4.0 if e.isP else 16.0   # bots use a coarser (much cheaper) ray
-        t = 1.0
-        solid = self.world.bullet_solid
-        while t < rg:
-            if solid(o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t):
-                lo2, hi2 = max(0.0, t - step), t      # refine: find the exact wall distance
-                for _r in range(5):
-                    mid = (lo2 + hi2) * .5
-                    if solid(o[0] + d[0] * mid, o[1] + d[1] * mid, o[2] + d[2] * mid):
-                        hi2 = mid
+        pellets = max(1, int(w.pellets or 1)) if not w.melee else 1
+        rem_dmg = {}
+        hit_snd = False
+        bt = tw = 0.0
+        for _pi in range(pellets):
+            d = [cp * math.cos(yy) + (random.random() - .5) * sp * 2,
+                 cp * math.sin(yy) + (random.random() - .5) * sp * 2,
+                 math.sin(pp) + (random.random() - .5) * sp * 2]
+            m = math.sqrt(d[0] ** 2 + d[1] ** 2 + d[2] ** 2)
+            d = [x / m for x in d]
+            rg = w.range or 3000
+            tw = rg
+            step = 4.0 if e.isP else 16.0   # bots use a coarser (much cheaper) ray
+            t = 1.0
+            solid = self.world.bullet_solid
+            while t < rg:
+                if solid(o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t):
+                    lo2, hi2 = max(0.0, t - step), t      # refine: find the exact wall distance
+                    for _r in range(5):
+                        mid = (lo2 + hi2) * .5
+                        if solid(o[0] + d[0] * mid, o[1] + d[1] * mid, o[2] + d[2] * mid):
+                            hi2 = mid
+                        else:
+                            lo2 = mid
+                    tw = hi2
+                    break
+                t += step
+            best, bt = None, tw
+            for v in self.ents:
+                if not v.alive or v.team == e.team:
+                    continue
+                sl = v.sl > 0 or v.cr > .5
+                p = [v.x, v.y, v.z - (16 if sl else 0)]
+                hh = HIT_HALF_H_LOW if sl else HIT_HALF_H
+                h = [HIT_HALF_W, HIT_HALF_W, hh]
+                p[2] -= (21 if sl else 35) - hh   # keep the feet where they were
+                a, b = 0.0, 1e9
+                for k in range(3):
+                    if abs(d[k]) < 1e-6:
+                        if o[k] < p[k] - h[k] or o[k] > p[k] + h[k]:
+                            b = -1
                     else:
-                        lo2 = mid
-                tw = hi2
-                break
-            t += step
-        best, bt = None, tw
-        for v in self.ents:
-            if not v.alive or v.team == e.team:
-                continue
-            sl = v.sl > 0 or v.cr > .5
-            p = [v.x, v.y, v.z - (16 if sl else 0)]
-            hh = HIT_HALF_H_LOW if sl else HIT_HALF_H
-            h = [HIT_HALF_W, HIT_HALF_W, hh]
-            p[2] -= (21 if sl else 35) - hh   # keep the feet where they were
-            a, b = 0.0, 1e9
-            for k in range(3):
-                if abs(d[k]) < 1e-6:
-                    if o[k] < p[k] - h[k] or o[k] > p[k] + h[k]:
-                        b = -1
+                        t1 = (p[k] - h[k] - o[k]) / d[k]
+                        t2 = (p[k] + h[k] - o[k]) / d[k]
+                        a = max(a, min(t1, t2))
+                        b = min(b, max(t1, t2))
+                if a <= b and b > 0 and a < bt:
+                    best, bt = v, a
+            if best:
+                if e.isP and self.custom_hit and not hit_snd:
+                    self.audio.play(.6, self.custom_hit)
+                    hit_snd = True
+                killed_ = False
+                dmg = w.dmg
+                if pellets > 1:
+                    dmg *= max(.2, 1.0 - bt / float(rg))      # shotgun pellets lose damage with distance
+                if best.remote:
+                    rem_dmg[best] = rem_dmg.get(best, 0.0) + dmg    # one message per victim, not one per pellet
                 else:
-                    t1 = (p[k] - h[k] - o[k]) / d[k]
-                    t2 = (p[k] + h[k] - o[k]) / d[k]
-                    a = max(a, min(t1, t2))
-                    b = min(b, max(t1, t2))
-            if a <= b and b > 0 and a < bt:
-                best, bt = v, a
-        if best:
-            if e.isP and self.custom_hit:
-                self.audio.play(.6, self.custom_hit)
-            killed_ = False
-            if best.remote:
-                self.net.send({"t": "hit", "to": best.nid, "d": w.dmg, "w": e.w})  # the victim applies it
-            else:
-                best.hp -= w.dmg * (1 if e.isP else .7)
-                if best.hp <= 0:
-                    killed_ = True
-                    self.kill(best, e)
-            if e.isP:
-                self.hm, self.hm_kill = HM_TIME, killed_
-        if not w.melee:
-            tl = min(bt, 115 if e.isP else 85)
-            # your own tracer starts a little ahead of the eye, right on the aim line,
-            # so it comes out of the crosshair instead of the bottom of the screen
-            ts = min(40.0, tl * .5) if e.isP else 0.0
-            # nudged a little to the right and down so the line isn't hidden behind the crosshair
-            ox = math.sin(yy) * 4.0 if e.isP else 0.0
-            oy = -math.cos(yy) * 4.0 if e.isP else 0.0
-            self.tracers.append({
-                "a": (o[0] + d[0] * ts + ox, o[1] + d[1] * ts + oy,
-                      o[2] + d[2] * ts - (3.0 if e.isP else 2.0)),
-                "b": (o[0] + d[0] * tl, o[1] + d[1] * tl, o[2] + d[2] * tl),
-                "al": .62 if e.isP else .32, "t": .04 if e.isP else .022,
-            })
+                    best.hp -= dmg * (1 if e.isP else .7)
+                    if best.hp <= 0:
+                        killed_ = True
+                        self.kill(best, e)
+                if e.isP:
+                    self.hm, self.hm_kill = HM_TIME, killed_
+            if not w.melee:
+                tl = min(bt, 115 if e.isP else 85)
+                # your own tracer starts a little ahead of the eye, right on the aim line,
+                # so it comes out of the crosshair instead of the bottom of the screen
+                ts = min(40.0, tl * .5) if e.isP else 0.0
+                # nudged a little to the right and down so the line isn't hidden behind the crosshair
+                ox = math.sin(yy) * 4.0 if e.isP else 0.0
+                oy = -math.cos(yy) * 4.0 if e.isP else 0.0
+                self.tracers.append({
+                    "a": (o[0] + d[0] * ts + ox, o[1] + d[1] * ts + oy,
+                          o[2] + d[2] * ts - (3.0 if e.isP else 2.0)),
+                    "b": (o[0] + d[0] * tl, o[1] + d[1] * tl, o[2] + d[2] * tl),
+                    "al": (.62 if e.isP else .32) * (.55 if pellets > 1 else 1), "t": .04 if e.isP else .022,
+                })
+        for _v, _dm in rem_dmg.items():
+            self.net.send({"t": "hit", "to": _v.nid, "d": int(round(_dm)), "w": e.w})  # the victim applies it
         if e.isP and self.net.active:
             tl2 = min(bt, 85)
             self.net.send({"t": "shot", "w": e.w,
@@ -4871,6 +5112,25 @@ class Game:
         # moving = any real motion: running, sliding, or in the air (jumping / falling / air-strafing)
         return bool(P.alive and (math.hypot(P.vx, P.vy) > 40 or (not P.walk and abs(P.vz) > 40)))
 
+    def awp_reload_len(self):
+        """Seconds the AWP takes to reload (its reload animation, or 3.7 s like CS:GO when it has no model)."""
+        for w in CFG["weapons"]:
+            if str(w.n or "").lower() == "awp":
+                try:
+                    if w.vm:
+                        old = getattr(w.vm, "want_empty", False)
+                        w.vm.want_empty = False
+                        c = w.vm.find("reload")
+                        w.vm.want_empty = old
+                        if c:
+                            sq = w.vm.seqs[c[0]]
+                            d = sq["n"] / max(1.0, sq["fps"])
+                            if d > 0.3:
+                                return min(d, 6.0)
+                except Exception:
+                    pass
+        return 3.7
+
     def vm_play(self, vm, kind):
         c = vm.find(kind)
         if kind == "shove" and not c:
@@ -4886,6 +5146,7 @@ class Game:
         self.vmA["t"] = 0.0
         self.vmA["loop"] = kind in ("idle", "run")
         self.vmA["kind"] = kind
+        self.vmA["spd"] = 1.0
         # standing still: hold the first frame of the idle sequence instead of playing it
         self.vmA["hold"] = bool(kind == "idle" and not VM_IDLE_ANIM and not self._vm_moving())
         if c and 0 <= self.vmA["s"] < len(vm.seqs):
@@ -4922,7 +5183,7 @@ class Game:
             A["t"] = 0.0
             vm.pose(A["s"], 0.0, loop=True)
             return
-        A["t"] += dt * s["fps"]
+        A["t"] += dt * s["fps"] * A.get("spd", 1.0)
         f = A["t"]
         if f >= s["n"]:
             if A["loop"]:
@@ -5037,7 +5298,8 @@ class Game:
             if n not in asset["mdl"] and not self.manual_mods:
                 wk = key_norm(w.n)
                 n = next((m for m in names if key_norm(re.sub(r"^v_", "", m)) == wk), None) or \
-                    next((m for m in names if wk in key_norm(m)), None)
+                    next((m for m in names if wk in key_norm(m)), None) or \
+                    (w.match and next((m for m in names if re.search(w.match, m.lower())), None))
             if n and not w.model and not pick and bool(w.melee) != bool(re.search("knife", n)):
                 n = None
             w._m = n if (n and n in asset["mdl"]) else None
@@ -5129,6 +5391,10 @@ class Game:
                 continue            # several weapons in this pack: only take sounds that name this one
             if self._SND_FIRE.search(stem):
                 sc += 5
+            if re.search(r"gunfire|/fire", low):
+                sc += 5
+            if re.search(r"incendiary|silenc|suppress|distant|/far|explo|alt", low):
+                sc -= 8
             if w.melee and not re.search(r"slash|swing|miss|stab|knife", low):
                 continue
             if not w.melee and re.search(r"knife|melee", low):
@@ -5160,7 +5426,7 @@ class Game:
         return base * att, lat * min(1.0, hd / 120.0)
 
     def weapon_mods(self):
-        """Loaded weapon view-models (v_*.mdl style), for the Loadout tab. Arms/hands packs are listed under Arms."""
+        """Loaded weapon view-models (v_*.mdl style), for the Skins tab. Arms/hands packs are listed under Arms."""
         return sorted(n for n in self.asset["mdl"]
                       if not re.match(r"^[pw]_", n) and not _is_arms_mdl(n) and n not in self.arms_all)
 
@@ -5218,7 +5484,7 @@ class Game:
         n_arms = sum(1 for n in arms if not hasattr(arch, "complete") or arch.complete(n))
         if n_arms:
             parts.append(f"{n_arms} arms/hands model(s)")
-        msg = f"{path.name}: {' + '.join(parts)} - pick them in Loadout."
+        msg = f"{path.name}: {' + '.join(parts)} - pick them in Skins."
         if getattr(arch, "incomplete", False):
             msg += " (package incomplete — re-download the full .vpk for missing models/textures)"
         return msg
@@ -5415,7 +5681,72 @@ class Game:
             return f"Cannot load map {path.name}: {ex}"
         self.files["bsp"] = raw          # used for the online map signature
         self.set_world(world)
+        self.remember_map(raw)
         return f"Map loaded: {world.name} ({len(world.B)} boxes)."
+
+    # --- online: find a map by its signature so joining a custom-map server just works ---
+    @staticmethod
+    def _map_dirs():
+        base = Path(__file__).resolve().parent
+        dirs = list(mod_folders("maps", "map"))
+        dirs.append(base / "mod" / "maps")
+        dirs.append(base / "mod")
+        out, seen = [], set()
+        for d in dirs:
+            try:
+                k = str(d.resolve())
+                if d.is_dir() and k not in seen:
+                    seen.add(k)
+                    out.append(d)
+            except Exception:
+                pass
+        return out
+
+    def remember_map(self, raw):
+        """Keep a copy of every map you load in mod/maps (named by its signature) so it can be re-found."""
+        try:
+            sig = hashlib.sha1(raw).hexdigest()[:10]
+            d = Path(__file__).resolve().parent / "mod" / "maps"
+            d.mkdir(parents=True, exist_ok=True)
+            p = d / (sig + ".fadmap")
+            if not p.exists():
+                p.write_bytes(raw)
+        except Exception:
+            pass
+
+    def find_map_by_sig(self, sig):
+        """Path of a local .fadmap whose signature matches `sig`, or None."""
+        for d in self._map_dirs():
+            try:
+                files = list(d.rglob("*.fadmap"))
+            except Exception:
+                continue
+            for p in files:
+                try:
+                    if hashlib.sha1(p.read_bytes()).hexdigest()[:10] == sig:
+                        return p
+                except Exception:
+                    pass
+        return None
+
+    def use_map_sig(self, sig):
+        """Make our world match the server's map. Returns (ok, message)."""
+        if sig == self.map_sig():
+            return True, ""
+        if self.net.active:
+            self.net.leave()          # maps can only change while offline
+        if sig == "arena":
+            self.files["bsp"] = None
+            self.set_world(ArenaWorld())
+            return True, "Switched to the arena map to match the server."
+        p = self.find_map_by_sig(sig)
+        if p is None:
+            return False, ("You don't have this server's map (custom_%s). Get the .fadmap from the host "
+                           "and load it (or drop it in mod/maps), then join again." % sig[:5])
+        msg = self.load_map(p)
+        if self.map_sig() != sig:
+            return False, "Could not load the server's map: " + msg
+        return True, "Found the server's map (%s) - loaded it." % p.name
 
     def set_weapon_pick(self, slot, name):
         if name:
@@ -5545,7 +5876,7 @@ class Game:
                     self.reset_game()
                 nsrc = sum(isinstance(v, SrcSpec) for v in self.asset["mdl"].values())
                 if not self.vm_msg and nsrc:
-                    return status or f"{nsrc} Source view-model(s) loaded - pick them in Loadout."
+                    return status or f"{nsrc} Source view-model(s) loaded - pick them in Skins."
                 return (self.vm_msg or "No weapon files matched.").strip() if not status else status
         return status or ""
 
@@ -5613,7 +5944,10 @@ class Game:
                     while e.acc >= TICK:
                         e.acc -= TICK
                         e.px, e.py, e.pz = e.x, e.y, e.z
+                        g0 = self.walkable(e)
+                        v0 = math.hypot(e.vx, e.vy)
                         self.ptick(e, TICK, f, s, n, c, sn)
+                        self.js_tick(e, s, g0, v0, TICK)
                     crouch = bool(K.get(B["crouch"])) and e.sl <= 0
                     e.cr += ((1.0 if crouch else 0.0) - e.cr) * min(1.0, dt * 14)
                     e.slk += ((1.0 if e.sl > 0 else 0.0) - e.slk) * min(1.0, dt * (9 if e.sl > 0 else 6))
@@ -5703,6 +6037,9 @@ class Game:
         self.xp_pops = [pp_ for pp_ in self.xp_pops if pp_["t"] > 0]
         self.rank_flash = max(0.0, self.rank_flash - dt)
         self.hm = max(0.0, self.hm - dt)
+        for c_ in self.chat:
+            c_["t"] -= dt
+        self.chat = [c_ for c_ in self.chat if c_["t"] > 0]
         self.flash = max(0.0, self.flash - dt * 2.5)
         self.shake = max(0.0, self.shake - dt * SHAKE_DECAY * max(0.2, self.shake))
         cvm = CFG["weapons"][P.w].vm
@@ -5765,9 +6102,23 @@ class Game:
         if hit_any and self.custom_hit:
             self.audio.play(.6, self.custom_hit)
 
+    def knife_index(self):
+        return next((i for i, w in enumerate(CFG["weapons"]) if w.melee), 0)
+
     def select_weapon(self, i):
+        """Key 1 = your primary gun, key 2 = knife. You only ever carry one gun plus the knife."""
         P = self.P
-        if P and 0 <= i < len(CFG["weapons"]):
+        if P and i in (0, 1):
+            P.w = self.primary if i == 0 else self.knife_index()
+            P.zoom = 0
+
+    def set_primary(self, i):
+        """Choose the one gun you carry (Loadout tab). Swaps straight to it if you are holding a gun."""
+        if not (0 <= i < len(CFG["weapons"])) or CFG["weapons"][i].melee:
+            return
+        self.primary = i
+        P = self.P
+        if P and not CFG["weapons"][P.w].melee and P.w != i:
             P.w = i
             P.zoom = 0
 
@@ -6030,7 +6381,7 @@ class Menu:
         self.sb_sel = None        # selected server id
         self.sb_click = (None, 0.0)
         self.sb_scroll = 0
-        self.lo_tab = "weapons"   # Loadout tab: "weapons" | "players"
+        self.lo_tab = "weapons"   # Skins tab: "weapons" | "players"
         self.lo_slot = 0          # weapon slot being edited
         self.lo_team = "CT"       # team being edited
         self.lo_page = 0
@@ -6174,7 +6525,8 @@ class Menu:
         nav("Play", "play", 80)
         nav("Profile", "profile", 124)
         nav("Loadout", "loadout", 168)
-        nav("Settings", "settings", 212)
+        nav("Skins", "skins", 212)
+        nav("Settings", "settings", 256)
         if g.net.active:
             gfx.text("ONLINE: " + g.net.room[:18], 20, LH - 48, 11, (104, 104, 104), mono=True)
         gfx.text("FAD-MOD", 20, LH - 26, 12, (154, 154, 154), bold=True)
@@ -6252,7 +6604,10 @@ class Menu:
                     return
                 g.player_name = pname()
                 g.P.name = g.player_name
-                g.net_join(r)
+                if g.net_join(r) is False and getattr(g, "join_msg", ""):
+                    self.status = g.join_msg
+                elif getattr(g, "join_msg", ""):
+                    self.status = g.join_msg
 
             def do_offline():
                 if self.check_ready():
@@ -6333,7 +6688,7 @@ class Menu:
                     button(cx + 314, byy, 100, 38, "Back", lambda: setattr(self, "cm_open", False))
                     miss = self.missing()
                     if miss:
-                        gfx.text("Pick mods in Loadout first: " + ", ".join(miss), cx + 430, byy + 12, 11, (255, 193, 7))
+                        gfx.text("Pick mods in Skins first: " + ", ".join(miss), cx + 430, byy + 12, 11, (255, 193, 7))
                     ly = LH
                 else:
                     ly = 128
@@ -6454,7 +6809,10 @@ class Menu:
                     gfx.text("Connect", cx + 199, fy + 16, 13, (80, 80, 80), bold=True, anchor="c")
                 gfx.text("%d server%s" % (len(shown), "" if len(shown) == 1 else "s"), cx + cw - 20, fy + 16, 12, (140, 140, 140), anchor="r")
                 if sel and sel["map"] != g.map_sig():
-                    gfx.text("This server uses another map.", cx + 284, fy + 16, 11, (255, 193, 7))
+                    have = sel["map"] == "arena" or g.find_map_by_sig(sel["map"]) is not None
+                    gfx.text("Other map - you have it, it loads on join." if have else
+                             "Other map - you don't have it.", cx + 284, fy + 16, 11,
+                             (157, 211, 103) if have else (255, 193, 7))
 
             # --- open dropdown lists (on top of everything) ---
             for (ox_, oy_, ow_, opts_, setter_, cur_) in overlays:
@@ -6513,16 +6871,89 @@ class Menu:
             if self.pfp_status:
                 gfx.text(self.pfp_status[:80], cx + 210, 336, 12, (255, 193, 7))
         elif self.page == "loadout":
-            gfx.text("YOUR KIT", cx, 32, 11, (119, 119, 119), bold=True)
+            # Class screen: grid of weapon cards with live 3D model previews (same renderer as the Skins tab)
+            gfx.text("CLASS", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Loadout.", cx, 48, 34, (255, 255, 255), bold=True)
-            gfx.text("Pick weapon mods, player models and arms. Click a card to equip it.",
+            gfx.text("Choose your primary weapon. You carry one gun at a time, plus your knife. Skins are changed in the Skins tab.",
+                     cx, 96, 13, (154, 154, 154))
+            wl = CFG["weapons"]
+            guns = [i for i, w in enumerate(wl) if not w.melee]
+            kn = g.knife_index()
+            cur = wl[g.primary]
+
+            def lo_stats(w):
+                pel = int(w.pellets or 1)
+                dmg = (w.dmg or 0) * (pel * .45 if pel > 1 else 1)
+                return (("Damage", dmg / 100.0), ("Fire rate", (w.rpm or 0) / 600.0),
+                        ("Magazine", (w.mag or 0) / 30.0), ("Accuracy", 1.0 - (w.spr or 0) / .05))
+
+            # equipped summary strip
+            gfx.text("EQUIPPED", cx, 134, 11, (119, 119, 119), bold=True)
+            gfx.rect(cx, 154, cw, 44, c255(17, 17, 17))
+            gfx.rect(cx, 154, 4, 44, c255(157, 211, 103))
+            gfx.text(str(cur.n), cx + 20, 162, 20, (255, 255, 255), bold=True)
+            gfx.text(str(cur.cls or "Weapon"), cx + 20 + gfx.text_w(str(cur.n), 20, True) + 12, 168, 12, (130, 130, 130))
+            gfx.text("+ " + str(wl[kn].n) + "  (key 2)", cx + cw - 16, 168, 12, (154, 154, 154), anchor="r")
+
+            gap = 16
+            ncols = max(2, min(4, int((cw + gap) // 230)))
+            cwd = (cw - gap * (ncols - 1)) / ncols
+            pvh = 132
+            chd = pvh + 118
+            gy0 = 222
+            avail = max(chd, int(LH - gy0 - 24))
+            nrows = max(1, int((avail + gap) // (chd + gap)))
+            per_pg = ncols * nrows
+            cards = [(i, False) for i in guns] + [(kn, True)]
+            npg = max(1, (len(cards) + per_pg - 1) // per_pg)
+            self.lo_gpage = max(0, min(getattr(self, "lo_gpage", 0), npg - 1))
+            if npg > 1:
+                gfx.text("%d / %d  (scroll)" % (self.lo_gpage + 1, npg), cx + cw, 134, 11, (119, 119, 119), bold=True, anchor="r")
+            for idx, (i, is_melee) in enumerate(cards[self.lo_gpage * per_pg:(self.lo_gpage + 1) * per_pg]):
+                r_, c_ = divmod(idx, ncols)
+                x = cx + c_ * (cwd + gap)
+                y = gy0 + r_ * (chd + gap)
+                w = wl[i]
+                on = (i == g.primary) and not is_melee
+                hv = hover(x, y, cwd, chd) and not is_melee
+                gfx.box(x, y, cwd, chd, c255(26, 26, 26) if (on or hv) else c255(17, 17, 17),
+                        c255(157, 211, 103) if on else (c255(120, 120, 120) if hv else c255(42, 42, 42)))
+                inst = self.pv_weapon(w._m) if w._m else None
+                self.draw_card_preview(W, H, x + 2, y + 2, cwd - 4, pvh, "weapon", inst)
+                if inst is None:
+                    gfx.text("NO MODEL LOADED", x + cwd / 2, y + 2 + pvh / 2 - 6, 11, (90, 90, 90), bold=True, anchor="c")
+                gfx.rect(x + 2, y + pvh + 2, cwd - 4, 1, c255(42, 42, 42))
+                ty = y + pvh + 10
+                gfx.text(str(w.n), x + 12, ty, 17, (255, 255, 255) if (on or is_melee) else (210, 210, 210), bold=True)
+                gfx.text(str(w.cls or ("Melee" if is_melee else "Weapon")), x + 12, ty + 24, 11, (130, 130, 130))
+                if on:
+                    gfx.rect(x + cwd - 84, ty + 2, 72, 18, c255(157, 211, 103, .18))
+                    gfx.text("EQUIPPED", x + cwd - 48, ty + 5, 10, (157, 211, 103), bold=True, anchor="c")
+                elif is_melee:
+                    gfx.text("ALWAYS", x + cwd - 12, ty + 5, 10, (130, 130, 130), bold=True, anchor="r")
+                if is_melee:
+                    gfx.text("Always equipped (key 2)", x + 12, ty + 52, 11, (110, 110, 110))
+                else:
+                    bw_ = (cwd - 24 - 12) / 2
+                    for k, (lab, v) in enumerate(lo_stats(w)):
+                        bx = x + 12 + (k % 2) * (bw_ + 12)
+                        by = ty + 48 + (k // 2) * 28
+                        gfx.text(lab.upper(), bx, by, 9, (110, 110, 110), bold=True)
+                        gfx.rect(bx, by + 14, bw_, 5, c255(42, 42, 42))
+                        gfx.rect(bx, by + 14, bw_ * max(.03, min(1.0, v)), 5,
+                                 c255(157, 211, 103) if on else c255(200, 200, 200))
+                    self.hot.append((x, y, cwd, chd, lambda i=i: g.set_primary(i), None))
+        elif self.page == "skins":
+            gfx.text("YOUR KIT", cx, 32, 11, (119, 119, 119), bold=True)
+            gfx.text("Skins.", cx, 48, 34, (255, 255, 255), bold=True)
+            gfx.text("Change your weapon skins, player models and arms. Click a card to equip it.",
                      cx, 96, 13, (154, 154, 154))
             wp = self.lo_tab == "weapons"
             ar = self.lo_tab == "arms"
             button(cx, 124, 130, 32, "Weapon mods", lambda: self.lo_set("weapons"), wp)
             button(cx + 140, 124, 130, 32, "Player models", lambda: self.lo_set("players"), self.lo_tab == "players")
             button(cx + 280, 124, 100, 32, "Arms", lambda: self.lo_set("arms"), ar)
-            ws = CFG["weapons"][:3]
+            ws = CFG["weapons"][:4]
             if wp:
                 items = g.weapon_mods()
             elif ar:
@@ -6545,10 +6976,10 @@ class Menu:
             if wp:
                 self.lo_slot = max(0, min(self.lo_slot, len(ws) - 1)) if ws else 0
                 for i, w in enumerate(ws):
-                    button(cx + i * 160, 166, 150, 30, f"{i + 1}  {w.n}"[:18],
+                    button(cx + i * 160, 166, 150, 30, w.n[:18],
                            lambda i=i: setattr(self, "lo_slot", i), self.lo_slot == i)
                 cur = ws[self.lo_slot] if ws else None
-                info = ("Slot %d (%s): " % (self.lo_slot + 1, cur.n) + (cur._m or "no model - box")
+                info = ("%s: " % cur.n + (cur._m or "no model - box")
                         + ("" if self.lo_slot in g.wm_pick else "  (auto)")) if cur else ""
             elif ar:
                 info = "Arms: " + (g.arms_pick or ("none (built-in hands)" if g.arms_off or not g.arms_pick else "none"))
@@ -6782,12 +7213,17 @@ class Menu:
             gfx.text(f"{int(round(g.fov_cfg))}", cx + cw - 20, 14 + 292, 13, (255, 255, 255), bold=True, anchor="r")
             slider(cx + 20, 292 + 62, cw - 190, g.fov_cfg, 50, 110, lambda v: setattr(g, "fov_cfg", float(round(v))))
             button(cx + cw - 150, 292 + 54, 130, 30, "Reset to 75", lambda: setattr(g, "fov_cfg", 75.0))
-            panel(cx, 400, cw, 92, "Fullscreen", "Fills the whole screen. You can also press F11 any time.")
-            button(cx + 20, 400 + 44, 200, 36, "Fullscreen: ON" if g.fullscreen else "Fullscreen: OFF",
+            panel(cx, 400, cw, 100, "Fullscreen", "Fills the whole screen. You can also press F11 any time.")
+            button(cx + 20, 400 + 54, 200, 36, "Fullscreen: ON" if g.fullscreen else "Fullscreen: OFF",
                    lambda: (set_fullscreen(g, not g.fullscreen), save_settings(g, self)), bool(g.fullscreen))
-            panel(cx, 508, cw, 92, "FPS counter", "Shows your frames per second in the top-left corner while playing.")
-            button(cx + 20, 508 + 44, 200, 36, "FPS counter: ON" if g.show_fps else "FPS counter: OFF",
+            panel(cx, 508, cw, 100, "FPS counter / Speed meter / Jump stats",
+                  "FPS: top-left. Speed: bottom center. Jump stats: distance, speed and strafes in chat.")
+            button(cx + 20, 508 + 54, 200, 36, "FPS counter: ON" if g.show_fps else "FPS counter: OFF",
                    lambda: (setattr(g, "show_fps", not g.show_fps), save_settings(g, self)), bool(g.show_fps))
+            button(cx + 240, 508 + 54, 200, 36, "Speed meter: ON" if g.show_speed else "Speed meter: OFF",
+                   lambda: (setattr(g, "show_speed", not g.show_speed), save_settings(g, self)), bool(g.show_speed))
+            button(cx + 460, 508 + 54, 200, 36, "Jump stats: ON" if g.show_jstats else "Jump stats: OFF",
+                   lambda: (setattr(g, "show_jstats", not g.show_jstats), save_settings(g, self)), bool(g.show_jstats))
         gl.glPopMatrix()
 
     def missing(self):
@@ -6868,8 +7304,10 @@ class Menu:
     def wheel(self, dy):
         if self.page == "play" and dy:
             self.sb_scroll = max(0, self.sb_scroll + (-1 if dy > 0 else 1))
-        if self.page == "loadout" and dy:
+        if self.page == "skins" and dy:
             self.lo_page = max(0, self.lo_page + (-1 if dy > 0 else 1))
+        if self.page == "loadout" and dy:
+            self.lo_gpage = max(0, getattr(self, "lo_gpage", 0) + (-1 if dy > 0 else 1))
 
     def lo_pick(self, name):
         g = self.g
@@ -6913,7 +7351,7 @@ class Menu:
         return self.pv[k]
 
     def pv_arms(self, name):
-        """Standalone arms model for the Loadout Arms tab preview."""
+        """Standalone arms model for the Skins Arms tab preview."""
         g = self.g
         spec = g.arms_all.get(name)
         if spec is None:
@@ -7527,6 +7965,17 @@ def render_hud(game, gfx, W, H, menu_visible):
     gfx.rect(W - 22 - hud_w - 12, H - 50 - 6, hud_w + 24, 22 + 12, (22 / 255, 22 / 255, 22 / 255, .94))  # same dark gray as HP background
     gfx.text(hud_txt, W - 22, H - 50, 22, (255, 255, 255), bold=True, anchor="r", mono=True)
 
+    # chat (bottom-left): jump stats show up here and fade out after a few seconds
+    cy_ = H - 104
+    for ln in reversed(game.chat):
+        al_ = max(0.0, min(1.0, ln["t"] / 1.5))
+        tg_ = "[%s] " % ln["tag"]
+        tw_ = gfx.text_w(tg_, 10, True) + gfx.text_w(ln["text"], 10)
+        gfx.rect(10, cy_ - 2, tw_ + 12, 16, (22 / 255, 22 / 255, 22 / 255, .8 * al_))
+        gfx.text(tg_, 16, cy_, 10, (255, 193, 7), alpha=al_, bold=True)
+        gfx.text(ln["text"], 16 + gfx.text_w(tg_, 10, True), cy_, 10, (255, 255, 255), alpha=al_)
+        cy_ -= 19
+
     # kill feed (same look as the scoreboard: dark panel, team-tinted name bands)
     y = 18
     rh = 26
@@ -7580,6 +8029,12 @@ def render_hud(game, gfx, W, H, menu_visible):
         draw_scoreboard(game, gfx, W, H)
     if game.show_fps:
         gfx.text(f"{int(round(game.fps_val))} FPS", 12, 10, 14, (255, 255, 255), bold=True, mono=True)
+    if game.show_speed and P.alive and not game.over:
+        sp_ = math.hypot(P.vx, P.vy)                     # horizontal speed, units / second
+        t_ = max(0.0, min(1.0, (sp_ - MAXS) / (MAXS * 0.6)))   # white at normal speed -> yellow when fast
+        col_ = (255, int(255 - 62 * t_), int(255 - 248 * t_))
+        gfx.text(f"{int(round(sp_))}", W / 2, H - 92, 26, col_, bold=True, anchor="c", mono=True)
+        gfx.text("UNITS / SEC", W / 2, H - 62, 10, (154, 154, 154), bold=True, anchor="c")
     gl.glColor4f(1, 1, 1, 1)
     gl.glEnable(gl.GL_TEXTURE_2D)
 
@@ -7622,6 +8077,8 @@ def load_settings(game, menu):
         menu.resw, menu.resh = str(game.res[0]), str(game.res[1])
         game.want_fullscreen = bool(j.get("fullscreen", False))
         game.show_fps = bool(j.get("show_fps", False))
+        game.show_speed = bool(j.get("show_speed", False))
+        game.show_jstats = bool(j.get("show_jstats", True))
         FX.day = bool(j.get("day", False))
         vo = j.get("vm_offset")
         if isinstance(vo, list) and len(vo) == 3:
@@ -7631,6 +8088,12 @@ def load_settings(game, menu):
             if sp and Path(sp).is_file():
                 game.set_custom_sound(kind, sp)
         game.audio.volume = float(j.get("volume", .25))
+        try:
+            pw = int(j.get("primary", game.primary))
+            if 0 <= pw < len(CFG["weapons"]) and not CFG["weapons"][pw].melee:
+                game.primary = pw
+        except Exception:
+            pass
         wmj = j.get("weapon_models", {})
         if isinstance(wmj, dict):
             game.wm_pick = {int(k): v for k, v in wmj.items() if str(k).isdigit() and isinstance(v, str)}
@@ -7664,7 +8127,7 @@ def set_fullscreen(game, on):
 def save_settings(game, menu):
     try:
         SETTINGS_FILE.write_text(json.dumps({
-            "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "hand_swap": game.hand_swap, "bots_on": game.bots_on, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "day": bool(FX.day), "res": list(game.res), "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "fov": game.fov_cfg, "vm_offset": game.vm_adj,
+            "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "hand_swap": game.hand_swap, "bots_on": game.bots_on, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "primary": game.primary, "day": bool(FX.day), "res": list(game.res), "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "show_speed": bool(game.show_speed), "show_jstats": bool(game.show_jstats), "fov": game.fov_cfg, "vm_offset": game.vm_adj,
             "shot_sound": game.custom_shot_path, "hit_sound": game.custom_hit_path, "sens": game.sens, "xp": int(game.xp), "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh,
         }, indent=2))
     except Exception:
@@ -7759,7 +8222,7 @@ def main():
     game.player_name = menu.name.strip() or "Player"
     game.P.name = game.player_name
 
-    # Scan the mod folders so everything shows up in Loadout. Nothing is EQUIPPED automatically
+    # Scan the mod folders so everything shows up in Skins. Nothing is EQUIPPED automatically
     # (game.manual_mods): you pick the weapons / players / arms / sounds yourself, or play with none.
     # Weapon mods (.mdl / .wav / .json) from mod/weapon (never created).
     try:
@@ -7856,7 +8319,7 @@ def main():
                         game.P.jreq = 1
                     if name == b["reload"]:
                         game.reload_pressed()
-                    for i in range(3):
+                    for i in range(2):
                         if name == b[f"weapon{i + 1}"]:
                             game.select_weapon(i)
                     if name == b["swaphand"]:
@@ -7891,7 +8354,7 @@ def main():
                             game.P.jreq = 1
                         if code == b["reload"]:
                             game.reload_pressed()
-                        for i in range(3):
+                        for i in range(2):
                             if code == b[f"weapon{i + 1}"]:
                                 game.select_weapon(i)
                         if code == b["swaphand"]:
