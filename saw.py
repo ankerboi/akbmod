@@ -15,13 +15,27 @@ Controls
   Tools    V select    B box    1 spawn BLACK team    2 spawn YELLOW team
   Box      click + drag on the floor (or on top of another box) = draw the footprint.
            It gets the current Height. Mouse wheel while dragging changes the height.
+  Slope    press 3, press R (or T) to pick the uphill direction, then drag the footprint like a box.
+           Height = how high the top end is.  A real smooth slope.
+  Circle   press 4, click the CENTER and drag outward = radius.  Height works like a box.
+           A real smooth cylinder.  Select / move / resize / texture them like boxes.
   Select   click a box / spawn.   Drag it to move it.
            Arrows = move    PageUp / PageDown = up / down
            Shift + Up/Down = longer / shorter      Shift + Left/Right = narrower / wider
            Shift + PageUp/PageDown = taller / shorter
+           Ctrl+C copy    Ctrl+X cut    Ctrl+V paste (lands where the mouse points: floor or top of a box)
            Del = delete      Ctrl+D = duplicate      R = turn a spawn (Shift+R = other way)
+  Spin     press 5 (or Y), click a box / slope / circle / spawn. A ring with an ARROW appears around it:
+           DRAG the arrow (or the ring) to spin it. Snaps to the turn step; hold Shift = free angle.
+           , and . = turn the selection one step      U = change the step (5 / 15 / 30 / 45 / 90)
+  Stretch  press 6 (or X), click a box. Arrows appear on its faces: DRAG an arrow to push / pull that
+           face (snaps to the grid, Shift = free). Works on slopes and circles too.
+           F5 turns spun boxes into plain boxes for the game (a spin of 0/90/180/270 stays exact).
   Skybox   "Set image" in the left panel (or drop an image on the empty sky) = skybox.
            Use a wide panorama (2:1) for best results.
+           CUBEMAP: "Set cubemap" and pick 6 images named px nx py ny pz nz (also posx/negx..., or
+           right left up down front back, or rt lf up dn ft bk). Or drop the face files on the sky
+           one by one. px/nx = east/west, py/ny = up/down, pz/nz = south/north. The game gets it baked.
 Texture  DRAG an image file from your PC and DROP it on the face you want (that one face gets it).
            Or "Add image", then click it in the right panel (whole selected box),
            Shift+click = top only, Ctrl+click = sides only, or DRAG it from the panel onto a face.
@@ -36,6 +50,7 @@ import json
 import math
 import time
 import base64
+import re
 import zlib
 from pathlib import Path
 
@@ -78,7 +93,45 @@ TEAM_NAMES = ("BLACK", "YELLOW")
 TEAM_COL = ((0.35, 0.70, 1.00), (1.00, 0.84, 0.10))
 DEFAULT_COL = (176, 160, 144)
 HULL_R, HULL_H = 16.0, 72.0          # player: 32 wide, 72 tall (same as the game)
-SELECT, BOX, SPAWN0, SPAWN1 = "select", "box", "spawn0", "spawn1"
+SELECT, BOX, SPAWN0, SPAWN1, RAMP, CIRC, ROT = "select", "box", "spawn0", "spawn1", "ramp", "circle", "rotate"
+STRETCH = "stretch"
+TURN_SNAPS = (5, 15, 30, 45, 90)     # degrees, for the spin / turn tool
+RAMP_DIRS = ("+X", "+Y", "-X", "-Y")
+
+
+def gen_ramp(x0, y0, x1, y1, z, h, d):
+    """Ramp = a row of thin boxes (so the game needs no changes). d: 0 +x, 1 +y, 2 -x, 3 -y = uphill direction."""
+    along_x = d in (0, 2)
+    L = (x1 - x0) if along_x else (y1 - y0)
+    n = int(max(2, min(256, h / 1.5, L)))
+    out = []
+    for i in range(n):
+        a, b = L * i / n, L * (i + 1) / n
+        top = z + h * (i + 1) / n
+        if d == 2:
+            a, b = L - b, L - a
+        if d == 3:
+            a, b = L - b, L - a
+        if along_x:
+            out.append([x0 + a, y0, z, x0 + b, y1, top])
+        else:
+            out.append([x0, y0 + a, z, x1, y0 + b, top])
+    return out
+
+
+def gen_circle(cx, cy, r, z, h):
+    """Round pillar / disc = strips of boxes."""
+    s = max(2.0, 2 * r / 160.0)
+    n = int(math.ceil(2 * r / s))
+    out = []
+    for j in range(n):
+        ya = cy - r + j * s
+        yb = min(ya + s, cy + r)
+        dy = (ya + yb) / 2 - cy
+        hw = math.sqrt(max(0.0, r * r - dy * dy))
+        if hw >= 1 and yb - ya >= 1:
+            out.append([cx - hw, ya, z, cx + hw, yb, z + h])
+    return out
 LW, RW, SB = 196, 236, 26           # left panel, right panel, status bar sizes
 
 
@@ -86,10 +139,13 @@ LW, RW, SB = 196, 236, 26           # left panel, right panel, status bar sizes
 # Map data
 # --------------------------------------------------------------------------
 class Box:
-    __slots__ = ("b", "t", "tt", "tile", "col", "f")
+    __slots__ = ("b", "t", "tt", "tile", "col", "f", "k", "d", "yaw")
 
-    def __init__(self, b, t=-1, tt=None, tile=128.0, col=DEFAULT_COL, f=None):
+    def __init__(self, b, t=-1, tt=None, tile=128.0, col=DEFAULT_COL, f=None, k=0, d=0, yaw=0.0):
         self.b = [float(v) for v in b]
+        self.yaw = float(yaw)                    # spin around the box centre, degrees (counter-clockwise from above)
+        self.k = int(k)                          # 0 box, 1 slope, 2 cylinder
+        self.d = int(d)                          # slope uphill direction: 0 +x, 1 +y, 2 -x, 3 -y
         self.t = int(t)                          # texture of the sides + bottom (-1 = flat colour)
         self.tt = self.t if tt is None else int(tt)   # texture of the top
         self.tile = float(tile)                  # world units per texture repeat
@@ -99,7 +155,7 @@ class Box:
         self.f = [int(v) for v in (f + [-1] * 6)[:6]]
 
     def copy(self):
-        return Box(list(self.b), self.t, self.tt, self.tile, self.col, self.f)
+        return Box(list(self.b), self.t, self.tt, self.tile, self.col, self.f, self.k, self.d, self.yaw)
 
     def fix(self):
         b = self.b
@@ -219,8 +275,86 @@ def decode_tex(d):
     return Tex(d.get("name", "texture"), s)
 
 
+CUBE_FACES = ("px", "nx", "py", "ny", "pz", "nz")
+CUBE_ALIASES = (("px", "posx", "right", "rt", "east"), ("nx", "negx", "left", "lf", "west"),
+                ("py", "posy", "up", "top", "bottom_"), ("ny", "negy", "down", "dn", "bottom"),
+                ("pz", "posz", "front", "ft"), ("nz", "negz", "back", "bk"))
+
+
+def face_index(path):
+    """File name -> cubemap face 0..5 (px nx py ny pz nz) or None."""
+    stem = Path(str(path)).stem.lower()
+    toks = [(a, i) for i, names in enumerate(CUBE_ALIASES) for a in names if a != "bottom_"]
+    toks.sort(key=lambda t: -len(t[0]))
+    for a, i in toks:                                   # whole word: "sky_px", "px-1", "px"
+        if re.search(r"(?:^|[^a-z0-9])" + a + r"(?:$|[^a-z0-9])", stem):
+            return i
+    for a, i in toks:                                   # glued on the end: "skyboxpz", "cloudsft"
+        if len(a) >= 2 and stem.endswith(a):
+            return i
+    return None
+
+
+def make_gl_cube(faces, s):
+    """6 Tex -> GL cube map texture (all faces s x s)."""
+    tid = gl.glGenTextures(1)
+    gl.glBindTexture(gl.GL_TEXTURE_CUBE_MAP, tid)
+    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+    for i, t in enumerate(faces):
+        sf = t.surf if t.surf.get_size() == (s, s) else pygame.transform.smoothscale(t.surf, (s, s))
+        gl.glTexImage2D(gl.GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, gl.GL_RGBA, s, s, 0, gl.GL_RGBA,
+                        gl.GL_UNSIGNED_BYTE, surf_bytes(sf))
+    for pn, v in ((gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR), (gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR),
+                  (gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE), (gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE),
+                  (gl.GL_TEXTURE_WRAP_R, gl.GL_CLAMP_TO_EDGE)):
+        gl.glTexParameteri(gl.GL_TEXTURE_CUBE_MAP, pn, v)
+    return tid
+
+
+def cube_size(faces):
+    return int(min(1024, max(max(t.surf.get_size()) for t in faces)))
+
+
+def cube_to_equirect(faces, W=2048, H=1024):
+    """6 cube faces -> one 2:1 panorama Surface (the sky the game already understands).
+    World (x, y, z-up) is looked up in the cube as GL direction (x, z, -y)."""
+    s = cube_size(faces)
+    arrs = []
+    for t in faces:
+        sf = t.surf if t.surf.get_size() == (s, s) else pygame.transform.smoothscale(t.surf, (s, s))
+        arrs.append(pygame.surfarray.array3d(sf).astype(np.float32))      # [x, y, rgb]
+    lon = 2 * np.pi * (1 - (np.arange(W) + 0.5) / W)
+    lat = np.pi / 2 - np.pi * (np.arange(H) + 0.5) / H
+    LON, LAT = np.meshgrid(lon, lat)
+    wx, wy, wz = np.cos(LAT) * np.cos(LON), np.cos(LAT) * np.sin(LON), np.sin(LAT)
+    gx, gy, gz = wx, wz, -wy
+    ax, ay, az = np.abs(gx), np.abs(gy), np.abs(gz)
+    face = np.where((ax >= ay) & (ax >= az), np.where(gx > 0, 0, 1),
+                    np.where(ay >= az, np.where(gy > 0, 2, 3), np.where(gz > 0, 4, 5)))
+    maps = ((-gz, -gy, ax), (gz, -gy, ax), (gx, gz, ay), (gx, -gz, ay), (gx, -gy, az), (-gx, -gy, az))
+    out = np.zeros((H, W, 3), np.float32)
+    for i, (sc, tc, ma) in enumerate(maps):
+        m = face == i
+        if not m.any():
+            continue
+        fx = np.clip((sc[m] / ma[m] + 1) * 0.5 * (s - 1), 0, s - 1)
+        fy = np.clip((tc[m] / ma[m] + 1) * 0.5 * (s - 1), 0, s - 1)
+        x0, y0 = np.floor(fx).astype(int), np.floor(fy).astype(int)
+        x1, y1 = np.minimum(x0 + 1, s - 1), np.minimum(y0 + 1, s - 1)
+        ux, uy = (fx - x0)[:, None], (fy - y0)[:, None]
+        a = arrs[i]
+        out[m] = (a[x0, y0] * (1 - ux) * (1 - uy) + a[x1, y0] * ux * (1 - uy)
+                  + a[x0, y1] * (1 - ux) * uy + a[x1, y1] * ux * uy)
+    surf = pygame.surfarray.make_surface(np.ascontiguousarray(out.transpose(1, 0, 2)).astype(np.uint8))
+    try:
+        return surf.convert_alpha()
+    except Exception:
+        return surf
+
+
 class MapDoc:
     def __init__(self):
+        self.cube = [None] * 6            # sky as 6 faces (px nx py ny pz nz): Tex or None
         self.boxes = []
         self.spawns = []
         self.tex = []
@@ -247,14 +381,17 @@ class MapDoc:
         d = {
             "format": MAP_FORMAT, "version": MAP_VERSION, "name": self.name,
             "textures": [encode_tex(self.tex[i], max_side) for i in used],
-            "boxes": [{"b": [round(v, 3) for v in b.b], "t": remap.get(b.t, -1), "tt": remap.get(b.tt, -1),
-                       "tile": b.tile, "c": list(b.col),
-                       "f": [remap.get(v, -1) for v in b.f]} for b in boxes],
+            "boxes": [dict({"b": [round(v, 3) for v in b.b], "t": remap.get(b.t, -1), "tt": remap.get(b.tt, -1),
+                            "tile": b.tile, "c": list(b.col), "k": b.k, "d": b.d,
+                            "f": [remap.get(v, -1) for v in b.f]},
+                           **({"yaw": round(b.yaw, 3)} if b.yaw else {})) for b in boxes],
             "spawns": [[{"p": [round(s.x, 2), round(s.y, 2), round(s.z, 2)], "yaw": round(s.yaw, 1)}
                         for s in self.spawns if s.team == t] for t in (0, 1)],
         }
         if self.sky is not None:
             d["sky"] = encode_tex(self.sky, 2048)
+        if all(self.cube) and not compiled:
+            d["skycube"] = [encode_tex(t, 1024) for t in self.cube]
         if cam:
             d["cam"] = cam
         return d
@@ -263,7 +400,7 @@ class MapDoc:
         if d.get("format") != MAP_FORMAT:
             raise ValueError("not a FAD-MOD map file")
         self.tex = [decode_tex(t) for t in d.get("textures", [])]
-        self.boxes = [Box(b["b"], b.get("t", -1), b.get("tt"), b.get("tile", 128), b.get("c", DEFAULT_COL), b.get("f"))
+        self.boxes = [Box(b["b"], b.get("t", -1), b.get("tt"), b.get("tile", 128), b.get("c", DEFAULT_COL), b.get("f"), b.get("k", 0), b.get("d", 0), b.get("yaw", 0.0))
                       for b in d.get("boxes", [])]
         for b in self.boxes:
             b.fix()
@@ -273,6 +410,8 @@ class MapDoc:
                 p = s["p"]
                 self.spawns.append(Spawn(t, p[0], p[1], p[2], s.get("yaw", 0)))
         self.sky = decode_tex(d["sky"]) if d.get("sky") else None
+        sc = d.get("skycube")
+        self.cube = [decode_tex(x) for x in sc] if sc and len(sc) == 6 else [None] * 6
         self.name = d.get("name", "untitled")
         return d.get("cam")
 
@@ -301,12 +440,21 @@ def compile_doc(doc, out_path):
     """Returns (summary lines, warnings). Writes out_path."""
     msgs, warns = [], []
     boxes, seen, dropped, dups = [], set(), 0, 0
-    for b in doc.boxes:
+    flat, spun, spun_out = [], 0, 0
+    for src in doc.boxes:
+        if src.yaw % 360.0:
+            pieces = bake_box(src)           # the game only knows axis-aligned boxes
+            spun += 1
+            spun_out += len(pieces)
+            flat.extend(pieces)
+        else:
+            flat.append(src)
+    for b in flat:
         c = tuple(round(v, 2) for v in b.b)
         if c[3] - c[0] < 1 or c[4] - c[1] < 1 or c[5] - c[2] < 1:
             dropped += 1
             continue
-        key = (c, b.t, b.tt, b.tile, b.col, tuple(b.f))
+        key = (c, b.t, b.tt, b.tile, b.col, tuple(b.f), b.k, b.d)
         if key in seen:
             dups += 1
             continue
@@ -318,6 +466,8 @@ def compile_doc(doc, out_path):
         warns.append("removed %d empty box(es)" % dropped)
     if dups:
         warns.append("removed %d duplicate box(es)" % dups)
+    if spun:
+        warns.append("%d spun object(s) became %d plain boxes" % (spun, spun_out))
     if not boxes:
         raise ValueError("The map is empty. Build something first.")
     bl = [b.b for b in boxes]
@@ -330,7 +480,7 @@ def compile_doc(doc, out_path):
             warns.append("a %s spawn at (%d, %d, %d) is inside a wall or floating: dropped" % (TEAM_NAMES[s.team], s.x, s.y, s.z))
     # a team without spawn points gets some automatically
     cands = []
-    for b in bl:
+    for b in [x.b for x in boxes if x.k != 1]:
         if b[3] - b[0] < 96 or b[4] - b[1] < 96:
             continue
         z = b[5]
@@ -368,6 +518,8 @@ def compile_doc(doc, out_path):
     tmp = MapDoc()
     tmp.boxes, tmp.spawns, tmp.tex, tmp.name = boxes, spawns, doc.tex, doc.name
     tmp.sky = doc.sky
+    if all(doc.cube):
+        tmp.sky = Tex("sky_from_cubemap", cube_to_equirect(doc.cube))
     d = tmp.to_dict(compiled=True, max_side=512)
     d["void_z"] = round(min(b[2] for b in bl) - 800.0, 1)
     d["bounds"] = [round(min(b[i] for b in bl), 1) for i in range(3)] + [round(max(b[i + 3] for b in bl), 1) for i in range(3)]
@@ -377,6 +529,135 @@ def compile_doc(doc, out_path):
     msgs.append("%d boxes, %d textures, spawns: %d BLACK / %d YELLOW, %.1f KB" % (
         len(boxes), len(d["textures"]), n0, len(spawns) - n0, len(raw) / 1024.0))
     return msgs, warns
+
+
+# --------------------------------------------------------------------------
+# Spin / turn helpers
+# --------------------------------------------------------------------------
+def yaw_cs(yaw):
+    a = math.radians(yaw)
+    return math.cos(a), math.sin(a)
+
+
+def rot_point(box, p, inv=False):
+    """Point p -> where it ends up after the box is spun about its own centre (inv = the other way)."""
+    if not box.yaw:
+        return p
+    c, s = yaw_cs(-box.yaw if inv else box.yaw)
+    cx, cy = (box.b[0] + box.b[3]) / 2.0, (box.b[1] + box.b[4]) / 2.0
+    dx, dy = p[0] - cx, p[1] - cy
+    return (cx + dx * c - dy * s, cy + dx * s + dy * c, p[2])
+
+
+def rot_vec(box, v, inv=False):
+    if not box.yaw:
+        return v
+    c, s = yaw_cs(-box.yaw if inv else box.yaw)
+    return (v[0] * c - v[1] * s, v[0] * s + v[1] * c, v[2])
+
+
+def _solve_range(a, b, h):
+    """All t with |a*t + b| <= h  ->  (lo, hi) or None."""
+    if abs(a) < 1e-9:
+        return (-1e18, 1e18) if abs(b) <= h else None
+    t1, t2 = (-h - b) / a, (h - b) / a
+    return (min(t1, t2), max(t1, t2))
+
+
+def _strips(cx, cy, ex, ey, hmin, fn):
+    """Fill a turned shape with thin axis-aligned strips. fn(stack_y, offset) -> (lo, hi) across the strip."""
+    stack_y = ey <= ex                          # stack along the shorter side: fewer strips
+    ext, c0 = (ey, cy) if stack_y else (ex, cx)
+    s = max(2.0, min(16.0, hmin / 2.0))
+    n = int(max(1, min(200, math.ceil(2 * ext / s))))
+    step = 2 * ext / n
+    out = []
+    for j in range(n):
+        a = c0 - ext + j * step
+        iv = fn(stack_y, a + step / 2 - c0)
+        if not iv or iv[1] - iv[0] < 1.0:
+            continue
+        if stack_y:
+            out.append((cx + iv[0], a, cx + iv[1], a + step))
+        else:
+            out.append((a, cy + iv[0], a + step, cy + iv[1]))
+    return out
+
+
+def bake_box(b):
+    """A spun box / slope / circle -> plain axis-aligned boxes (what the game understands)."""
+    yaw = b.yaw % 360.0
+    x0, y0, z0, x1, y1, z1 = b.b
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    hx, hy = (x1 - x0) / 2, (y1 - y0) / 2
+    q = int(round(yaw / 90.0))
+    if abs(yaw - q * 90.0) < 1e-3:               # 0 / 90 / 180 / 270: exact, keeps real slopes and cylinders
+        q %= 4
+        f = list(b.f)
+        for _ in range(q):
+            f = [f[0], f[1], f[4], f[5], f[3], f[2]]
+            hx, hy = hy, hx
+        nb = b.copy()
+        nb.yaw = 0.0
+        nb.b = [cx - hx, cy - hy, z0, cx + hx, cy + hy, z1]
+        nb.f = f
+        if b.k == 1:
+            nb.d = (b.d + q) % 4
+        return [nb]
+    if b.k == 2 and abs(hx - hy) < 1e-3:         # a round cylinder looks the same spun
+        nb = b.copy()
+        nb.yaw = 0.0
+        return [nb]
+    c, s = yaw_cs(yaw)
+    rects = []                                    # (x0, y0, z0, x1, y1, z1)
+    if b.k == 1:                                  # slope: a grid of little columns following the surface
+        ex, ey = abs(hx * c) + abs(hy * s), abs(hx * s) + abs(hy * c)
+        cs = max(6.0, math.sqrt(4 * hx * hy / 250.0))
+        nx, ny = max(1, int(math.ceil(2 * ex / cs))), max(1, int(math.ceil(2 * ey / cs)))
+        sx, sy = 2 * ex / nx, 2 * ey / ny
+        for i in range(nx):
+            for j in range(ny):
+                xa, ya = cx - ex + i * sx, cy - ey + j * sy
+                X, Y = xa + sx / 2 - cx, ya + sy / 2 - cy
+                u, v = c * X + s * Y, -s * X + c * Y
+                if abs(u) > hx or abs(v) > hy:
+                    continue
+                t = ((u + hx) / (2 * hx), (v + hy) / (2 * hy), 1 - (u + hx) / (2 * hx), 1 - (v + hy) / (2 * hy))[b.d % 4]
+                rects.append((xa, ya, z0, xa + sx, ya + sy, z0 + max(1.0, (z1 - z0) * t)))
+    elif b.k == 2:                                # elliptic cylinder
+        ex, ey = math.hypot(hx * c, hy * s), math.hypot(hx * s, hy * c)
+
+        def ell(stack_y, off):
+            B = 2 * c * s * off * (1 / (hx * hx) - 1 / (hy * hy))
+            if stack_y:
+                A = c * c / (hx * hx) + s * s / (hy * hy)
+                C = off * off * (s * s / (hx * hx) + c * c / (hy * hy)) - 1
+            else:
+                A = s * s / (hx * hx) + c * c / (hy * hy)
+                C = off * off * (c * c / (hx * hx) + s * s / (hy * hy)) - 1
+            disc = B * B - 4 * A * C
+            if disc < 0:
+                return None
+            r = math.sqrt(disc)
+            return (-B - r) / (2 * A), (-B + r) / (2 * A)
+        rects = [(a, b_, z0, c_, d_, z1) for a, b_, c_, d_ in _strips(cx, cy, ex, ey, 2 * min(hx, hy), ell)]
+    else:                                         # plain box
+        ex, ey = abs(hx * c) + abs(hy * s), abs(hx * s) + abs(hy * c)
+
+        def rect(stack_y, off):
+            if stack_y:
+                r1, r2 = _solve_range(c, s * off, hx), _solve_range(-s, c * off, hy)
+            else:
+                r1, r2 = _solve_range(s, c * off, hx), _solve_range(c, -s * off, hy)
+            if r1 is None or r2 is None:
+                return None
+            lo, hi = max(r1[0], r2[0]), min(r1[1], r2[1])
+            return (lo, hi) if hi > lo else None
+        rects = [(a, b_, z0, c_, d_, z1) for a, b_, c_, d_ in _strips(cx, cy, ex, ey, 2 * min(hx, hy), rect)]
+    if not rects:
+        ex, ey = abs(hx * c) + abs(hy * s), abs(hx * s) + abs(hy * c)
+        rects = [(cx - ex, cy - ey, z0, cx + ex, cy + ey, z1)]
+    return [Box(r, b.t, b.tt, b.tile, b.col, [b.f[0], b.f[1], -1, -1, -1, -1]) for r in rects]
 
 
 # --------------------------------------------------------------------------
@@ -434,6 +715,29 @@ def ray_box(o, d, b):
     n = [0, 0, 0]
     n[axis] = sign
     return tmin, tuple(n)
+
+
+def ray_seg(o, d, a, b):
+    """Closest approach of a ray (o, unit d) to the segment a-b -> (distance, s along segment 0..1, t along ray)."""
+    o, d, a, b = (np.asarray(v, np.float64) for v in (o, d, a, b))
+    u, w = b - a, o - a
+    A, B, C, D, E = d @ d, d @ u, u @ u, d @ w, u @ w
+    den = A * C - B * B
+    s = 0.0 if den < 1e-9 else (A * E - B * D) / den
+    s = min(1.0, max(0.0, s))
+    t = max(0.0, (B * s - D) / A)
+    return float(np.linalg.norm((o + d * t) - (a + u * s))), s, t
+
+
+def line_param(o, d, p, u):
+    """Where along the infinite line p + u*s (u unit) the ray (o, d) comes closest -> s, or None if parallel."""
+    o, d, p, u = (np.asarray(v, np.float64) for v in (o, d, p, u))
+    w = o - p
+    B, D, E = d @ u, d @ w, u @ w
+    den = 1.0 - B * B
+    if den < 1e-6:
+        return None
+    return float((E - B * D) / den)
 
 
 def perspective(fovy, aspect, near, far):
@@ -531,12 +835,19 @@ class App:
         self.doc.new_default()
         self.undo, self.redo = [], []
         self.sky_list = None
+        self.cube_gid = None             # GL cube map of the skybox faces
+        self.cube_dirty = True
         self.texdrag = None              # (texture index, key mods) while dragging a thumbnail
         self.tool = BOX
         self.gi = 2                      # grid index
         self.height = 128.0              # height of new boxes
         self.tile = 128.0                # texture size of new boxes
         self.cur_tex = -1                # texture for new boxes
+        self.ramp_dir = 0                # uphill direction of new ramps
+        self.turn_i = 1                  # index into TURN_SNAPS (15 degrees)
+        self.gz_hover = False            # mouse is over the spin ring / arrow
+        self.st_hover = None             # (axis, hi) of the stretch arrow under the mouse
+        self.clip = None                 # copied object: ("box", Box) or ("spawn", Spawn)
         self.sel = None                  # ("box", i) / ("spawn", i)
         self.hover = None
         self.cam = np.array([0.0, -1100.0, 620.0])
@@ -624,7 +935,7 @@ class App:
         o, d = self.ray(pos)
         best = None
         for i, b in enumerate(self.doc.boxes):
-            h = ray_box(o, d, b.b)
+            h = ray_box(rot_point(b, o, True), rot_vec(b, d, True), b.b)     # spun boxes: ray in the box's own frame
             if h and (best is None or h[0] < best[0]):
                 best = (h[0], "box", i, h[1])
         if want_spawns:
@@ -671,11 +982,68 @@ class App:
             return
         if self.doc.sky is not None and self.doc.sky.gid:
             gl.glDeleteTextures([self.doc.sky.gid])
+        self.drop_cube()
         t = Tex(Path(path).name, surf)
         t.upload()
         self.doc.sky = t
         self.doc.dirty = True
         self.msg("Skybox: %s" % t.name)
+
+    def drop_cube(self):
+        """Forget the cubemap faces (and its GL texture)."""
+        self.doc.cube = [None] * 6
+        self.reset_cube_gl()
+
+    def reset_cube_gl(self):
+        if self.cube_gid is not None:
+            try:
+                gl.glDeleteTextures([self.cube_gid])
+            except Exception:
+                pass
+        self.cube_gid = None
+        self.cube_dirty = True
+
+    def set_cube_face(self, i, path):
+        try:
+            surf = load_image(path, 1024)
+        except Exception as ex:
+            self.msg("Cannot read that image: %s" % str(ex)[:60])
+            return False
+        if self.doc.sky is not None:                      # a cubemap replaces the panorama
+            if self.doc.sky.gid:
+                gl.glDeleteTextures([self.doc.sky.gid])
+            self.doc.sky = None
+        self.doc.cube[i] = Tex(Path(path).name, surf)
+        self.reset_cube_gl()
+        self.doc.dirty = True
+        have = sum(1 for t in self.doc.cube if t)
+        if have == 6:
+            self.msg("Cubemap skybox ready (6/6 faces)", 6)
+        else:
+            miss = [CUBE_FACES[k] for k in range(6) if not self.doc.cube[k]]
+            self.msg("Cube face %s set (%d/6). Still needed: %s" % (CUBE_FACES[i], have, " ".join(miss)), 8)
+        return True
+
+    def pick_cube(self):
+        paths = ask_open_many(IMG_KINDS, "Pick the cubemap faces (px nx py ny pz nz)")
+        if not paths:
+            if _tk_dialog(lambda fd: True) is None:
+                self.msg("No file dialog here: drop the face images onto the sky instead.")
+            return
+        named = [(face_index(p), p) for p in paths]
+        if len(paths) == 6 and (any(i is None for i, _ in named) or len({i for i, _ in named}) < 6):
+            named = [(i, p) for i, p in enumerate(paths)]          # no usable names: take them in the order picked
+            self.msg("Faces taken in the order you picked them: " + " ".join(CUBE_FACES), 8)
+        ok = 0
+        for i, p in named:
+            if i is None:
+                continue
+            ok += self.set_cube_face(i, p)
+        if not ok:
+            self.msg("No face names found. Name the files px nx py ny pz nz (or pick exactly 6 files).", 8)
+
+    def cube_ready(self):
+        return all(self.doc.cube)
 
     def clear_sky(self):
         if self.doc.sky is not None:
@@ -684,6 +1052,37 @@ class App:
             self.doc.sky = None
             self.doc.dirty = True
             self.msg("Skybox removed")
+        if any(self.doc.cube):
+            self.drop_cube()
+            self.doc.dirty = True
+            self.msg("Skybox removed")
+
+    def draw_cube_sky(self):
+        if self.cube_gid is None or self.cube_dirty:
+            if self.cube_gid is not None:
+                gl.glDeleteTextures([self.cube_gid])
+            self.cube_gid = make_gl_cube(self.doc.cube, cube_size(self.doc.cube))
+            self.cube_dirty = False
+        R = 1000.0
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glDisable(gl.GL_TEXTURE_2D)
+        gl.glEnable(gl.GL_TEXTURE_CUBE_MAP)
+        gl.glBindTexture(gl.GL_TEXTURE_CUBE_MAP, self.cube_gid)
+        gl.glColor3f(1, 1, 1)
+        gl.glPushMatrix()
+        gl.glTranslatef(float(self.cam[0]), float(self.cam[1]), float(self.cam[2]))
+        gl.glBegin(gl.GL_QUADS)
+        for n, u, v in (((1, 0, 0), (0, 1, 0), (0, 0, 1)), ((-1, 0, 0), (0, 1, 0), (0, 0, 1)),
+                        ((0, 1, 0), (1, 0, 0), (0, 0, 1)), ((0, -1, 0), (1, 0, 0), (0, 0, 1)),
+                        ((0, 0, 1), (1, 0, 0), (0, 1, 0)), ((0, 0, -1), (1, 0, 0), (0, 1, 0))):
+            for su, sv in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+                x, y, z = (n[k] + su * u[k] + sv * v[k] for k in range(3))
+                gl.glTexCoord3f(x, z, -y)               # world (z up) -> cube map direction (y up)
+                gl.glVertex3f(x * R, y * R, z * R)
+        gl.glEnd()
+        gl.glPopMatrix()
+        gl.glDisable(gl.GL_TEXTURE_CUBE_MAP)
+        gl.glEnable(gl.GL_DEPTH_TEST)
 
     def pick_sky(self):
         p = ask_open(IMG_KINDS, "Skybox image")
@@ -693,6 +1092,9 @@ class App:
             self.msg("No file dialog here: drop an image on the empty sky instead.")
 
     def draw_sky(self):
+        if self.cube_ready():
+            self.draw_cube_sky()
+            return
         sky = self.doc.sky
         if sky is None or not sky.gid:
             return
@@ -753,6 +1155,29 @@ class App:
         self.doc.boxes.append(nb)
         self.sel = ("box", len(self.doc.boxes) - 1)
 
+    def new_shape(self, bounds, kind, name):
+        self.push_undo()
+        nb = Box(bounds, self.cur_tex, self.cur_tex, self.tile, k=kind, d=self.ramp_dir)
+        nb.fix()
+        self.doc.boxes.append(nb)
+        self.sel = ("box", len(self.doc.boxes) - 1)
+        self.msg("Built " + name)
+
+    def shape_bounds(self, dr):
+        """Bounding box of the slope / circle being dragged."""
+        (ax, ay), (cx, cy) = dr["a"], dr["cur"]
+        g = self.grid
+        z = dr["z"]
+        if dr["tool"] == CIRC:
+            r = max(g, snap(math.hypot(cx - ax, cy - ay), g))
+            return [ax - r, ay - r, z, ax + r, ay + r, z + self.height]
+        x0, x1, y0, y1 = min(ax, cx), max(ax, cx), min(ay, cy), max(ay, cy)
+        if x1 - x0 < g:
+            x1 = x0 + g
+        if y1 - y0 < g:
+            y1 = y0 + g
+        return [x0, y0, z, x1, y1, z + self.height]
+
     def nav_axes(self):
         """Arrow keys relative to the camera: returns (forward axis/sign, right axis/sign)."""
         fx, fy = math.cos(self.yaw), math.sin(self.yaw)
@@ -765,6 +1190,167 @@ class App:
             # right of +y is +x ... right of -y is -x
             right = (0, 1 if fy > 0 else -1)
         return fwd, right
+
+    def set_tool(self, t):
+        self.tool = t
+        if t == ROT:
+            self.msg("Spin / turn: select something, then DRAG the arrow or the ring. Shift = free angle.", 7)
+        elif t == STRETCH:
+            self.msg("Stretch: select a box, then DRAG an arrow on one of its faces. Shift = free size.", 7)
+
+    def cycle_turn_snap(self):
+        self.turn_i = (self.turn_i + 1) % len(TURN_SNAPS)
+        self.msg("Turn step %d deg" % TURN_SNAPS[self.turn_i])
+
+    def turn_sel(self, sign):
+        obj = self.sel_obj()
+        if obj is None:
+            self.msg("Select a box or spawn first, then turn it")
+            return
+        st = TURN_SNAPS[self.turn_i]
+        self.push_undo()
+        obj.yaw = (round((obj.yaw + sign * st) / st) * st) % 360.0
+        self.dirty_list = True
+        self.msg("Turned to %d deg" % round(obj.yaw))
+
+    def gizmo_info(self):
+        """(centre x, centre y, plane z, ring radius, yaw) of the spin ring around the selection."""
+        obj = self.sel_obj()
+        if obj is None:
+            return None
+        if self.sel[0] == "box":
+            b = obj.b
+            R = math.hypot(b[3] - b[0], b[4] - b[1]) / 2 + 24
+            return (b[0] + b[3]) / 2, (b[1] + b[4]) / 2, b[2] + 0.5, max(R, 56.0), obj.yaw
+        return obj.x, obj.y, obj.z + 0.5, 56.0, obj.yaw
+
+    def gizmo_hit(self, pos):
+        """Point on the spin plane if the mouse is on the ring or the arrow, else None."""
+        gi = self.gizmo_info()
+        if gi is None or not self.in_view(pos):
+            return None
+        cx, cy, z, R, yaw = gi
+        o, d = self.ray(pos)
+        p = self.plane_point(o, d, z)
+        if p is None:
+            return None
+        tol = max(18.0, R * 0.08)
+        dx, dy = p[0] - cx, p[1] - cy
+        if abs(math.hypot(dx, dy) - R) <= tol:
+            return p
+        ux, uy = yaw_cs(yaw)
+        a = dx * ux + dy * uy                      # along the arrow
+        lat = abs(dx * uy - dy * ux)               # sideways from it
+        L = min(max(40.0, R * 0.35), 220.0)
+        if R - tol <= a <= R + L + tol and lat <= tol:
+            return p
+        return None
+
+    def stretch_handles(self):
+        """The six face arrows of the selected box: dicts with axis, hi, base point P, direction D, length L."""
+        if not self.sel or self.sel[0] != "box":
+            return []
+        obj = self.sel_obj()
+        if obj is None:
+            return []
+        b = obj.b
+        mid = [(b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2]
+        out = []
+        for ax in range(3):
+            for hi in (0, 1):
+                c = list(mid)
+                c[ax] = b[ax + 3] if hi else b[ax]
+                dl = [0.0, 0.0, 0.0]
+                dl[ax] = 1.0 if hi else -1.0
+                P = np.array(rot_point(obj, c), np.float64)
+                D = np.array(rot_vec(obj, dl), np.float64)
+                L = max(24.0, float(np.linalg.norm(self.cam - P)) * 0.11)
+                out.append({"ax": ax, "hi": hi, "P": P, "D": D, "L": L})
+        return out
+
+    def stretch_pick(self, pos):
+        if not self.in_view(pos):
+            return None
+        o, d = self.ray(pos)
+        best = None
+        for h in self.stretch_handles():
+            dist, _, t = ray_seg(o, d, h["P"], h["P"] + h["D"] * h["L"])
+            if dist <= max(5.0, h["L"] * 0.13) and (best is None or t < best[0]):
+                best = (t, h)
+        return best[1] if best else None
+
+    def stretch_motion(self, dr, o, d):
+        obj = self.sel_obj()
+        sv = line_param(o, d, dr["P"], dr["D"])
+        if obj is None or sv is None:
+            return
+        ax, hi, b0 = dr["ax"], dr["hi"], dr["b0"]
+        idx = ax + (3 if hi else 0)
+        val = b0[idx] + (1 if hi else -1) * (sv - dr["s0"])
+        g = self.grid
+        if not (pygame.key.get_mods() & pygame.KMOD_SHIFT):
+            val = snap(val, g)
+        val = max(val, b0[ax] + g) if hi else min(val, b0[ax + 3] - g)
+        nb = list(b0)
+        nb[idx] = val
+        if abs(val - b0[idx]) < 1e-6 and not dr["pushed"]:
+            return
+        if not dr["pushed"]:
+            obj.b = list(b0)
+            self.push_undo()
+            dr["pushed"] = True
+        if obj.yaw and ax < 2:
+            # keep the opposite face where it is in the world (the spin centre moves when a face moves)
+            fixed = [(b0[0] + b0[3]) / 2, (b0[1] + b0[4]) / 2, (b0[2] + b0[5]) / 2]
+            fixed[ax] = b0[ax if hi else ax + 3]
+            obj.b = list(b0)
+            before = rot_point(obj, fixed)
+            obj.b = nb
+            after = rot_point(obj, fixed)
+            ddx, ddy = before[0] - after[0], before[1] - after[1]
+            nb = [nb[0] + ddx, nb[1] + ddy, nb[2], nb[3] + ddx, nb[4] + ddy, nb[5]]
+        obj.b = nb
+        self.dirty_list = True
+
+    def draw_stretch(self):
+        hs = self.stretch_handles()
+        if not hs:
+            return
+        act = self.drag if (self.drag and self.drag.get("kind") == "stretch") else None
+        cols = ((1.0, 0.28, 0.28), (0.3, 0.9, 0.3), (0.38, 0.58, 1.0))
+        gl.glDisable(gl.GL_TEXTURE_2D)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        for h in hs:
+            key = (h["ax"], h["hi"])
+            hot = (act is not None and (act["ax"], act["hi"]) == key) or (act is None and self.st_hover == key)
+            col = (1.0, 0.9, 0.2) if hot else cols[h["ax"]]
+            P, D, L = h["P"], h["D"], h["L"]
+            base, tip = P + D * L * 0.62, P + D * L
+            gl.glLineWidth(5.0 if hot else 3.5)
+            gl.glColor4f(*col, 1.0)
+            gl.glBegin(gl.GL_LINES)
+            gl.glVertex3f(*P)
+            gl.glVertex3f(*base)
+            gl.glEnd()
+            ref = np.array([0.0, 0.0, 1.0]) if abs(D[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+            u = np.cross(D, ref)
+            u /= np.linalg.norm(u)
+            v = np.cross(D, u)
+            r = L * (0.17 if hot else 0.14)
+            gl.glBegin(gl.GL_TRIANGLES)
+            for i in range(12):
+                a0, a1 = 2 * math.pi * i / 12, 2 * math.pi * (i + 1) / 12
+                p0 = base + (u * math.cos(a0) + v * math.sin(a0)) * r
+                p1 = base + (u * math.cos(a1) + v * math.sin(a1)) * r
+                gl.glVertex3f(*tip)
+                gl.glVertex3f(*p0)
+                gl.glVertex3f(*p1)
+                gl.glVertex3f(*base)
+                gl.glVertex3f(*p1)
+                gl.glVertex3f(*p0)
+            gl.glEnd()
+        gl.glLineWidth(1.0)
+        gl.glEnable(gl.GL_DEPTH_TEST)
 
     def key_edit(self, key, mods):
         obj = self.sel_obj()
@@ -850,6 +1436,64 @@ class App:
             self.doc.spawns.append(c)
             self.sel = ("spawn", len(self.doc.spawns) - 1)
 
+    def copy_sel(self, cut=False):
+        obj = self.sel_obj()
+        if obj is None:
+            self.msg("Select a box or spawn first, then copy it")
+            return
+        self.clip = (self.sel[0], obj.copy())
+        if cut:
+            self.push_undo()
+            kind, i = self.sel
+            (self.doc.boxes if kind == "box" else self.doc.spawns).pop(i)
+            self.sel = None
+            self.msg("Cut. Ctrl+V to paste it")
+        else:
+            self.msg("Copied. Ctrl+V to paste it where the mouse points")
+
+    def paste(self):
+        if self.clip is None:
+            self.msg("Nothing copied yet: select something and press Ctrl+C")
+            return
+        kind, src = self.clip
+        g = self.grid
+        spot = None                                   # (x, y, z) under the mouse, on a floor / box top
+        if self.in_view(self.mouse) and not self.look:
+            hit, o, d = self.pick_all(self.mouse, False)
+            if hit and hit[1] in ("box", "ground") and tuple(hit[3]) == (0, 0, 1):
+                p = o + d * hit[0]
+                spot = (float(p[0]), float(p[1]), float(self.doc.boxes[hit[2]].b[5]) if hit[1] == "box" else 0.0)
+        self.push_undo()
+        c = src.copy()
+        if kind == "box":
+            ntex = len(self.doc.tex)
+            c.t = c.t if c.t < ntex else -1
+            c.tt = c.tt if c.tt < ntex else -1
+            c.f = [v if v < ntex else -1 for v in c.f]
+            w, dpt, h = c.b[3] - c.b[0], c.b[4] - c.b[1], c.b[5] - c.b[2]
+            if spot:
+                x0, y0 = snap(spot[0] - w / 2, g), snap(spot[1] - dpt / 2, g)
+                z0 = spot[2]
+            else:
+                x0, y0, z0 = c.b[0] + g, c.b[1] + g, c.b[2]
+            c.b = [x0, y0, z0, x0 + w, y0 + dpt, z0 + h]
+            for _ in range(60):                      # never land exactly on top of an identical box
+                if not any(all(abs(a - b) < 0.01 for a, b in zip(c.b, o_.b)) for o_ in self.doc.boxes):
+                    break
+                c.b = [c.b[0] + g, c.b[1] + g, c.b[2], c.b[3] + g, c.b[4] + g, c.b[5]]
+            self.doc.boxes.append(c)
+            self.sel = ("box", len(self.doc.boxes) - 1)
+            self.dirty_list = True
+        else:
+            gg = max(8, g)
+            if spot:
+                c.x, c.y, c.z = snap(spot[0], gg), snap(spot[1], gg), spot[2]
+            else:
+                c.x, c.y = c.x + gg, c.y + gg
+            self.doc.spawns.append(c)
+            self.sel = ("spawn", len(self.doc.spawns) - 1)
+        self.msg("Pasted")
+
     def focus_sel(self):
         obj = self.sel_obj()
         if obj is None:
@@ -873,6 +1517,7 @@ class App:
                 gl.glDeleteTextures([t.gid])
         self.doc = MapDoc()
         self.doc.new_default()
+        self.reset_cube_gl()
         self.undo, self.redo, self.sel, self.cur_tex = [], [], None, -1
         self.dirty_list = True
         self.msg("New map")
@@ -915,6 +1560,7 @@ class App:
         doc.path = path if str(path).endswith(".fadproj") else None
         doc.name = Path(path).stem
         self.doc = doc
+        self.reset_cube_gl()
         self.undo, self.redo, self.sel, self.cur_tex = [], [], None, -1
         if cam and len(cam) == 5:
             self.cam = np.array(cam[:3], np.float64)
@@ -959,7 +1605,13 @@ class App:
                 pos = getattr(ev, "pos", None)
                 if not pos:
                     pos = pygame.mouse.get_pos()
-                if self.in_view(pos) and self.pick_all(pos, False)[0] is None:
+                fi = face_index(p)
+                hit = self.pick_all(pos, False)[0] if self.in_view(pos) else None
+                on_sky = self.in_view(pos) and (hit is None or hit[1] == "ground")
+                if fi is not None and (on_sky or (pos[0] < LW and not self.in_view(pos))):
+                    self.set_cube_face(fi, p)        # a cubemap face (px nx py ny pz nz)
+                    return
+                if self.in_view(pos) and hit is None:
                     self.set_sky(p)          # dropped on the empty sky
                     return
                 ti = self.add_texture(p, apply=False)
@@ -989,6 +1641,12 @@ class App:
             self.do_redo()
         elif ctrl and k == pygame.K_d:
             self.duplicate()
+        elif ctrl and k == pygame.K_c:
+            self.copy_sel()
+        elif ctrl and k == pygame.K_x:
+            self.copy_sel(cut=True)
+        elif ctrl and k == pygame.K_v:
+            self.paste()
         elif ctrl and k == pygame.K_n:
             self.new_map()
         elif k == pygame.K_F5:
@@ -997,7 +1655,17 @@ class App:
             self.help = not self.help
         elif k == pygame.K_ESCAPE:
             if self.drag:
-                self.drag = None
+                dr, self.drag = self.drag, None
+                if dr.get("kind") in ("rot", "stretch") and dr["pushed"]:       # cancel a spin / stretch in progress
+                    obj = self.sel_obj()
+                    if obj is not None:
+                        if dr["kind"] == "rot":
+                            obj.yaw = dr["yaw0"]
+                        else:
+                            obj.b = list(dr["b0"])
+                    if self.undo:
+                        self.undo.pop()
+                    self.dirty_list = True
             else:
                 self.sel = None
         elif k == pygame.K_v:
@@ -1008,6 +1676,21 @@ class App:
             self.tool = SPAWN0
         elif k == pygame.K_2:
             self.tool = SPAWN1
+        elif k == pygame.K_3:
+            self.tool = RAMP
+        elif k == pygame.K_4:
+            self.tool = CIRC
+        elif k == pygame.K_5 or k == pygame.K_y:
+            self.set_tool(ROT)
+        elif k == pygame.K_6 or k == pygame.K_x:
+            self.set_tool(STRETCH)
+        elif k == pygame.K_u:
+            self.cycle_turn_snap()
+        elif k == pygame.K_COMMA or k == pygame.K_PERIOD:
+            self.turn_sel(-1 if k == pygame.K_COMMA else 1)
+        elif k == pygame.K_t or (k == pygame.K_r and not (self.sel and self.sel[0] == "spawn")):
+            self.ramp_dir = (self.ramp_dir + 1) % 4
+            self.msg("Slope goes uphill toward " + RAMP_DIRS[self.ramp_dir])
         elif k == pygame.K_g:
             self.gi = (self.gi + 1) % len(GRIDS)
             self.msg("Grid %d" % self.grid)
@@ -1072,7 +1755,27 @@ class App:
                              "orig": list(obj.b) if hit[1] == "box" else (obj.x, obj.y), "pushed": False}
             else:
                 self.sel = None
-        elif self.tool == BOX:
+        elif self.tool == ROT:
+            gp = self.gizmo_hit(ev.pos)
+            if gp is not None:                       # grabbed the arrow / ring
+                cx, cy, z, R, yaw = self.gizmo_info()
+                self.drag = {"kind": "rot", "z": z, "cx": cx, "cy": cy, "yaw0": yaw, "acc": 0.0,
+                             "last": math.atan2(gp[1] - cy, gp[0] - cx), "pushed": False}
+                return
+            hit, o, d = self.pick_all(ev.pos)
+            self.sel = (hit[1], hit[2]) if (hit and hit[1] in ("box", "spawn")) else None
+        elif self.tool == STRETCH:
+            h = self.stretch_pick(ev.pos)
+            if h is not None:                        # grabbed a face arrow
+                o, d = self.ray(ev.pos)
+                s0 = line_param(o, d, h["P"], h["D"])
+                if s0 is not None:
+                    self.drag = {"kind": "stretch", "ax": h["ax"], "hi": h["hi"], "P": h["P"], "D": h["D"],
+                                 "s0": s0, "b0": list(self.sel_obj().b), "pushed": False, "z": 0.0}
+                return
+            hit, o, d = self.pick_all(ev.pos, False)
+            self.sel = ("box", hit[2]) if (hit and hit[1] == "box") else None
+        elif self.tool in (BOX, RAMP, CIRC):
             z = self.place_plane(ev.pos)
             if z is None:
                 self.msg("Click on the floor or on top of a box to start a box")
@@ -1082,7 +1785,7 @@ class App:
             if p is None:
                 return
             g = self.grid
-            self.drag = {"kind": "box", "z": z, "a": (snap(p[0], g), snap(p[1], g)), "cur": (snap(p[0], g), snap(p[1], g))}
+            self.drag = {"kind": "box", "tool": self.tool, "z": z, "a": (snap(p[0], g), snap(p[1], g)), "cur": (snap(p[0], g), snap(p[1], g))}
         else:
             hit, o, d = self.pick_all(ev.pos, False)
             if hit and hit[1] in ("box", "ground") and hit[3] == (0, 0, 1):
@@ -1142,7 +1845,10 @@ class App:
         if ev.button != 1 or not self.drag:
             return
         dr, self.drag = self.drag, None
-        if dr["kind"] == "box":
+        if dr["kind"] == "box" and dr.get("tool") in (RAMP, CIRC):
+            self.new_shape(self.shape_bounds(dr), 1 if dr["tool"] == RAMP else 2,
+                           "slope" if dr["tool"] == RAMP else "circle")
+        elif dr["kind"] == "box":
             (ax, ay), (cx, cy) = dr["a"], dr["cur"]
             g = self.grid
             x0, x1 = min(ax, cx), max(ax, cx)
@@ -1166,12 +1872,39 @@ class App:
         if not dr:
             return
         o, d = self.ray(ev.pos)
+        if dr["kind"] == "stretch":
+            self.stretch_motion(dr, o, d)
+            return
         p = self.plane_point(o, d, dr["z"])
         if p is None:
             return
         g = self.grid
         if dr["kind"] == "box":
             dr["cur"] = (snap(p[0], g), snap(p[1], g))
+        elif dr["kind"] == "rot":
+            obj = self.sel_obj()
+            if obj is None:
+                return
+            a = math.atan2(p[1] - dr["cy"], p[0] - dr["cx"])
+            da = a - dr["last"]
+            while da > math.pi:
+                da -= 2 * math.pi
+            while da < -math.pi:
+                da += 2 * math.pi
+            dr["acc"] += da
+            dr["last"] = a
+            new = dr["yaw0"] + math.degrees(dr["acc"])
+            if not (pygame.key.get_mods() & pygame.KMOD_SHIFT):
+                st = TURN_SNAPS[self.turn_i]
+                new = round(new / st) * st
+            new = round(new % 360.0, 3) % 360.0
+            if abs(new - obj.yaw) > 1e-6:
+                if not dr["pushed"]:
+                    obj.yaw = dr["yaw0"]
+                    self.push_undo()
+                    dr["pushed"] = True
+                obj.yaw = new
+                self.dirty_list = True
         elif dr["kind"] == "move" and dr["start"] is not None:
             dx, dy = snap(p[0] - dr["start"][0], g), snap(p[1] - dr["start"][1], g)
             obj = self.sel_obj()
@@ -1220,11 +1953,18 @@ class App:
             self.cam += mv * sp
         self.hover = None
         self.cursor3d = None
+        self.gz_hover = False
+        self.st_hover = None
         if not self.look and not self.drag and self.in_view(self.mouse):
-            hit, o, d = self.pick_all(self.mouse, self.tool == SELECT)
-            if self.tool == SELECT:
+            hit, o, d = self.pick_all(self.mouse, self.tool in (SELECT, ROT))
+            if self.tool in (SELECT, ROT, STRETCH):
                 if hit and hit[1] in ("box", "spawn"):
                     self.hover = (hit[1], hit[2])
+                if self.tool == ROT:
+                    self.gz_hover = self.gizmo_hit(self.mouse) is not None
+                if self.tool == STRETCH:
+                    hh = self.stretch_pick(self.mouse)
+                    self.st_hover = (hh["ax"], hh["hi"]) if hh else None
             elif hit:
                 self.cursor3d = o + d * hit[0]
                 self.cursor_n = hit[3]
@@ -1246,6 +1986,9 @@ class App:
         gl.glNewList(self.list_id, gl.GL_COMPILE)
         gl.glEnable(gl.GL_TEXTURE_2D)
         for b in self.doc.boxes:
+            if b.k:
+                self.draw_shape(b)
+                continue
             for fi, f in enumerate(box_faces(b.b)):
                 n = f[4]
                 ti = b.tt if n[2] > .5 else b.t
@@ -1259,13 +2002,81 @@ class App:
                 else:
                     gl.glColor3f(b.col[0] / 255 * s, b.col[1] / 255 * s, b.col[2] / 255 * s)
                 gl.glBegin(gl.GL_QUADS)
+                nr = rot_vec(b, n)
                 for p in f[:4]:
-                    u, v = face_uv(p, n, b.tile)
+                    p = rot_point(b, p)
+                    u, v = face_uv(p, nr, b.tile)
                     gl.glTexCoord2f(u, v)
                     gl.glVertex3f(*p)
                 gl.glEnd()
         gl.glEndList()
         self.dirty_list = False
+
+    def _poly(self, b, ti, pts, sh, uv):
+        tex = self.doc.tex[ti] if 0 <= ti < len(self.doc.tex) else None
+        gl.glBindTexture(gl.GL_TEXTURE_2D, tex.gid if tex else self.white)
+        if tex:
+            gl.glColor3f(sh, sh, sh)
+        else:
+            gl.glColor3f(b.col[0] / 255 * sh, b.col[1] / 255 * sh, b.col[2] / 255 * sh)
+        gl.glBegin(gl.GL_POLYGON)
+        for p, (u, v) in zip(pts, uv):
+            gl.glTexCoord2f(u, v)
+            gl.glVertex3f(*p)
+        gl.glEnd()
+
+    def draw_shape(self, b):
+        """A real slope (wedge) or cylinder."""
+        x0, y0, z0, x1, y1, z1 = b.b
+        tile = b.tile
+        top_t = b.f[0] if b.f[0] >= 0 else b.tt
+        bot_t = b.f[1] if b.f[1] >= 0 else b.t
+        side_t = next((v for v in b.f[2:] if v >= 0), b.t)
+        if b.k == 1:
+            d = b.d % 4
+
+            def W(u, v, w):
+                if d == 0:
+                    x, y = x0 + u * (x1 - x0), y0 + v * (y1 - y0)
+                elif d == 2:
+                    x, y = x1 - u * (x1 - x0), y0 + v * (y1 - y0)
+                elif d == 1:
+                    x, y = x0 + v * (x1 - x0), y0 + u * (y1 - y0)
+                else:
+                    x, y = x0 + v * (x1 - x0), y1 - u * (y1 - y0)
+                return (x, y, z0 + w * (z1 - z0))
+            ax = d in (0, 2)
+            wn = ((1, 0, 0), (0, 1, 0), (-1, 0, 0), (0, -1, 0))[d]
+            sa, sb = ((0, -1, 0), (0, 1, 0)) if ax else ((-1, 0, 0), (1, 0, 0))
+            polys = (
+                ([(0, 1, 0), (1, 1, 0), (1, 0, 0), (0, 0, 0)], (0, 0, -1), bot_t),
+                ([(0, 0, 0), (1, 0, 1), (1, 1, 1), (0, 1, 0)], (0, 0, 1), top_t),
+                ([(1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1)], wn, side_t),
+                ([(0, 0, 0), (1, 0, 0), (1, 0, 1)], sa, side_t),
+                ([(0, 1, 0), (1, 1, 0), (1, 1, 1)], sb, side_t))
+            for loc, n, ti in polys:
+                pts = [rot_point(b, W(*q)) for q in loc]
+                nr = rot_vec(b, n)
+                self._poly(b, ti, pts, shade(n), [face_uv(p, nr, tile) for p in pts])
+        else:
+            cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+            N = 64
+            ring = [(cx + rx * math.cos(2 * math.pi * i / N), cy + ry * math.sin(2 * math.pi * i / N)) for i in range(N)]
+            ring = [rot_point(b, (px, py, 0.0))[:2] for px, py in ring]
+            run = 0.0
+            for i in range(N):
+                a, c = ring[i], ring[(i + 1) % N]
+                seg = math.hypot(c[0] - a[0], c[1] - a[1])
+                pts = [(a[0], a[1], z0), (c[0], c[1], z0), (c[0], c[1], z1), (a[0], a[1], z1)]
+                uv = [(run / tile, -z0 / tile), ((run + seg) / tile, -z0 / tile),
+                      ((run + seg) / tile, -z1 / tile), (run / tile, -z1 / tile)]
+                run += seg
+                sh = 0.75 + 0.07 * math.cos(2 * math.pi * (i + .5) / N)
+                self._poly(b, side_t, pts, sh, uv)
+            top = [(px, py, z1) for px, py in ring]
+            self._poly(b, top_t, top, 1.0, [face_uv(p, (0, 0, 1), tile) for p in top])
+            bot = [(px, py, z0) for px, py in reversed(ring)]
+            self._poly(b, bot_t, bot, 0.5, [face_uv(p, (0, 0, 1), tile) for p in bot])
 
     def draw_grid(self):
         g = self.grid
@@ -1299,8 +2110,18 @@ class App:
         gl.glEnd()
 
     @staticmethod
-    def wire_box(b, col, w=2.0, e=0.4):
+    def wire_box(b, col, w=2.0, e=0.4, yaw=0.0):
         x0, y0, z0, x1, y1, z1 = b[0] - e, b[1] - e, b[2] - e, b[3] + e, b[4] + e, b[5] + e
+        if yaw:
+            mx, my = (b[0] + b[3]) / 2, (b[1] + b[4]) / 2
+            cc, ss = yaw_cs(yaw)
+
+            def P(q):
+                dx, dy = q[0] - mx, q[1] - my
+                return (mx + dx * cc - dy * ss, my + dx * ss + dy * cc, q[2])
+        else:
+            def P(q):
+                return q
         gl.glLineWidth(w)
         gl.glColor4f(*col)
         gl.glBegin(gl.GL_LINES)
@@ -1308,8 +2129,8 @@ class App:
                      ((x0, y1, z0), (x0, y0, z0)), ((x0, y0, z1), (x1, y0, z1)), ((x1, y0, z1), (x1, y1, z1)),
                      ((x1, y1, z1), (x0, y1, z1)), ((x0, y1, z1), (x0, y0, z1)), ((x0, y0, z0), (x0, y0, z1)),
                      ((x1, y0, z0), (x1, y0, z1)), ((x1, y1, z0), (x1, y1, z1)), ((x0, y1, z0), (x0, y1, z1))):
-            gl.glVertex3f(*a)
-            gl.glVertex3f(*c)
+            gl.glVertex3f(*P(a))
+            gl.glVertex3f(*P(c))
         gl.glEnd()
 
     def draw_spawn(self, s, selected=False, hover=False):
@@ -1338,10 +2159,84 @@ class App:
             gl.glVertex3f(ex + math.cos(yaw + a) * 14, ey + math.sin(yaw + a) * 14, cz)
         gl.glEnd()
 
+    def draw_gizmo(self):
+        """Hammer-style spin handle: a ring with tick marks, turn arrows and a big arrow showing the facing."""
+        gi = self.gizmo_info()
+        if gi is None:
+            return
+        cx, cy, z, R, yaw = gi
+        active = bool(self.drag and self.drag.get("kind") == "rot")
+        hot = active or self.gz_hover
+        ring = (1.0, 0.85, 0.1, 1.0) if hot else (0.35, 0.85, 1.0, 0.95)
+        arrow = (1.0, 1.0, 1.0, 1.0) if hot else (1.0, 0.85, 0.1, 1.0)
+
+        def P(a, r):
+            return (cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a)), z)
+        gl.glDisable(gl.GL_TEXTURE_2D)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        # ring
+        gl.glLineWidth(3.5 if hot else 2.5)
+        gl.glColor4f(*ring)
+        gl.glBegin(gl.GL_LINE_LOOP)
+        for i in range(120):
+            gl.glVertex3f(*P(i * 3.0, R))
+        gl.glEnd()
+        # tick marks at every turn step (longer every 90 degrees)
+        st = TURN_SNAPS[self.turn_i]
+        gl.glLineWidth(1.5)
+        gl.glColor4f(1, 1, 1, 0.75)
+        gl.glBegin(gl.GL_LINES)
+        for a in range(0, 360, st):
+            ln = R * (0.10 if a % 90 == 0 else 0.045)
+            gl.glVertex3f(*P(a, R - ln))
+            gl.glVertex3f(*P(a, R + ln))
+        gl.glEnd()
+        # little cross in the middle
+        gl.glLineWidth(2.0)
+        gl.glColor4f(*ring)
+        gl.glBegin(gl.GL_LINES)
+        gl.glVertex3f(cx - 10, cy, z)
+        gl.glVertex3f(cx + 10, cy, z)
+        gl.glVertex3f(cx, cy - 10, z)
+        gl.glVertex3f(cx, cy + 10, z)
+        gl.glEnd()
+        # turn arrows on both sides of the handle
+        hs = max(9.0, min(R * 0.07, 24.0))
+        gl.glColor4f(*ring)
+        gl.glBegin(gl.GL_TRIANGLES)
+        for sg in (1, -1):
+            a = yaw + sg * 36
+            ca, sa = math.cos(math.radians(a)), math.sin(math.radians(a))
+            tx, ty = -sa * sg, ca * sg                    # direction of travel
+            px, py, _ = P(a, R)
+            gl.glVertex3f(px + tx * hs * 1.7, py + ty * hs * 1.7, z)
+            gl.glVertex3f(px + ca * hs * .9, py + sa * hs * .9, z)
+            gl.glVertex3f(px - ca * hs * .9, py - sa * hs * .9, z)
+        gl.glEnd()
+        # the big arrow (drag me)
+        L = min(max(40.0, R * 0.35), 220.0)
+        ux, uy = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+        hl = min(L * 0.5, 46.0)
+        hw = hl * 0.6
+        gl.glLineWidth(6.0)
+        gl.glColor4f(*arrow)
+        gl.glBegin(gl.GL_LINES)
+        gl.glVertex3f(cx + ux * R, cy + uy * R, z)
+        gl.glVertex3f(cx + ux * (R + L - hl * .5), cy + uy * (R + L - hl * .5), z)
+        gl.glEnd()
+        gl.glBegin(gl.GL_TRIANGLES)
+        bx, by = cx + ux * (R + L - hl), cy + uy * (R + L - hl)
+        gl.glVertex3f(bx - uy * hw, by + ux * hw, z)
+        gl.glVertex3f(bx + uy * hw, by - ux * hw, z)
+        gl.glVertex3f(cx + ux * (R + L), cy + uy * (R + L), z)
+        gl.glEnd()
+        gl.glLineWidth(1.0)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+
     def draw_world(self):
         W, H = self.W, self.H
         gl.glViewport(0, 0, W, H)
-        gl.glClearColor(0.11, 0.12, 0.15, 1.0)
+        gl.glClearColor(0.04, 0.04, 0.06, 1.0)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glDepthFunc(gl.GL_LEQUAL)
@@ -1358,11 +2253,32 @@ class App:
         for i, s in enumerate(self.doc.spawns):
             self.draw_spawn(s, self.sel == ("spawn", i))
         if self.hover and self.hover[0] == "box":
-            self.wire_box(self.doc.boxes[self.hover[1]].b, (1, 1, 1, 0.8), 2.0)
+            hb = self.doc.boxes[self.hover[1]]
+            self.wire_box(hb.b, (1, 1, 1, 0.8), 2.0, 0.4, hb.yaw)
         if self.sel and self.sel[0] == "box" and 0 <= self.sel[1] < len(self.doc.boxes):
-            self.wire_box(self.doc.boxes[self.sel[1]].b, (1.0, 0.85, 0.1, 1.0), 3.0)
+            sb = self.doc.boxes[self.sel[1]]
+            self.wire_box(sb.b, (1.0, 0.85, 0.1, 1.0), 3.0, 0.4, sb.yaw)
+        if self.tool == ROT:
+            self.draw_gizmo()
+        elif self.tool == STRETCH:
+            self.draw_stretch()
         dr = self.drag
-        if dr and dr["kind"] == "box":
+        if dr and dr["kind"] == "box" and dr.get("tool") in (RAMP, CIRC):
+            lst = [self.shape_bounds(dr)]
+            gl.glDepthMask(gl.GL_FALSE)
+            gl.glColor4f(0.3, 0.8, 1.0, 0.25)
+            gl.glBegin(gl.GL_QUADS)
+            for b in lst:
+                for f in box_faces(b):
+                    for p in f[:4]:
+                        gl.glVertex3f(*p)
+            gl.glEnd()
+            gl.glDepthMask(gl.GL_TRUE)
+            if lst:
+                self.wire_box((min(b[0] for b in lst), min(b[1] for b in lst), dr["z"],
+                               max(b[3] for b in lst), max(b[4] for b in lst), max(b[5] for b in lst)),
+                              (0.4, 0.9, 1.0, 1.0), 2.5, 0)
+        elif dr and dr["kind"] == "box":
             (ax, ay), (cx, cy) = dr["a"], dr["cur"]
             g = self.grid
             x0, x1, y0, y1 = min(ax, cx), max(ax, cx), min(ay, cy), max(ay, cy)
@@ -1380,13 +2296,13 @@ class App:
             gl.glEnd()
             gl.glDepthMask(gl.GL_TRUE)
             self.wire_box(b, (0.4, 0.9, 1.0, 1.0), 2.5, 0)
-        elif self.cursor3d is not None and self.tool in (BOX, SPAWN0, SPAWN1):
+        elif self.cursor3d is not None and self.tool in (BOX, RAMP, CIRC, SPAWN0, SPAWN1):
             p = self.cursor3d
             g = self.grid
             x, y = snap(p[0], g), snap(p[1], g)
             z = p[2]
             n = getattr(self, "cursor_n", (0, 0, 1))
-            if self.tool == BOX and n == (0, 0, 1):
+            if self.tool in (BOX, RAMP, CIRC) and n == (0, 0, 1):
                 gl.glDepthMask(gl.GL_FALSE)
                 gl.glColor4f(0.3, 0.8, 1.0, 0.35)
                 gl.glBegin(gl.GL_QUADS)
@@ -1474,11 +2390,11 @@ class App:
     def button(self, x, y, w, h, label, cb, active=False, size=13, col=None):
         mx, my = self.mouse
         over = x <= mx < x + w and y <= my < y + h
-        base = (0.26, 0.45, 0.78, 1) if active else ((0.24, 0.26, 0.32, 1) if over else (0.17, 0.19, 0.23, 1))
+        base = (0.26, 0.45, 0.78, 1) if active else ((0.14, 0.14, 0.18, 1) if over else (0.08, 0.08, 0.10, 1))
         if col is not None:
             base = col if not over else tuple(min(1, c + 0.08) for c in col)
         self.rect(x, y, w, h, base)
-        self.outline(x, y, w, h, (0.36, 0.40, 0.48, 1) if not active else (0.55, 0.72, 1, 1))
+        self.outline(x, y, w, h, (0.20, 0.21, 0.26, 1) if not active else (0.55, 0.72, 1, 1))
         self.text(label, x + w / 2, y + (h - size) / 2 - 1, size, (240, 242, 248), "c")
         self.hot.append((x, y, w, h, cb))
 
@@ -1493,10 +2409,10 @@ class App:
         gl.glOrtho(0, W, H, 0, -1, 1)
         gl.glMatrixMode(gl.GL_MODELVIEW)
         gl.glLoadIdentity()
-        bg = (0.09, 0.10, 0.12, 0.94)
+        bg = (0.035, 0.035, 0.045, 0.97)
         self.rect(0, 0, LW, H - SB, bg)
         self.rect(W - RW, 0, RW, H - SB, bg)
-        self.rect(0, H - SB, W, SB, (0.07, 0.08, 0.10, 1))
+        self.rect(0, H - SB, W, SB, (0.015, 0.015, 0.02, 1))
         # ---- left panel ----
         x, y = 12, 10
         self.text("MAP BUILDER", x, y, 18, (255, 255, 255))
@@ -1514,13 +2430,15 @@ class App:
         self.text("TOOLS", x, y, 11, (130, 140, 155))
         y += 18
         for tool, label in ((SELECT, "Select / move  (V)"), (BOX, "Build box  (B)"),
+                            (RAMP, "Build slope  (3)"), (CIRC, "Build circle  (4)"),
+                            (ROT, "Spin / turn  (5)"), (STRETCH, "Stretch  (6)"),
                             (SPAWN0, "Spawn BLACK  (1)"), (SPAWN1, "Spawn YELLOW  (2)")):
-            self.button(x, y, LW - 24, 28, label, lambda t=tool: setattr(self, "tool", t), self.tool == tool)
+            self.button(x, y, LW - 24, 28, label, lambda t=tool: self.set_tool(t), self.tool == tool)
             if tool in (SPAWN0, SPAWN1):
                 c = TEAM_COL[0 if tool == SPAWN0 else 1]
                 self.rect(x + 6, y + 9, 10, 10, (*c, 1))
             y += 32
-        y += 6
+        y += 8
         self.text("GRID  (G)", x, y, 11, (130, 140, 155))
         y += 18
         gw = (LW - 24 - 4 * 4) // 5
@@ -1547,8 +2465,14 @@ class App:
         self.button(x, y, sbw, 26, "Set image", self.pick_sky)
         self.button(x + sbw + 12, y, sbw, 26, "Clear", self.clear_sky)
         y += 30
-        sk = self.doc.sky.name if self.doc.sky else "none"
-        self.text(sk[:24], x, y, 11, (150, 160, 175))
+        have = sum(1 for t in self.doc.cube if t)
+        self.button(x, y, LW - 24, 26, "Set cubemap (6 faces)", self.pick_cube, active=have == 6)
+        y += 30
+        if have:
+            sk = "cubemap %d/6: %s" % (have, " ".join(CUBE_FACES[k] for k in range(6) if self.doc.cube[k]))
+        else:
+            sk = self.doc.sky.name if self.doc.sky else "none"
+        self.text(sk[:30], x, y, 11, (150, 160, 175))
         y += 26
         self.text("F1 = help", x, y, 12, (130, 140, 155))
         # ---- right panel: textures ----
@@ -1580,14 +2504,14 @@ class App:
                 self.quad(cx, cy, th, th)
                 nm = t.name
             sel = ti == self.cur_tex
-            self.outline(cx, cy, th, th, (1, 0.85, 0.1, 1) if sel else (0.3, 0.33, 0.4, 1), 3.0 if sel else 1.0)
+            self.outline(cx, cy, th, th, (1, 0.85, 0.1, 1) if sel else (0.16, 0.17, 0.21, 1), 3.0 if sel else 1.0)
             self.text(nm[:11] + ("." if len(nm) > 11 else ""), cx, cy + th + 2, 11, (170, 178, 190))
             if top <= self.mouse[1] < bot:
                 self.hot.append((cx, max(cy, top), th, min(th, bot - cy), lambda ti=ti: self.start_texdrag(ti)))
         gl.glDisable(gl.GL_SCISSOR_TEST)
         # ---- right panel: selection info ----
         py = H - SB - 180
-        self.rect(W - RW, py - 6, RW, 1, (0.3, 0.33, 0.4, 1))
+        self.rect(W - RW, py - 6, RW, 1, (0.16, 0.17, 0.21, 1))
         self.text("SELECTED", rx, py, 11, (130, 140, 155))
         py += 20
         obj = self.sel_obj()
@@ -1605,7 +2529,7 @@ class App:
                 return self.doc.tex[i].name[:16] if 0 <= i < len(self.doc.tex) else "flat colour"
             self.text("sides  " + tn(obj.t), rx, py + 62, 12, (190, 198, 210))
             self.text("top    " + tn(obj.tt), rx, py + 80, 12, (190, 198, 210))
-            self.text("tile   %d" % obj.tile, rx, py + 98, 12, (190, 198, 210))
+            self.text("tile   %d     turn  %d deg" % (obj.tile, round(obj.yaw)), rx, py + 98, 12, (190, 198, 210))
             self.text("Drop / drag an image on a face", rx, py + 120, 11, (120, 128, 140))
             self.text("= texture just that face", rx, py + 135, 11, (120, 128, 140))
         else:
@@ -1617,7 +2541,11 @@ class App:
         n0 = sum(1 for s in self.doc.spawns if s.team == 0)
         n1 = len(self.doc.spawns) - n0
         info = "%d boxes   spawns: %d black / %d yellow   grid %d   %s" % (
-            len(self.doc.boxes), n0, n1, self.grid, {SELECT: "select", BOX: "build box", SPAWN0: "spawn black", SPAWN1: "spawn yellow"}[self.tool])
+            len(self.doc.boxes), n0, n1, self.grid, {SELECT: "select", BOX: "build box", RAMP: "build slope", CIRC: "build circle", ROT: "spin / turn", STRETCH: "stretch", SPAWN0: "spawn black", SPAWN1: "spawn yellow"}[self.tool])
+        if self.tool == RAMP:
+            info += "   uphill %s (R = turn it)" % RAMP_DIRS[self.ramp_dir]
+        elif self.tool == ROT:
+            info += "   turn step %d deg (U)" % TURN_SNAPS[self.turn_i]
         self.text(info, 10, H - SB + 5, 13, (170, 178, 190))
         if self.msgs:
             self.text(self.msgs[-1][0][:170], W - 10, H - SB + 5, 13, (255, 220, 120), "r")
@@ -1627,6 +2555,19 @@ class App:
             gl.glBindTexture(gl.GL_TEXTURE_2D, t_.gid)
             gl.glColor4f(1, 1, 1, 0.8)
             self.quad(self.mouse[0] + 8, self.mouse[1] + 8, 48, 48)
+        if self.drag and self.drag.get("kind") == "stretch":
+            o_ = self.sel_obj()
+            if o_ is not None:
+                mx_, my_ = self.mouse
+                self.rect(mx_ + 12, my_ + 8, 150, 24, (0, 0, 0, 0.7))
+                self.text("%d x %d x %d" % (o_.b[3] - o_.b[0], o_.b[4] - o_.b[1], o_.b[5] - o_.b[2]),
+                          mx_ + 18, my_ + 11, 16, (255, 220, 120))
+        if self.drag and self.drag.get("kind") == "rot":
+            o_ = self.sel_obj()
+            if o_ is not None:
+                mx_, my_ = self.mouse
+                self.rect(mx_ + 12, my_ + 8, 74, 24, (0, 0, 0, 0.7))
+                self.text("%d deg" % round(o_.yaw), mx_ + 18, my_ + 11, 16, (255, 220, 120))
         # crosshair hint while flying
         if self.look:
             self.rect(self.W / 2 - 1, self.H / 2 - 8, 2, 16, (1, 1, 1, 0.6))

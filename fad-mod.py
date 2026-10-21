@@ -10,7 +10,6 @@ Mods in the "mod" folder are listed in Skins but NOT equipped automatically - pi
   mod/weapon/   weapon mods (Source engine: CS:GO / L4D2 .vpk packages — models + animations only)
   mod/player/   player models (Source only — loose, .zip / .7z / .rar / .vpk; posed in code)
   mod/arms/     arms/hands packs
-  mod/sound/    custom sounds (shoot.wav / hit.wav)
 Drag & drop .vpk / .mdl / .wav / .json onto the window, or use Skins buttons (needs tkinter).
 
 CS 1.6 (GoldSrc) maps/models and CS:S hand meshes are not supported.
@@ -118,6 +117,7 @@ DEFAULT_BINDS = {
     "jump": "space", "slide": "c", "reload": "r",
     "weapon1": "1", "weapon2": "2",
     "swaphand": "v", "crouch": "left ctrl", "melee": "e",
+    "console": "`",
 }
 DEFAULT_XH = {"size": 6, "thick": 2, "gap": 3, "dot": 0, "outline": 1, "r": 0, "g": 255, "b": 0, "a": 1.0}
 BIND_META = [
@@ -127,6 +127,7 @@ BIND_META = [
     ("weapon1", "Primary weapon"), ("weapon2", "Knife"),
     ("swaphand", "Switch hand"),
     ("crouch", "Crouch"), ("melee", "Melee attack"),
+    ("console", "Developer console"),
 ]
 BASE_SENS = 0.0022
 STEP_H = 18  # max step / slope rise per move
@@ -147,8 +148,8 @@ TWIST_SIGN = 1       # torso twist direction. If the upper body twists the wrong
 FADE_TIME = 0.2      # sequence cross-fade (seconds), same feel as the GoldSrc 0.2s sequence blend
 RUN_SPEED = 135      # above this horizontal speed the "run" gait plays, below it "walk"
 MAX_TWIST = 50.0     # keep idle torso turns restrained instead of twisting sharply
-VM_BOB_SIDE = 0.22    # first-person gun sway left/right while running (was 0.7). 0 = none
-VM_BOB_UP = 0.28      # first-person gun up/down bounce while running (was 0.9). 0 = none
+VM_BOB_SIDE = 0.45    # first-person gun sway left/right while running. Scaled by cl_viewbob
+VM_BOB_UP = 0.55      # first-person gun up/down bounce while running. Scaled by cl_viewbob
 VM_LAND = 1.0         # gun dip when landing (was 2.2)
 VM_IDLE_ANIM = False    # False = the weapon holds a still pose when you stand still; its animation only plays while you move. True = always play the idle animation
 SHAKE = 0.6            # screen shake when you shoot: 0 = off, 0.3 = light, 0.6 = medium, 1 = strong
@@ -239,14 +240,18 @@ class Wpn:
 def default_cfg():
     return {
         "weapons": [
-            Wpn(n="AWP", cls="Sniper rifle", dmg=100, rpm=45, mag=5, spr=.00035, auto=0,
-                match=r"snip|hunting|scout|sg55|g3sg|dragunov|svd|barrett|awm|(^|[^a-z])m24|m82"),
+            Wpn(n="AWP", cls="Sniper rifle", dmg=50, head_dmg=1000, rpm=45, mag=5, spr=.00035, auto=0,
+                match=r"awp|snip|hunting|scout|sg55|g3sg|dragunov|svd|barrett|awm|(^|[^a-z])m24|m82"),
             Wpn(n="AK-47", cls="Assault rifle", dmg=28, rpm=600, mag=30, spr=.012, auto=1),
             Wpn(n="Knife", dmg=1000, rpm=120, mag=0, spr=0, auto=1, melee=1, range=64),
             # pump shotgun: `pellets` rays per shot, each doing `dmg` (damage fades with distance up to `range`);
             # `match` = file-name pattern used to auto-pick a shotgun view-model from your weapon packs
             Wpn(n="Shotgun", cls="Pump shotgun", dmg=16, rpm=70, mag=8, spr=.045, auto=0, pellets=9, range=1400, recoil=.14,
                 match=r"nova|xm1014|mag7|sawed|shotgun|(^|[^a-z])m3"),
+            # semi-auto pistol: slow fire. `head_dmg` = damage of a hit in the head (kills in one shot);
+            # body hits do `dmg` = 25, so 4 body shots kill a 100 hp target
+            Wpn(n="Pistol", cls="Pistol", dmg=25, head_dmg=1000, rpm=130, mag=5, spr=.004, auto=0, recoil=.07,
+                match=r"pistol|glock|usp|p228|p250|fiveseven|five-seven|deagle|elite|tec9|revolver"),
         ],
         "bots": 2,
         "frags": 30,
@@ -627,18 +632,25 @@ class FadMapWorld(World):
             raise ValueError("not a FAD-MOD map file")
         self.name = str(d.get("name", "map"))
         self.B, self.meta = [], []
+        self.K, self.D = [], []      # shape kind per box (0 box, 1 slope, 2 cylinder) and slope uphill direction
         for b in d.get("boxes", []):
             v = [float(x) for x in b["b"]]
             for i in range(3):
                 if v[i] > v[i + 3]:
                     v[i], v[i + 3] = v[i + 3], v[i]
             self.B.append(v)
+            _k = int(b.get("k", 0) or 0)
+            self.K.append(_k if _k in (0, 1, 2) else 0)
+            self.D.append(int(b.get("d", 0) or 0) % 4)
             col = b.get("c") or (176, 160, 144)
             self.meta.append((int(b.get("t", -1)), int(b.get("tt", b.get("t", -1)) if b.get("tt") is not None else b.get("t", -1)),
                               float(b.get("tile", 128) or 128), tuple(col),
                               [int(v) for v in ((b.get("f") or []) + [-1] * 6)[:6]]))
         if not self.B:
             raise ValueError("the map has no boxes")
+        # plain boxes are tested the fast way; slopes / cylinders have their own tests
+        self._bx = [b for b, k in zip(self.B, self.K) if k == 0]
+        self._sp = [(b, k, d) for b, k, d in zip(self.B, self.K, self.D) if k]
         self.spawns = [[], []]
         for team, lst in enumerate((d.get("spawns") or [[], []])[:2]):
             for sp in lst:
@@ -707,21 +719,130 @@ class FadMapWorld(World):
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glColor4f(1, 1, 1, 1)
 
+    # ---- slopes (wedges) and cylinders ----
+    # slope: bounding box b, uphill direction d (0 +x, 1 +y, 2 -x, 3 -y); the top rises from b[2] (low end) to b[5] (high end)
+    # cylinder: the ellipse inscribed in the bounding box, from b[2] to b[5]
+    @staticmethod
+    def _slope_u(b, d, x, y):
+        """Position along the uphill direction: 0 at the low end .. 1 at the high end (not clamped)."""
+        if d == 0:
+            return (x - b[0]) / max(b[3] - b[0], 1e-6)
+        if d == 2:
+            return (b[3] - x) / max(b[3] - b[0], 1e-6)
+        if d == 1:
+            return (y - b[1]) / max(b[4] - b[1], 1e-6)
+        return (b[4] - y) / max(b[4] - b[1], 1e-6)
+
+    @classmethod
+    def _slope_top(cls, b, d, x, y):
+        u = cls._slope_u(b, d, x, y)
+        u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
+        return b[2] + u * (b[5] - b[2])
+
+    @staticmethod
+    def _slope_n(b, d):
+        """Unit normal of the slanted top surface."""
+        along_x = d in (0, 2)
+        L = (b[3] - b[0]) if along_x else (b[4] - b[1])
+        H = b[5] - b[2]
+        sx, sy = ((1, 0), (0, 1), (-1, 0), (0, -1))[d]
+        l = math.sqrt(H * H + L * L) or 1.0
+        return (-sx * H / l, -sy * H / l, L / l)
+
     def solid(self, x, y, z):
-        for b in self.B:
+        for b in self._bx:
             if (b[0] - 16 < x < b[3] + 16 and b[1] - 16 < y < b[4] + 16
                     and b[2] - 36 < z < b[5] + 36):
+                return True
+        for b, k, d in self._sp:
+            if not (b[0] - 16 < x < b[3] + 16 and b[1] - 16 < y < b[4] + 16 and b[2] - 36 < z < b[5] + 36):
+                continue
+            if k == 2:
+                ex = (x - (b[0] + b[3]) * .5) / ((b[3] - b[0]) * .5 + 16)
+                ey = (y - (b[1] + b[4]) * .5) / ((b[4] - b[1]) * .5 + 16)
+                if ex * ex + ey * ey < 1.0:
+                    return True
+            elif z < self._slope_top(b, d, x, y) + 36:
                 return True
         return False
 
     def bullet_solid(self, x, y, z):
-        for b in self.B:
+        for b in self._bx:
             if b[0] < x < b[3] and b[1] < y < b[4] and b[2] < z < b[5]:
+                return True
+        for b, k, d in self._sp:
+            if not (b[0] < x < b[3] and b[1] < y < b[4] and b[2] < z < b[5]):
+                continue
+            if k == 2:
+                ex = (x - (b[0] + b[3]) * .5) / ((b[3] - b[0]) * .5)
+                ey = (y - (b[1] + b[4]) * .5) / ((b[4] - b[1]) * .5)
+                if ex * ex + ey * ey < 1.0:
+                    return True
+            elif z < self._slope_top(b, d, x, y):
                 return True
         return False
 
     def normal_at(self, x, y, z, want_up=False, move=None):
-        return ArenaWorld.normal_at(self, x, y, z, want_up, move)
+        if want_up:
+            # standing on a slope: its slanted surface normal (steep ones are surfed, like in CS)
+            for b, k, d in self._sp:
+                if k == 1 and b[0] - 16 < x < b[3] + 16 and b[1] - 16 < y < b[4] + 16:
+                    u = self._slope_u(b, d, x, y)
+                    if 0.0 < u < 1.0:
+                        top = b[2] + u * (b[5] - b[2])
+                        if top - 3.0 <= z - 36 <= top + 6.0:
+                            return self._slope_n(b, d)
+            return (0.0, 0.0, 1.0)
+        best, bd = None, 1e30
+        F = self._FACES
+        cand = []                                  # (signed distances, normals) per shape
+        for b in self._bx:
+            cand.append(((b[0] - 16 - x, x - (b[3] + 16), b[1] - 16 - y,
+                          y - (b[4] + 16), b[2] - 36 - z, z - (b[5] + 36)), F))
+        for b, k, d in self._sp:
+            if k == 2:
+                cx, cy = (b[0] + b[3]) * .5, (b[1] + b[4]) * .5
+                Rx, Ry = (b[3] - b[0]) * .5 + 16, (b[4] - b[1]) * .5 + 16
+                dx, dy = x - cx, y - cy
+                r = math.hypot(dx, dy)
+                if r > 1e-6:
+                    ca, sa = dx / r, dy / r
+                    rr = 1.0 / math.sqrt((ca / Rx) ** 2 + (sa / Ry) ** 2)
+                    gx, gy = dx / (Rx * Rx), dy / (Ry * Ry)
+                    gl_ = math.hypot(gx, gy) or 1.0
+                    side, ns = r - rr, (gx / gl_, gy / gl_, 0.0)
+                else:
+                    side, ns = -min(Rx, Ry), (1.0, 0.0, 0.0)
+                cand.append(((side, b[2] - 36 - z, z - (b[5] + 36)), (ns, (0.0, 0.0, -1.0), (0.0, 0.0, 1.0))))
+            else:
+                u = self._slope_u(b, d, x, y)
+                if 0.0 < u < 1.0:
+                    tn = self._slope_n(b, d)
+                    top = b[2] + u * (b[5] - b[2])
+                    tsv = (z - 36 - top) * tn[2]
+                else:                              # flat lip beyond either end
+                    tn = (0.0, 0.0, 1.0)
+                    tsv = z - 36 - (b[5] if u >= 1.0 else b[2])
+                if d in (0, 2):
+                    sides = ((b[1] - 16 - y, (0.0, -1.0, 0.0)), (y - (b[4] + 16), (0.0, 1.0, 0.0)))
+                else:
+                    sides = ((b[0] - 16 - x, (-1.0, 0.0, 0.0)), (x - (b[3] + 16), (1.0, 0.0, 0.0)))
+                back = ((x - (b[3] + 16), (1.0, 0.0, 0.0)), (y - (b[4] + 16), (0.0, 1.0, 0.0)),
+                        (b[0] - 16 - x, (-1.0, 0.0, 0.0)), (b[1] - 16 - y, (0.0, -1.0, 0.0)))[d]
+                cand.append(((b[2] - 36 - z, tsv, sides[0][0], sides[1][0], back[0]),
+                             ((0.0, 0.0, -1.0), tn, sides[0][1], sides[1][1], back[1])))
+        for sv, ns in cand:
+            m = max(sv)
+            for i in range(len(sv)):
+                if sv[i] < m - .5:
+                    continue  # not a face we are touching
+                n = ns[i]
+                if move is not None and n[0] * move[0] + n[1] * move[1] + n[2] * move[2] > -1e-4:
+                    continue
+                if abs(sv[i]) < bd:
+                    bd = abs(sv[i])
+                    best = n
+        return best
 
     @staticmethod
     def _faces(b):
@@ -763,7 +884,10 @@ class FadMapWorld(World):
             self._tids.append(make_texture(arr, w, h))
         self._list = gl.glGenLists(1)
         gl.glNewList(self._list, gl.GL_COMPILE)
-        for b, (t, tt, tile, col, fo) in zip(self.B, self.meta):
+        for b, (t, tt, tile, col, fo), _k, _d in zip(self.B, self.meta, self.K, self.D):
+            if _k:
+                self._build_shape(b, _k, _d, t, tt, tile, col, fo)
+                continue
             for fi, f in enumerate(self._faces(b)):
                 n = f[4]
                 ti = tt if n[2] > .5 else t
@@ -783,6 +907,66 @@ class FadMapWorld(World):
                     gl.glVertex3f(*pt)
                 gl.glEnd()
         gl.glEndList()
+
+    def _poly(self, ti, col, pts, sh, uv):
+        tid = self._tids[ti] if 0 <= ti < len(self._tids) else None
+        gl.glBindTexture(gl.GL_TEXTURE_2D, tid or self._white)
+        if tid:
+            gl.glColor3f(sh, sh, sh)
+        else:
+            gl.glColor3f(col[0] / 255 * sh, col[1] / 255 * sh, col[2] / 255 * sh)
+        gl.glBegin(gl.GL_POLYGON)
+        for pt, (u, v) in zip(pts, uv):
+            gl.glTexCoord2f(u, v)
+            gl.glVertex3f(*pt)
+        gl.glEnd()
+
+    def _build_shape(self, b, k, d, t, tt, tile, col, fo):
+        """Slope (wedge) or cylinder, drawn exactly like the Map Builder shows it."""
+        x0, y0, z0, x1, y1, z1 = b
+        top_t = fo[0] if fo[0] >= 0 else tt
+        bot_t = fo[1] if fo[1] >= 0 else t
+        side_t = next((v for v in fo[2:] if v >= 0), t)
+        if k == 1:
+            def W(u, v, w):
+                if d == 0:
+                    x, y = x0 + u * (x1 - x0), y0 + v * (y1 - y0)
+                elif d == 2:
+                    x, y = x1 - u * (x1 - x0), y0 + v * (y1 - y0)
+                elif d == 1:
+                    x, y = x0 + v * (x1 - x0), y0 + u * (y1 - y0)
+                else:
+                    x, y = x0 + v * (x1 - x0), y1 - u * (y1 - y0)
+                return (x, y, z0 + w * (z1 - z0))
+            ax = d in (0, 2)
+            wn = ((1, 0, 0), (0, 1, 0), (-1, 0, 0), (0, -1, 0))[d]
+            sa, sb = ((0, -1, 0), (0, 1, 0)) if ax else ((-1, 0, 0), (1, 0, 0))
+            polys = (
+                ([(0, 1, 0), (1, 1, 0), (1, 0, 0), (0, 0, 0)], (0, 0, -1), bot_t),
+                ([(0, 0, 0), (1, 0, 1), (1, 1, 1), (0, 1, 0)], (0, 0, 1), top_t),
+                ([(1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1)], wn, side_t),
+                ([(0, 0, 0), (1, 0, 0), (1, 0, 1)], sa, side_t),
+                ([(0, 1, 0), (1, 1, 0), (1, 1, 1)], sb, side_t))
+            for loc, n, ti in polys:
+                pts = [W(*q) for q in loc]
+                self._poly(ti, col, pts, self._shade(n), [self._uv(pt, n, tile) for pt in pts])
+        else:
+            cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+            N = 64
+            ring = [(cx + rx * math.cos(2 * math.pi * i / N), cy + ry * math.sin(2 * math.pi * i / N)) for i in range(N)]
+            run = 0.0
+            for i in range(N):
+                a, c = ring[i], ring[(i + 1) % N]
+                seg = math.hypot(c[0] - a[0], c[1] - a[1])
+                pts = [(a[0], a[1], z0), (c[0], c[1], z0), (c[0], c[1], z1), (a[0], a[1], z1)]
+                uv = [(run / tile, -z0 / tile), ((run + seg) / tile, -z0 / tile),
+                      ((run + seg) / tile, -z1 / tile), (run / tile, -z1 / tile)]
+                run += seg
+                self._poly(side_t, col, pts, 0.75 + 0.07 * math.cos(2 * math.pi * (i + .5) / N), uv)
+            topp = [(px, py, z1) for px, py in ring]
+            self._poly(top_t, col, topp, 1.0, [self._uv(pt, (0, 0, 1), tile) for pt in topp])
+            botp = [(px, py, z0) for px, py in reversed(ring)]
+            self._poly(bot_t, col, botp, 0.5, [self._uv(pt, (0, 0, 1), tile) for pt in botp])
 
     def draw(self):
         if self._list is None:
@@ -1102,7 +1286,12 @@ def _slerp(a, b, t):
 
 HIT_HALF_W = 12.0     # hitbox half-width (was 19); smaller = narrower hitbox
 HIT_HALF_H = 29.0     # hitbox half-height standing (was 35)
+HEAD_FRAC = 0.20       # the top 20% of the model's height is the head (own hitbox, placed on the model's real head)
+HEAD_MIN_R, HEAD_MAX_R = 4.5, 9.0   # head box half-width limits (units, before PLAYER_SCALE)
 HIT_HALF_H_LOW = 17.0 # half-height while sliding / crouching (was 21)
+BLAST_AIM_MIX = 0.75      # shotgun jump: 1.0 = launch exactly opposite your aim, 0.0 = old surface-position based direction
+BLAST_FLAT_BOOST = 0.5    # shotgun jump: extra sideways/forward push when you shoot at a shallow angle (0 = none)
+SHOTGUN_RELOAD_SCALE = 0.75   # shotgun reload time as a fraction of the AWP reload (1.0 = same as AWP, lower = faster)
 PLAYER_SCALE = 0.85   # visual + hitbox size of other players (1.0 = original); lower = smaller
 
 
@@ -1130,9 +1319,10 @@ class SrcModel:
         # ---- vertices (VVD)
         if vvd[:4] != b"IDSV":
             raise ValueError("bad VVD")
-        nfix, fixo, vdo, tdo = struct.unpack_from("<4i", vvd, 48 + 0) if False else (
-            struct.unpack_from("<i", vvd, 48)[0], struct.unpack_from("<i", vvd, 52)[0],
-            struct.unpack_from("<i", vvd, 56)[0], struct.unpack_from("<i", vvd, 60)[0])
+        nfix = struct.unpack_from("<i", vvd, 48)[0]
+        fixo = struct.unpack_from("<i", vvd, 52)[0]
+        vdo = struct.unpack_from("<i", vvd, 56)[0]
+        tdo = struct.unpack_from("<i", vvd, 60)[0]
         nlod0 = struct.unpack_from("<i", vvd, 16)[0]
         raw_n = (tdo - vdo) // 48 if tdo > vdo else (len(vvd) - vdo) // 48
         dt = np.dtype([("w", "<f4", 3), ("bi", "u1", 3), ("nbw", "u1"), ("p", "<f4", 3),
@@ -1147,57 +1337,8 @@ class SrcModel:
         self.v_w = np.ascontiguousarray(V["w"], np.float32)
         self.v_bi = np.ascontiguousarray(V["bi"], np.int64)
         self.v_nb = np.ascontiguousarray(V["nbw"], np.int64)
-        # ---- meshes: MDL bodyparts (first model of each) + VTX strips
-        self.parts = []
+        # ---- meshes (VTX strips via _build_parts)
         nbody, bpo = I(232), I(236)
-        sv = struct.unpack_from
-        vh_nbp, vh_bpo = sv("<i", vtx, 28)[0], sv("<i", vtx, 32)[0]
-        for bi in range(nbody):
-            p = bpo + bi * 16
-            nmod, mi = I(p + 4), I(p + 12)
-            if nmod <= 0:
-                continue
-            mp = p + mi                      # model 0 of this body part
-            nmesh, mo, nvert, vidx = I(mp + 72), I(mp + 76), I(mp + 80), I(mp + 84)
-            if nmesh <= 0 or nvert <= 0:
-                continue
-            vstart = vidx // 48
-            # VTX: same body part / model 0 / LOD 0
-            vbp = vh_bpo + bi * 8
-            vnm, vmo = sv("<ii", vtx, vbp)
-            vm = vbp + vmo
-            vnl, vlo = sv("<ii", vtx, vm)
-            vl = vm + vlo
-            vnmesh, vmeo = sv("<ii", vtx, vl)
-            for k in range(min(nmesh, vnmesh)):
-                q = mp + mo + k * 116
-                mat, voff = I(q), I(q + 12)
-                vme = vl + vmeo + k * 9
-                nsg, sgo = sv("<ii", vtx, vme)
-                tri = []
-                for g in range(nsg):
-                    sg = vme + sgo + g * 25
-                    nv_, vo_, ni_, io_, ns_, so_ = sv("<6i", vtx, sg)
-                    vt = np.frombuffer(vtx, np.dtype([("bwi", "u1", 3), ("nb", "u1"), ("orig", "<u2"),
-                                                       ("bid", "i1", 3)]), nv_, sg + vo_)
-                    ix = np.frombuffer(vtx, "<u2", ni_, sg + io_)
-                    glob = (vt["orig"].astype(np.int64) + voff + vstart)
-                    for s in range(ns_):
-                        st = sg + so_ + s * 27
-                        sni, sio, snv, svo, snb, sfl = sv("<iiiihB", vtx, st)
-                        sidx = ix[sio:sio + sni].astype(np.int64)
-                        if sfl & 2:     # tri strip
-                            for t in range(len(sidx) - 2):
-                                a, b2, c = sidx[t:t + 3]
-                                tri.extend((a, c, b2) if t & 1 else (a, b2, c))
-                        else:           # tri list (default)
-                            tri.extend(sidx[:len(sidx) // 3 * 3].tolist())
-                if not tri:
-                    continue
-                tri = glob_to = np.array(tri, np.int64)
-                # indices above are strip-group local; map them to global vertex ids per group
-                self.parts.append({"mat": mat, "tri": tri, "glob": None})
-        # the loop above needs the group's glob table per triangle: redo cleanly
         self.parts = self._build_parts(vtx, nbody, bpo)
         self._parse_seqs()
         self.includes = []
@@ -1448,9 +1589,7 @@ class SrcModel:
 
     @staticmethod
     def _quat48s(buf, o):
-        """Quaternion48S used by FRAMEANIM const/anim rot2."""
-        v = struct.unpack_from("<Q", buf, o)[0] if False else None
-        # 3x16-bit with different packing — fall back to quat48 layout used by Crowbar
+        """Quaternion48S used by FRAMEANIM const/anim rot2 (Crowbar-compatible quat48 layout)."""
         return SrcModel._quat48(buf, o)
 
     def _decode_frameanim(self, buf, base, frame, pos, quat, delta):
@@ -1591,8 +1730,10 @@ class SrcModel:
                 break
             p += nxt
         self._cache[key] = (pos, quat)
-        if len(self._cache) > 6000:
-            self._cache.clear()
+        if len(self._cache) > 12000:
+            # drop oldest half rather than wiping everything mid-shoot (avoids decode spikes)
+            for k in list(self._cache.keys())[:6000]:
+                del self._cache[k]
         return pos, quat
 
 
@@ -1984,18 +2125,23 @@ class SrcInst:
         self.m = data.model
         self.seqs = data.seqs
         self.last = None
+        self._pose_t = 0.0
         self.bt = self.bdur = 0.0
         self.snap = self.snap_cur = None
         self.vtx = None
         self._pos_src = self._pos_val = None
         mm = self.m
-        self._p2b = np.stack([b["p2b"] for b in mm.bones])
+        self._p2b = np.stack([b["p2b"] for b in mm.bones]).astype(np.float32)
         self._P = np.concatenate([mm.v_pos, np.ones((len(mm.v_pos), 1))], 1).astype(np.float32)
         nbn = mm.nb
-        self._bi = [np.minimum(mm.v_bi[:, k], nbn - 1) for k in range(3)]
+        # bone parents as a flat int array (Source MDLs are parent-before-child)
+        self._par = np.array([b["par"] for b in mm.bones], dtype=np.int32)
+        self._bi = [np.minimum(mm.v_bi[:, k], nbn - 1).astype(np.intp) for k in range(3)]
         ws = [np.where(mm.v_nb > k, mm.v_w[:, k], 0.0).astype(np.float32) for k in range(3)]
         tot = np.maximum(ws[0] + ws[1] + ws[2], 1e-6)
-        self._wk = [w_ / tot for w_ in ws]
+        self._wk = [np.ascontiguousarray(w_ / tot, dtype=np.float32) for w_ in ws]
+        # pre-split rest positions for faster skinning (xyz only; w=1 applied as translation)
+        self._Px = np.ascontiguousarray(mm.v_pos, dtype=np.float32)
         self.base_seq = 0
         self.want_empty = False
         self.avtx = None
@@ -2003,15 +2149,16 @@ class SrcInst:
             am = arms.model
             wi = {b["name"].lower(): i for i, b in enumerate(mm.bones)}
             self._amap = [wi.get(b["name"].lower(), -1) for b in am.bones]
-            self._ap2b = np.stack([b["p2b"] for b in am.bones])
+            self._ap2b = np.stack([b["p2b"] for b in am.bones]).astype(np.float32)
             self._aP = np.concatenate([am.v_pos, np.ones((len(am.v_pos), 1))], 1).astype(np.float32)
-            self._abi = [np.minimum(am.v_bi[:, k], am.nb - 1) for k in range(3)]
+            self._aPx = np.ascontiguousarray(am.v_pos, dtype=np.float32)
+            self._abi = [np.minimum(am.v_bi[:, k], am.nb - 1).astype(np.intp) for k in range(3)]
             aw = [np.where(am.v_nb > k, am.v_w[:, k], 0.0).astype(np.float32) for k in range(3)]
             at = np.maximum(aw[0] + aw[1] + aw[2], 1e-6)
-            self._awk = [x / at for x in aw]
+            self._awk = [np.ascontiguousarray(x / at, dtype=np.float32) for x in aw]
             self._albind = []
             for b in am.bones:
-                Lb = np.eye(4)
+                Lb = np.eye(4, dtype=np.float32)
                 Lb[:3, :3] = _quat_mat3(b["quat"])
                 Lb[:3, 3] = b["pos"]
                 self._albind.append(Lb)
@@ -2160,13 +2307,26 @@ class SrcInst:
         if self.bt > 0:
             self.bt = max(0.0, self.bt - dt)
 
-    def pose(self, si, f, base=-1, bf=0, loop=False):
-        key = (si, round(f * 16), loop)
-        if key == self.last and self.bt <= 0:
+    def pose(self, si, f, base=-1, bf=0, loop=False, force=False):
+        # Fine quantize (1/8 frame) for smooth viewmodel motion, but rate-limit the
+        # expensive CPU skin to ~120 Hz so high game FPS does not reskin every tick.
+        # force=True: menu previews — no rate limit, no leftover in-game fade blend.
+        if force:
+            self.bt = self.bdur = 0.0
+            self.snap = None
+        fq = round(f * 8)
+        fade_q = 0 if force else (round(self.bt * 48) if self.bt > 0 else 0)
+        key = (si, fq, loop, fade_q)
+        if key == self.last and not force:
             return
+        now = time.perf_counter()
+        if (not force and self.last is not None and self.last[0] == si and self.bt <= 0
+                and (now - getattr(self, "_pose_t", 0.0)) < (1.0 / 120.0)):
+            return  # keep previous mesh; self.last stays so a newer frame retries next tick
         self.last = key
-        pos, quat = self._frame(si, f, loop)
-        if self.bt > 0 and self.snap is not None:
+        self._pose_t = now
+        pos, quat = self._frame(si, fq / 8.0, loop)
+        if (not force) and self.bt > 0 and self.snap is not None:
             w = 1.0 - self.bt / max(1e-4, self.bdur)
             w = w * w * (3 - 2 * w)
             sp, sq = self.snap
@@ -2175,29 +2335,42 @@ class SrcInst:
             q = sq + (q2 - sq) * w
             quat = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-9)
             pos = sp + (pos - sp) * w
-        self.snap_cur = (np.array(pos), np.array(quat))
+        self.snap_cur = (pos, quat)
         self._build(pos, quat)
+
+    @staticmethod
+    def _skin_verts(M, Px, bi, wk):
+        """Linear-blend skinning: M=(nb,3,4), Px=(nv,3). Fast path over 3 bone weights."""
+        out = np.zeros((Px.shape[0], 3), np.float32)
+        for k in range(3):
+            w = wk[k]
+            if not w.any():
+                continue
+            Mk = M[bi[k]]                                          # (nv,3,4)
+            # R @ v + t  without building homogeneous coords
+            out += w[:, None] * (np.einsum("nij,nj->ni", Mk[:, :, :3], Px) + Mk[:, :, 3])
+        return out
 
     def _build(self, pos, quat):
         m = self.m
         nb = m.nb
+        quat = np.asarray(quat, dtype=np.float32)
+        pos = np.asarray(pos, dtype=np.float32)
         x, y, z, w = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-        L = np.zeros((nb, 4, 4))
+        L = np.zeros((nb, 4, 4), dtype=np.float32)
         L[:, 0, 0] = 1 - 2 * (y * y + z * z); L[:, 0, 1] = 2 * (x * y - z * w); L[:, 0, 2] = 2 * (x * z + y * w)
         L[:, 1, 0] = 2 * (x * y + z * w); L[:, 1, 1] = 1 - 2 * (x * x + z * z); L[:, 1, 2] = 2 * (y * z - x * w)
         L[:, 2, 0] = 2 * (x * z - y * w); L[:, 2, 1] = 2 * (y * z + x * w); L[:, 2, 2] = 1 - 2 * (x * x + y * y)
         L[:, :3, 3] = pos
         L[:, 3, 3] = 1
         W = L.copy()
+        par = self._par
         for b in range(nb):
-            par = m.bones[b]["par"]
-            if 0 <= par < b:
-                W[b] = W[par] @ L[b]
-        M = np.matmul(W, self._p2b)[:, :3, :].astype(np.float32)        # (nb,3,4)
-        out = np.zeros((len(self._P), 3), np.float32)
-        for k in range(3):
-            out += self._wk[k][:, None] * np.einsum("nij,nj->ni", M[self._bi[k]], self._P)
-        self.vtx = out
+            p = int(par[b])
+            if 0 <= p < b:
+                W[b] = W[p] @ L[b]
+        M = np.matmul(W, self._p2b)[:, :3, :]                      # (nb,3,4) float32
+        self.vtx = self._skin_verts(M, self._Px, self._bi, self._wk)
         if self.a is not None:
             try:
                 self._build_arms(W)
@@ -2208,7 +2381,7 @@ class SrcInst:
     def _build_arms(self, W):
         if self.a is not None:
             am = self.a.model
-            WA = np.empty((am.nb, 4, 4))
+            WA = np.empty((am.nb, 4, 4), dtype=np.float32)
             for b in range(am.nb):
                 wb = self._amap[b]
                 if wb >= 0:                       # same bone name as the weapon: follow the weapon animation
@@ -2216,11 +2389,8 @@ class SrcInst:
                 else:
                     par = am.bones[b]["par"]
                     WA[b] = WA[par] @ self._albind[b] if 0 <= par < b else self._albind[b]
-            MA = np.matmul(WA, self._ap2b)[:, :3, :].astype(np.float32)
-            o2 = np.zeros((len(self._aP), 3), np.float32)
-            for k in range(3):
-                o2 += self._awk[k][:, None] * np.einsum("nij,nj->ni", MA[self._abi[k]], self._aP)
-            self.avtx = o2
+            MA = np.matmul(WA, self._ap2b)[:, :3, :]
+            self.avtx = self._skin_verts(MA, self._aPx, self._abi, self._awk)
 
     @property
     def pos(self):
@@ -3298,7 +3468,20 @@ class Broker:
             self.cli = cli
             self.err = ""
             cli.loop_start()      # keeps running and reconnects by itself
-            return
+            # stay in the thread so we can rotate brokers if this one dies for good
+            while not self.stop:
+                time.sleep(2.0)
+                if self.ok or self.stop:
+                    continue
+                # disconnected and paho has not recovered yet — try the next broker
+                try:
+                    cli.loop_stop()
+                    cli.disconnect()
+                except Exception:
+                    pass
+                break
+            if self.stop:
+                return
 
     def _on_connect(self, c, u, flags, rc, *a):
         self.ok = (rc == 0)
@@ -3384,6 +3567,8 @@ class UConn:
         self.t_ping = 0.0
 
     def accepts(self, addr):
+        if not self.locked:
+            return True   # still probing: accept a reply from any path the host uses
         return addr in self.addrs
 
     def _raw(self, obj):
@@ -3425,6 +3610,9 @@ class UConn:
         self.last = time.time()
         if not self.locked:
             self.locked = True
+            self.addrs = [addr]
+        elif addr not in self.addrs:
+            # host/NAT may reply from a slightly different mapped port — keep talking to it
             self.addrs = [addr]
         a = pkt.get("a")
         if isinstance(a, int) and self.unacked:
@@ -3639,10 +3827,11 @@ class Net:
         for a in addrs:
             for pu in self.punch:
                 if pu[0] == a:
-                    pu[1] = now + 5.0
+                    pu[1] = now + 20.0
+                    pu[2] = 0.0   # send immediately
                     break
             else:
-                self.punch.append([a, now + 5.0, 0.0])
+                self.punch.append([a, now + 20.0, 0.0])  # keep punching long enough for slow STUN
 
     def _announce(self, now):
         self.t_ann = now
@@ -3787,15 +3976,33 @@ class Net:
     @staticmethod
     def room_cands(r):
         """Addresses to try for a room-browser entry."""
-        out = []
+        out, seen = [], set()
+
+        def add(ip, port):
+            try:
+                a = (str(ip), int(port))
+            except (TypeError, ValueError):
+                return
+            if a in seen:
+                return
+            seen.add(a)
+            out.append(a)
+
         if r.get("src") == "lan":
-            out.append((r["ip"], r["port"]))
+            add(r["ip"], r["port"])
         else:
             lan = r.get("lan")
             mine = lan_ip()
-            if lan and mine.count(".") == 3 and lan[0].rsplit(".", 1)[0] == mine.rsplit(".", 1)[0]:
-                out.append((lan[0], lan[1]))
-            out.append((r["ip"], r["port"]))
+            # Prefer LAN when both ends look like the same private subnet
+            if lan and mine.count(".") == 3 and str(lan[0]).count(".") == 3:
+                if mine.rsplit(".", 1)[0] == str(lan[0]).rsplit(".", 1)[0]:
+                    add(lan[0], lan[1])
+                # Also try LAN address first for common private ranges (same router / VPN)
+                elif str(lan[0]).startswith(("10.", "192.168.", "172.")):
+                    add(lan[0], lan[1])
+            add(r["ip"], r["port"])
+            if lan:
+                add(lan[0], lan[1])
         return out
 
     def join_room(self, r, pname, map_sig):
@@ -3817,12 +4024,14 @@ class Net:
         self.join_t0 = time.time()
         self.t_sig = 0.0
         self.t_stun = 0.0
+        self._join_pub_sent = False
+        self._join_punch_t = 0.0
         self._stun_start()
         self.cid = "%08x" % random.getrandbits(32)      # new for every attempt
         self.conn = UConn(sock, cands)
         self.conn.send({"t": "hello", "g": NET_MAGIC, "v": NET_PROTO, "n": pname, "map": map_sig,
                         "cid": self.cid})
-        self.status = "Connecting to the server ..."
+        self.status = "Connecting to the server (UDP hole-punch, up to 25s)..."
         return True
 
     def leave(self, status=None):
@@ -3920,7 +4129,7 @@ class Net:
         return msgs
 
     def _poll_host(self, now, msgs):
-        if self.pub and now - self.t_ann >= 5.0:
+        if self.pub and now - self.t_ann >= (2.0 if self.punch or self.pending else 5.0):
             self._announce(now)
         if not self.pub and not self.pub_warned and now - self.host_t0 > 6.0:
             self.pub_warned = True
@@ -3930,7 +4139,7 @@ class Net:
             if now > pu[1]:
                 self.punch.remove(pu)
             elif now >= pu[2]:
-                pu[2] = now + 0.15
+                pu[2] = now + 0.05   # fire often: keeps both NATs open during join
                 try:
                     self.sock.sendto(b'{"p":1}', pu[0])
                 except OSError:
@@ -4005,12 +4214,29 @@ class Net:
 
     def _poll_joining(self, now, msgs):
         c = self.conn
-        if self.join_rid and now - self.t_sig >= 1.5 and (self.pub or now - self.join_t0 > 2.5):
+        # After STUN resolves, re-send hello so the host sees the correct return path
+        if self.pub and not getattr(self, "_join_pub_sent", False):
+            self._join_pub_sent = True
+            self.t_sig = 0.0
+            try:
+                c.send({"t": "hello", "g": NET_MAGIC, "v": NET_PROTO, "n": self.pname,
+                        "map": self.map_sig, "cid": self.cid})
+            except Exception:
+                pass
+        if self.join_rid and now - self.t_sig >= 0.4 and (self.pub or now - self.join_t0 > 1.0):
             # tell the host (via the broker) where to punch through to us
             self.t_sig = now
             self.broker.pub("%s/sig/%s" % (BROKER_ROOT, self.join_rid), {
                 "t": "punch", "cid": self.cid, "n": self.pname,
                 "pub": list(self.pub) if self.pub else None, "lan": [lan_ip(), self.port]})
+        # Joiner must also punch the host (classic simultaneous UDP open)
+        if c and c.addrs and now - getattr(self, "_join_punch_t", 0.0) >= 0.05:
+            self._join_punch_t = now
+            for a in list(c.addrs):
+                try:
+                    self.sock.sendto(b'{"p":1}', a)
+                except OSError:
+                    pass
         c.flush()
         for m in c.read():
             t = m.get("t")
@@ -4029,9 +4255,12 @@ class Net:
                 self.leave("Denied: " + str(m.get("why", "Denied.")))
                 msgs.append({"t": "failed"})
                 return
-        if self.mode == "joining" and (c.dead or now - self.join_t0 > 12.0):
-            self.leave("Could not reach the server. The host may have left, or one of your networks "
-                       "blocks direct connections (try another network or hotspot).")
+        if self.mode == "joining" and (c.dead or now - self.join_t0 > 25.0):
+            why = ("Could not reach the server. Both of you should: "
+                   "1) stay in the game while connecting  2) try a phone hotspot  "
+                   "3) make sure neither network blocks UDP. "
+                   "Symmetric NATs (some mobile/college nets) cannot peer-connect.")
+            self.leave(why)
             msgs.append({"t": "failed"})
 
     def _poll_client(self, now, msgs):
@@ -4088,6 +4317,8 @@ class Ent:
         self.bl = 0
         self.see = 0
         self.tgt = None
+        self.static = False   # True = stands still (dev console bot_place / bot_stop)
+        self.kbx = self.kby = 0.0   # leftover knockback / toss (bots)
         self.zoom = 0
         self.acc = 0.0
         self.jreq = 0
@@ -4135,7 +4366,7 @@ class Game:
         self.audio = audio
         self.texdb = {}
         self.files = {"bsp": None, "wads": []}
-        self.asset = {"mdl": {}, "pack": {}, "wav": {}, "player": {}}
+        self.asset = {"mdl": {}, "pack": {}, "wav": {}, "player": {}, "mdl_folder": {}}
         self.src_loose = LooseSrcFiles()
         self.src_dirs = {}
         self.src_arms = None      # SrcSpec of the arms model (hands holding the CS:GO weapon)
@@ -4179,8 +4410,6 @@ class Game:
         self.chat = []            # chat lines: {"tag", "text", "t"} (t = seconds left)
         self.fps_val = 0.0
         self.vm_adj = [0.0, 0.0, 0.0]  # viewmodel x (forward), y (right), z (up)
-        self.custom_shot = self.custom_hit = None
-        self.custom_shot_path = self.custom_hit_path = ""
         self.sens = BASE_SENS
         self.lock = False
         self.flash = 0.0
@@ -4198,6 +4427,21 @@ class Game:
         self.rank_flash = 0.0    # "RANK UP" banner timer
         self.xh = dict(DEFAULT_XH)   # crosshair settings
         self.vmA = {"vm": None, "w": -1, "s": 0, "t": 0.0, "loop": True}
+        self.quit_req = False        # set by the quit console command
+        self.show_hitboxes = False   # sv_showhitboxes: draw player collision / bullet AABBs
+        self.thirdperson = False     # thirdperson console command: camera behind your player model
+        self.viewbob = 0.5           # viewmodel mouse-lag / sway strength 0..2 (0.5 = default)
+        self._vm_lyaw = None         # last frame yaw (for mouse lag)
+        self._vm_lpitch = None
+        self.vm_lag_y = 0.0          # current lag offset: + = gun shifts right
+        self.vm_lag_p = 0.0          # + = gun shifts up
+        # CS:GO-style developer console (~)
+        self.con_open = False
+        self.con_text = ""
+        self.con_hist = []       # command history
+        self.con_hist_i = -1
+        self.con_log = []        # recent output lines [{"t": str, "c": (r,g,b)}]
+        self.con_scroll = 0
 
     # ----- setup -----
     def set_world(self, w):
@@ -4214,9 +4458,9 @@ class Game:
             self.build_entity_model(e)
         return e
 
-    def build_entity_model(self, e):
+    def build_entity_model(self, e, force=False):
         e.pm = None
-        if e.isP:
+        if e.isP and not force:
             return
         name = self.pm_cfg["CT"] if e.team == 0 else self.pm_cfg["T"]
         if name and name in self.asset["player"]:
@@ -4301,6 +4545,366 @@ class Game:
         self.feed = []
         self.over = 0.0
         self.streak = 0
+
+    # ----- developer console (CS:GO style) -----
+    def con_print(self, msg, col=(200, 200, 200)):
+        """Append a line to the console log (keeps last ~80)."""
+        self.con_log.append({"t": str(msg), "c": col})
+        if len(self.con_log) > 80:
+            self.con_log = self.con_log[-80:]
+        self.con_scroll = 0
+
+    def con_toggle(self):
+        if self.net.active and not self.con_open:
+            self.chat_add("The console is disabled in online games.", tag="CONSOLE", life=4.0)
+            return
+        self.con_open = not self.con_open
+        self.con_text = ""
+        self.con_hist_i = -1
+        if self.con_open:
+            pygame.event.set_grab(False)
+            pygame.mouse.set_visible(True)
+            try:
+                pygame.mouse.set_relative_mode(False)
+            except Exception:
+                pass
+        elif self.lock:
+            pygame.event.set_grab(True)
+            pygame.mouse.set_visible(False)
+            try:
+                pygame.mouse.set_relative_mode(True)
+            except Exception:
+                pass
+            pygame.mouse.get_rel()
+
+    def _con_next_bot_name(self, team):
+        if self._bot_names:
+            return self._bot_names.pop()
+        used = {e.name for e in self.ents}
+        for n in BOT_NAMES:
+            nm = "Bot " + n
+            if nm not in used:
+                return nm
+        return ("Yellow" if team else "Black") + "-" + str(len(self.ents))
+
+    def con_add_bot(self, team=None, static=False, at_player=False):
+        """Spawn a bot. team 0=CT/Black, 1=T/Yellow, None=auto balance."""
+        if self.net.active:
+            self.con_print("Cannot add bots while online.", (255, 180, 80))
+            return None
+        if team is None:
+            n0 = sum(1 for e in self.ents if not e.isP and e.team == 0)
+            n1 = sum(1 for e in self.ents if not e.isP and e.team == 1)
+            team = 1 if n1 <= n0 else 0
+        team = int(team) & 1
+        name = self._con_next_bot_name(team)
+        e = Ent(team, False, name)
+        e.static = bool(static)
+        self.build_entity_model(e)
+        if at_player and self.P:
+            # place a few units in front of the player, same yaw
+            P = self.P
+            fwd = 48.0
+            e.x = P.x + math.cos(P.yaw) * fwd
+            e.y = P.y + math.sin(P.yaw) * fwd
+            e.z = P.z
+            e.yaw = P.yaw + math.pi   # face the player
+            e.pitch = 0.0
+            # drop onto ground
+            for _ in range(40):
+                if self.world.solid(e.x, e.y, e.z - 1):
+                    break
+                e.z -= 2
+            e.alive = 1
+            e.hp = 100
+            e.ammo = [w.mag for w in CFG["weapons"]]
+            e.w = self.primary if not CFG["weapons"][self.primary].melee else 0
+            e.anim = fresh_anim()
+        else:
+            self.spawn(e)
+        self.ents.append(e)
+        kind = "static bot" if static else "bot"
+        side = "Yellow" if team else "Black"
+        self.con_print("Added %s '%s' (%s)" % (kind, name, side), (157, 211, 103))
+        return e
+
+    def con_kick_bots(self, all_bots=True, name=None):
+        if self.net.active:
+            self.con_print("Cannot kick bots while online.", (255, 180, 80))
+            return
+        removed = []
+        for e in list(self.ents):
+            if e.isP or e.remote:
+                continue
+            if name is not None and e.name.lower() != name.lower():
+                continue
+            self.ents.remove(e)
+            removed.append(e.name)
+        if removed:
+            self.con_print("Kicked %d bot(s): %s" % (len(removed), ", ".join(removed[:8])), (255, 193, 7))
+        else:
+            self.con_print("No bots to kick.", (180, 180, 180))
+
+    def con_set_static(self, on=True, name=None):
+        n = 0
+        for e in self.ents:
+            if e.isP or e.remote:
+                continue
+            if name is not None and e.name.lower() != name.lower():
+                continue
+            e.static = bool(on)
+            e.vx = e.vy = 0.0
+            n += 1
+        self.con_print(("%s %d bot(s)." % ("Froze" if on else "Unfroze", n)), (157, 211, 103))
+
+    def con_run(self, line):
+        """Parse and execute a console command. Returns nothing; prints to con_log."""
+        line = (line or "").strip()
+        if not line:
+            return
+        if self.net.active:          # no console commands (god, noclip, bots ...) in online games
+            self.con_print("The console is disabled in online games.", (255, 100, 100))
+            return
+        self.con_hist.append(line)
+        if len(self.con_hist) > 40:
+            self.con_hist = self.con_hist[-40:]
+        self.con_hist_i = -1
+        self.con_print("] " + line, (255, 255, 255))
+        parts = line.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        def arg(i, default=None):
+            return args[i] if i < len(args) else default
+
+        if cmd in ("help", "commands", "?"):
+            help_lines = [
+                "=== Dev console (offline) ===",
+                "bot_add [ct|t]          add a bot (auto team if omitted)",
+                "bot_add_ct / bot_add_t  add bot to Black / Yellow",
+                "bot_place [ct|t]        spawn static bot in front of you",
+                "bot_kick [all|name]     kick bots (default: all)",
+                "bot_kick_all            kick every bot",
+                "bot_stop / bot_freeze   freeze all bots (static dummies)",
+                "bot_go / bot_unfreeze   unfreeze bots (resume AI)",
+                "bot_quota <n>           set default bot count per team & restart",
+                "bot_mimic 0/1           (alias) freeze/unfreeze",
+                "kill / killme           suicide",
+                "bot_kill                kill all bots (they respawn)",
+                "restart / mp_restartgame  restart the match",
+                "god                     toggle god mode (no damage)",
+                "noclip                  toggle noclip fly",
+                "sv_cheats 1             (always on offline)",
+                "status                  list players / bots",
+                "clear                   clear console log",
+                "fps / cl_showfps 0/1    toggle FPS counter",
+                "cl_viewbob <0-2>        viewmodel lag when moving mouse",
+                "bind <action> <key>     rebind a key (e.g. bind console f10)",
+                "unbind <action>         reset a bind to default",
+                "sv_showhitboxes 0/1     draw collision (cyan) + bullet (yellow) + pistol head (red) boxes",
+                "quit / exit             close the game",
+                "bot_toss                fling the nearest bot away from you",
+                "day / night             toggle day/night atmosphere",
+                "thirdperson [0/1]       camera behind your player (firstperson to go back)",
+                "",
+                "Player collision: bodies block each other (no pushing/tossing).",
+            ]
+            for h in help_lines:
+                self.con_print(h, (180, 200, 220))
+        elif cmd == "clear":
+            self.con_log.clear()
+        elif cmd in ("status", "users"):
+            self.con_print("--- entities ---", (150, 150, 150))
+            for e in self.ents:
+                flags = []
+                if e.isP:
+                    flags.append("YOU")
+                if e.remote:
+                    flags.append("net")
+                if getattr(e, "static", False):
+                    flags.append("static")
+                if not e.alive:
+                    flags.append("dead")
+                side = "Yellow" if e.team else "Black"
+                self.con_print("  %s  [%s]  hp=%d  %s" % (e.name, side, int(e.hp), " ".join(flags)),
+                               (220, 220, 220))
+        elif cmd in ("bot_add", "bot"):
+            team = None
+            a0 = (arg(0) or "").lower()
+            if a0 in ("ct", "black", "0"):
+                team = 0
+            elif a0 in ("t", "yellow", "1"):
+                team = 1
+            self.con_add_bot(team)
+        elif cmd in ("bot_add_ct", "bot_add_black"):
+            self.con_add_bot(0)
+        elif cmd in ("bot_add_t", "bot_add_yellow"):
+            self.con_add_bot(1)
+        elif cmd in ("bot_place", "bot_static", "npc_create"):
+            team = None
+            a0 = (arg(0) or "").lower()
+            if a0 in ("ct", "black", "0"):
+                team = 0
+            elif a0 in ("t", "yellow", "1"):
+                team = 1
+            self.con_add_bot(team, static=True, at_player=True)
+        elif cmd in ("bot_kick", "kick"):
+            a0 = (arg(0) or "all").lower()
+            if a0 in ("all", "*"):
+                self.con_kick_bots(True)
+            else:
+                self.con_kick_bots(False, name=" ".join(args) if args else None)
+        elif cmd in ("bot_kick_all", "kickall"):
+            self.con_kick_bots(True)
+        elif cmd in ("bot_stop", "bot_freeze", "bot_zombie"):
+            self.con_set_static(True, name=" ".join(args) if args else None)
+        elif cmd in ("bot_go", "bot_unfreeze", "bot_start"):
+            self.con_set_static(False, name=" ".join(args) if args else None)
+        elif cmd == "bot_mimic":
+            on = (arg(0) or "1") not in ("0", "off", "false")
+            self.con_set_static(on)
+        elif cmd == "bot_quota":
+            try:
+                n = max(0, min(16, int(arg(0, "2"))))
+            except ValueError:
+                self.con_print("Usage: bot_quota <0-16>", (255, 100, 100))
+                return
+            CFG["bots"] = n
+            self.bots_on = n > 0
+            self.con_print("bot_quota = %d (restarting match)" % n, (157, 211, 103))
+            self.reset_game()
+        elif cmd in ("bot_kill", "bot_slay"):
+            n = 0
+            for e in self.ents:
+                if not e.isP and not e.remote and e.alive:
+                    e.hp = 0
+                    self.kill(e, self.P if self.P else e)
+                    n += 1
+            self.con_print("Killed %d bot(s)." % n, (255, 193, 7))
+        elif cmd in ("kill", "killme", "suicide"):
+            if self.P and self.P.alive:
+                self.P.hp = 0
+                self.kill(self.P, self.P)
+                self.con_print("You died.", (255, 193, 7))
+        elif cmd in ("restart", "mp_restartgame", "retry"):
+            self.reset_game()
+            self.con_print("Match restarted.", (157, 211, 103))
+        elif cmd == "god":
+            self.P.god = not getattr(self.P, "god", False)
+            self.con_print("god %s" % ("ON" if self.P.god else "OFF"), (255, 214, 0))
+        elif cmd == "noclip":
+            self.P.noclip = not getattr(self.P, "noclip", False)
+            self.con_print("noclip %s" % ("ON" if self.P.noclip else "OFF"), (255, 214, 0))
+        elif cmd == "sv_cheats":
+            self.con_print("sv_cheats 1 (offline always allowed)", (180, 180, 180))
+        elif cmd in ("fps", "cl_showfps"):
+            if args:
+                self.show_fps = arg(0) not in ("0", "off", "false")
+            else:
+                self.show_fps = not self.show_fps
+            self.con_print("FPS counter %s" % ("ON" if self.show_fps else "OFF"), (157, 211, 103))
+        elif cmd in ("cl_viewbob", "viewbob", "cl_bob"):
+            # viewmodel lag when moving the mouse: 0=off .. 2=strong
+            if not args:
+                self.con_print("cl_viewbob = %.2f  (gun lag on mouse look: 0=off, 0.5=default, 2=strong)" % self.viewbob, (200, 200, 200))
+            else:
+                a0 = arg(0).lower()
+                if a0 in ("on", "true"):
+                    self.viewbob = 1.0
+                elif a0 in ("off", "false"):
+                    self.viewbob = 0.0
+                else:
+                    try:
+                        self.viewbob = max(0.0, min(2.0, float(a0)))
+                    except ValueError:
+                        self.con_print("Usage: cl_viewbob <0-2>", (255, 100, 100))
+                        return
+                self.con_print("cl_viewbob = %.2f  (mouse-look lag)" % self.viewbob, (157, 211, 103))
+        elif cmd == "bind":
+            # bind <action> <key>   e.g. bind console f10
+            if len(args) < 2:
+                self.con_print("Usage: bind <action> <key>", (255, 100, 100))
+                self.con_print("Actions: " + ", ".join(a for a, _ in BIND_META), (160, 180, 200))
+                return
+            action = args[0].lower()
+            key = " ".join(args[1:]).lower()
+            if action not in DEFAULT_BINDS:
+                self.con_print("Unknown action '%s'" % action, (255, 100, 100))
+                return
+            # swap if key already used
+            for k, v in list(self.binds.items()):
+                if v == key and k != action:
+                    self.binds[k] = self.binds[action]
+            self.binds[action] = key
+            self.con_print("Bound %s -> %s" % (action, key), (157, 211, 103))
+        elif cmd == "unbind":
+            if not args:
+                self.con_print("Usage: unbind <action>", (255, 100, 100))
+                return
+            action = args[0].lower()
+            if action not in DEFAULT_BINDS:
+                self.con_print("Unknown action '%s'" % action, (255, 100, 100))
+                return
+            self.binds[action] = DEFAULT_BINDS[action]
+            self.con_print("Reset %s -> %s" % (action, self.binds[action]), (157, 211, 103))
+        elif cmd in ("quit", "exit", "disconnect_and_quit"):
+            self.con_print("Quitting ...", (255, 180, 80))
+            self.quit_req = True
+        elif cmd in ("sv_showhitboxes", "hitboxes", "showhitboxes", "cl_showhitboxes", "hitbox", "showhitbox"):
+            if args:
+                self.show_hitboxes = arg(0) not in ("0", "off", "false")
+            else:
+                self.show_hitboxes = not self.show_hitboxes
+            self.con_print("sv_showhitboxes %s  (cyan=body collision, yellow=body hitbox, red=head hitbox)"
+                           % ("1" if self.show_hitboxes else "0"), (157, 211, 103))
+        elif cmd in ("thirdperson", "cl_thirdperson", "tp", "firstperson"):
+            if cmd == "firstperson":
+                on = False
+            elif args:
+                on = arg(0) not in ("0", "off", "false")
+            else:
+                on = not self.thirdperson
+            self.thirdperson = on
+            P = self.P
+            if P and not on:
+                P.pm = None                 # free the model, it is only needed in third person
+                P._pm_tried = False
+                P._pm_team = None
+            self.con_print("thirdperson %s" % ("ON" if on else "OFF"), (157, 211, 103))
+        elif cmd in ("bot_toss", "toss"):
+            # fling the nearest bot away from you (debug / fun)
+            P = self.P
+            if not P:
+                return
+            best, bd = None, 1e9
+            for e in self.ents:
+                if e.isP or e.remote or not e.alive:
+                    continue
+                d = math.hypot(e.x - P.x, e.y - P.y)
+                if d < bd:
+                    bd, best = d, e
+            if not best or bd > 200:
+                self.con_print("No bot nearby to toss.", (255, 180, 80))
+                return
+            dx, dy = best.x - P.x, best.y - P.y
+            L = math.hypot(dx, dy) or 1.0
+            power = 550.0
+            best.vx += dx / L * power
+            best.vy += dy / L * power
+            best.kbx = getattr(best, "kbx", 0.0) + dx / L * power
+            best.kby = getattr(best, "kby", 0.0) + dy / L * power
+            best.vz += 320.0
+            self.con_print("Tossed %s" % best.name, (255, 214, 0))
+        elif cmd == "day":
+            FX.day = True
+            self.con_print("day mode", (255, 255, 200))
+        elif cmd == "night":
+            FX.day = False
+            self.con_print("night mode", (150, 150, 180))
+        elif cmd in ("echo", "say"):
+            self.con_print(" ".join(args), (200, 200, 200))
+        else:
+            self.con_print("Unknown command: %s  (type help)" % cmd, (255, 100, 100))
 
     # ----- online -----
     def map_sig(self):
@@ -4420,8 +5024,6 @@ class Game:
             if not w.melee or w.snd:
                 g, pan = self.spatial(o[0], o[1], o[2], .55)
                 snd = w.snd
-                if not w.melee and self.custom_shot:
-                    snd = self.custom_shot
                 if g > .004:
                     self.audio.play(g, snd, pan)
         elif t == "shove":
@@ -4432,7 +5034,7 @@ class Game:
                 e.shoveHit = True            # the damage is sent by the shover; this is only the look
         elif t == "hit":
             P = self.P
-            if P.alive and not self.over:
+            if P.alive and not self.over and not getattr(P, "god", False):
                 damage = max(0.0, float(m.get("d", 0)))
                 P.hp -= damage
                 if damage > 0:
@@ -4561,11 +5163,120 @@ class Game:
         return world.normal_at(e.x, e.y, e.z, True) or (0.0, 0.0, 1.0)
 
     def walkable(self, e):
-        """On ground gentle enough to walk on (steeper surfaces count as air: you surf)."""
+        """On ground gentle enough to walk on (steeper surfaces count as air: you surf).
+        Also true when standing on another player's head."""
         if e.vz > 0:
             return False
         n = self.floor_n(e)
-        return n is not None and n[2] >= SURF_NZ
+        if n is not None and n[2] >= SURF_NZ:
+            return True
+        # standing on another living entity's head?
+        # use standing half-height for the feet test so crouch/uncrouch doesn't drop walkable
+        ra, _ = self.ent_hull(e)
+        ha_stand = HIT_HALF_H * (PLAYER_SCALE if not e.isP else 1.0)
+        feet = e.z - ha_stand
+        # also accept crouched feet (higher) so crouching on a head still counts
+        _, ha_now = self.ent_hull(e)
+        feet_now = e.z - ha_now
+        for o in self.ents:
+            if o is e or not o.alive or o.remote:
+                continue
+            rb, hb = self.ent_hull(o)
+            head = o.z + hb
+            near = abs(feet - head) <= 18 or abs(feet_now - head) <= 18
+            if not near:
+                continue
+            if math.hypot(e.x - o.x, e.y - o.y) <= (ra + rb) * 1.05:
+                return True
+        return False
+
+    def ent_hull(self, e):
+        """Horizontal radius and vertical half-height of the player collision hull (game units)."""
+        scale = PLAYER_SCALE if not e.isP else 1.0
+        sl = (getattr(e, "sl", 0) or 0) > 0 or (getattr(e, "cr", 0) or 0) > 0.5
+        hh = (HIT_HALF_H_LOW if sl else HIT_HALF_H) * scale
+        rw = HIT_HALF_W * scale * 1.15   # a bit wider than the bullet hitbox so bodies block
+        return rw, hh
+
+    def resolve_player_collisions(self, dt):
+        """Solid player hulls: bodies block each other (no shove), and you can stand on heads.
+        Crouch / uncrouch keeps feet planted on a head instead of shoving you sideways."""
+        alive = [e for e in self.ents if e.alive and not e.remote]
+        n = len(alive)
+        for i in range(n):
+            a = alive[i]
+            ra, ha = self.ent_hull(a)
+            for j in range(i + 1, n):
+                b = alive[j]
+                rb, hb = self.ent_hull(b)
+                dx = b.x - a.x
+                dy = b.y - a.y
+                dist = math.hypot(dx, dy)
+                min_d = ra + rb
+                dxy_ok = dist < min_d * 1.08 or dist < 1e-4
+
+                def try_stand(upper, lower, uh, lh):
+                    """Snap upper onto lower's head. Generous Z so crouch height changes stay on top."""
+                    if not dxy_ok and math.hypot(upper.x - lower.x, upper.y - lower.y) > (self.ent_hull(upper)[0] + self.ent_hull(lower)[0]) * 1.05:
+                        return False
+                    head = lower.z + lh
+                    # feet using current hull
+                    feet = upper.z - uh
+                    # also check as if standing full height (uncrouch expands downward)
+                    uh_stand = HIT_HALF_H * (PLAYER_SCALE if not upper.isP else 1.0)
+                    feet_stand = upper.z - uh_stand
+                    # accept a wide band: any feet near the head counts as "on top"
+                    on = (head - 16 <= feet <= head + 20) or (head - 16 <= feet_stand <= head + 20)
+                    if not on:
+                        return False
+                    if upper.vz > 60:
+                        return False
+                    # keep centre so feet sit just on the head (use current half-height)
+                    upper.z = head + uh + 0.5
+                    upper.vz = 0.0
+                    upper.walk = True
+                    return True
+
+                stacked = False
+                if try_stand(a, b, ha, hb):
+                    stacked = True
+                elif try_stand(b, a, hb, ha):
+                    stacked = True
+                if stacked:
+                    continue
+
+                # if one is clearly above the other, never apply horizontal push
+                # (stops crouch/uncrouch from ejecting you off a head)
+                if a.z - ha >= b.z + hb - 20 or b.z - hb >= a.z + ha - 20:
+                    continue
+
+                za0, za1 = a.z - ha, a.z + ha
+                zb0, zb1 = b.z - hb, b.z + hb
+                if za1 < zb0 or zb1 < za0:
+                    continue
+                if dist >= min_d or dist < 1e-4:
+                    continue
+                nx, ny = dx / dist, dy / dist
+                overlap = min_d - dist
+                if a.isP and not b.isP:
+                    a.x -= nx * overlap
+                    a.y -= ny * overlap
+                    vn = a.vx * nx + a.vy * ny
+                    if vn > 0:
+                        a.vx -= nx * vn
+                        a.vy -= ny * vn
+                elif b.isP and not a.isP:
+                    b.x += nx * overlap
+                    b.y += ny * overlap
+                    vn = b.vx * (-nx) + b.vy * (-ny)
+                    if vn > 0:
+                        b.vx -= (-nx) * vn
+                        b.vy -= (-ny) * vn
+                else:
+                    a.x -= nx * overlap * 0.5
+                    a.y -= ny * overlap * 0.5
+                    b.x += nx * overlap * 0.5
+                    b.y += ny * overlap * 0.5
 
     def pm_move(self, e, dt):
         """Player move: gravity, then a swept move that slides along whatever blocks it.
@@ -4576,6 +5287,7 @@ class Game:
         walk = e.walk
         e.steep = False
         if walk:
+            e.jc_used = 0.0          # touched ground: jump-crouch lift is available again
             if e.vz < 0:
                 e.vz = 0.0
         else:
@@ -4622,6 +5334,17 @@ class Game:
                 if h:
                     e.x, e.y, e.z = tx, ty, e.z + h
                     break
+            elif getattr(e, "jc", False):
+                # CS:GO jump-crouch: crouching in mid-air pulls your feet up (up to STEP_H once per jump),
+                # which lets you mount ledges higher than a plain jump reaches
+                used = getattr(e, "jc_used", 0.0)
+                if used < STEP_H:
+                    tx, ty = e.x + e.vx * t, e.y + e.vy * t
+                    h = self.step_h(tx, ty, e.z, e.x, e.y)
+                    if h and used + h <= STEP_H:
+                        e.x, e.y, e.z = tx, ty, e.z + h
+                        e.jc_used = used + h
+                        break
             n = world.normal_at(e.x, e.y, e.z, False, (dx, dy, dz))
             if n is None:
                 e.vx = e.vy = e.vz = 0.0
@@ -4653,14 +5376,9 @@ class Game:
                     e.vx = e.vy = e.vz = 0.0
                     break
             if not walk and len(planes) == 1 and .05 < planes[0][2] < SURF_NZ:
-                # too steep to stand on: only the downhill part of the motion survives
+                # CS:GO surf: too steep to stand on, so you slide along it. The clipped velocity is kept as it is
+                # (no speed lost, no sticking): gravity pulls you down the ramp and air-strafing steers / speeds you up
                 e.steep = True
-                q = planes[0]
-                dd = (q[0] * q[2], q[1] * q[2], q[2] * q[2] - 1.0)
-                dl = math.sqrt(dd[0] * dd[0] + dd[1] * dd[1] + dd[2] * dd[2]) or 1.0
-                dd = (dd[0] / dl, dd[1] / dl, dd[2] / dl)
-                k = max(0.0, v[0] * dd[0] + v[1] * dd[1] + v[2] * dd[2])
-                v = (dd[0] * k, dd[1] * k, dd[2] * k)
             if v[0] * ov[0] + v[1] * ov[1] + v[2] * ov[2] <= 0:
                 e.vx = e.vy = e.vz = 0.0
                 break
@@ -4710,7 +5428,7 @@ class Game:
                 e.vx = e.vy = 0.0
             ms = MAXS
             self.accel(e, wx, wy, ms, ACC, dt, ms)
-        elif not e.steep:  # no air control while sliding down a steep slope
+        else:   # air control also while surfing a steep ramp (strafe keys steer you along it, like CS:GO)
             self.accel(e, wx, wy, MAXS, AIRACC, dt, AIRCAP)
 
     def ptick(self, e, dt, f, s, n, c, sn):
@@ -4741,7 +5459,7 @@ class Game:
         jmp = jump
         if world.solid(e.x, e.y, e.z - 1):
             e.wj = 0
-        elif jump and int(e.wj) < WJMAX:
+        elif jump:   # no wall-jump limit (WJMAX is no longer used)
             nx = ny = 0.0
             for a in range(8):
                 dx, dy = math.cos(a * math.pi / 4), math.sin(a * math.pi / 4)
@@ -4763,7 +5481,9 @@ class Game:
                 e.wjn = (nx, ny)
                 jmp = 0
         self.pmove(e, dt, wx, wy, jmp)
-        if e.cr > .5 and world.solid(e.x, e.y, e.z - 1):  # crouch walk is slow
+        _fn = self.floor_n(e) if e.cr > .5 else None
+        _surf = _fn is not None and _fn[2] < SURF_NZ       # crouching on a surf ramp must not slow you down
+        if e.cr > .5 and not _surf and world.solid(e.x, e.y, e.z - 1):  # crouch walk is slow
             sp = math.hypot(e.vx, e.vy)
             cap = MAXS * .4
             if sp > cap:
@@ -4890,6 +5610,8 @@ class Game:
         if e.cool > 0 or not e.alive or e.shoveT > 0:
             return
         if not w.melee and e.ammo[e.w] <= 0:
+            if not getattr(self, "_manual_reload", False):
+                e.rl_prev = 0            # empty mag auto-reload: cancelling leaves you with an empty mag
             e.ammo[e.w] = w.mag
             dur = 1.6
             if e.isP and w.vm and hasattr(w.vm, "want_empty"):
@@ -4902,7 +5624,7 @@ class Game:
                     dur = min(d, 6.0)
             if w.pellets and int(w.pellets) > 1:
                 # shotgun: the whole reload takes as long as the AWP's, so the animation is slowed to fit
-                tgt = self.awp_reload_len()
+                tgt = self.awp_reload_len() * SHOTGUN_RELOAD_SCALE
                 if e.isP and w.vm and w.vm.find("reload") and dur > 0.3:
                     self.vmA["spd"] = dur / tgt
                 dur = tgt
@@ -4915,7 +5637,7 @@ class Game:
         e.cool = 60 / w.rpm
         if e.isP and not w.melee:
             _n = str(w.n or "").lower()
-            _snip = ("awp" in _n or "scout" in _n or (not w.auto and not w.pellets and 0 < (w.mag or 0) <= 10))
+            _snip = ("awp" in _n or "scout" in _n or (not w.auto and not w.pellets and not w.head_dmg and 0 < (w.mag or 0) <= 10))
             self.shake = min(1.0, self.shake + (0.9 if _snip else 0.28))
         if e.isP and w.vm:
             self.vm_play(w.vm, "slash" if w.melee else "shoot")
@@ -4924,7 +5646,7 @@ class Game:
         cp = math.cos(pp)
         sp = (w.spr or 0) + extra
         sniper = ("awp" in str(w.n or "").lower() or "scout" in str(w.n or "").lower()
-                  or (not w.melee and not w.auto and not w.pellets and 0 < (w.mag or 0) <= 10))
+                  or (not w.melee and not w.auto and not w.pellets and not w.head_dmg and 0 < (w.mag or 0) <= 10))
         if e.isP and sniper:
             # CS:GO style AWP: pin-point when scoped and standing still, wild when unscoped,
             # in the air, and a bit off while moving
@@ -4962,8 +5684,11 @@ class Game:
             o = [e.x, e.y, e.z + 17 + e.so]
         pellets = max(1, int(w.pellets or 1)) if not w.melee else 1
         rem_dmg = {}
-        hit_snd = False
         bt = tw = 0.0
+        # shotgun blast-jump: accumulate close wall/floor hits (TF2 rocket-jump style)
+        blast_sum = [0.0, 0.0, 0.0]
+        aim_sum = [0.0, 0.0, 0.0]     # opposite of the aim direction of the pellets that hit close by (angle-based launch)
+        blast_n = 0
         for _pi in range(pellets):
             d = [cp * math.cos(yy) + (random.random() - .5) * sp * 2,
                  cp * math.sin(yy) + (random.random() - .5) * sp * 2,
@@ -4988,43 +5713,61 @@ class Game:
                     break
                 t += step
             best, bt = None, tw
+            best_head = False
             for v in self.ents:
                 if not v.alive or v.team == e.team:
                     continue
-                sl = v.sl > 0 or v.cr > .5
-                p = [v.x, v.y, v.z - (16 if sl else 0)]
-                hh = HIT_HALF_H_LOW if sl else HIT_HALF_H
-                h = [HIT_HALF_W, HIT_HALF_W, hh]
-                p[2] -= (21 if sl else 35) - hh   # keep the feet where they were
-                a, b = 0.0, 1e9
-                for k in range(3):
-                    if abs(d[k]) < 1e-6:
-                        if o[k] < p[k] - h[k] or o[k] > p[k] + h[k]:
-                            b = -1
-                    else:
-                        t1 = (p[k] - h[k] - o[k]) / d[k]
-                        t2 = (p[k] + h[k] - o[k]) / d[k]
-                        a = max(a, min(t1, t2))
-                        b = min(b, max(t1, t2))
-                if a <= b and b > 0 and a < bt:
-                    best, bt = v, a
+                for is_head, (bcx, bcy, bcz, bhx, bhy, bhz) in zip((False, True), self.target_shape(v)):
+                    p = (bcx, bcy, bcz)
+                    h = (bhx, bhy, bhz)
+                    a, b = 0.0, 1e9
+                    for k in range(3):
+                        if abs(d[k]) < 1e-6:
+                            if o[k] < p[k] - h[k] or o[k] > p[k] + h[k]:
+                                b = -1
+                        else:
+                            t1 = (p[k] - h[k] - o[k]) / d[k]
+                            t2 = (p[k] + h[k] - o[k]) / d[k]
+                            a = max(a, min(t1, t2))
+                            b = min(b, max(t1, t2))
+                    if a <= b and b > 0 and a < bt:
+                        best, bt, best_head = v, a, is_head
             if best:
-                if e.isP and self.custom_hit and not hit_snd:
-                    self.audio.play(.6, self.custom_hit)
-                    hit_snd = True
                 killed_ = False
                 dmg = w.dmg
+                if w.head_dmg and best_head:
+                    dmg = w.head_dmg          # headshot
                 if pellets > 1:
                     dmg *= max(.2, 1.0 - bt / float(rg))      # shotgun pellets lose damage with distance
                 if best.remote:
                     rem_dmg[best] = rem_dmg.get(best, 0.0) + dmg    # one message per victim, not one per pellet
                 else:
-                    best.hp -= dmg * (1 if e.isP else .7)
-                    if best.hp <= 0:
-                        killed_ = True
-                        self.kill(best, e)
+                    if not getattr(best, "god", False):
+                        best.hp -= dmg * (1 if e.isP else .7)
+                        if best.hp <= 0:
+                            killed_ = True
+                            self.kill(best, e)
                 if e.isP:
                     self.hm, self.hm_kill = HM_TIME, killed_
+            elif pellets > 1 and tw < 140.0:
+                # pellet hit geometry close by — contribute to blast-jump impulse
+                hx = o[0] + d[0] * tw
+                hy = o[1] + d[1] * tw
+                hz = o[2] + d[2] * tw
+                # direction from impact toward shooter (knockback away from the surface)
+                dx = o[0] - hx
+                dy = o[1] - hy
+                dz = (o[2] - 17) - hz   # aim at body centre / feet, not the eye
+                ml = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
+                # closer hits = stronger; falloff so distant walls barely push
+                wgt = max(0.0, 1.0 - tw / 140.0) ** 1.4
+                blast_sum[0] += (dx / ml) * wgt
+                blast_sum[1] += (dy / ml) * wgt
+                blast_sum[2] += (dz / ml) * wgt
+                aim_sum[0] -= d[0] * wgt
+                aim_sum[1] -= d[1] * wgt
+                aim_sum[2] -= d[2] * wgt
+                blast_n += 1
             if not w.melee:
                 tl = min(bt, 115 if e.isP else 85)
                 # your own tracer starts a little ahead of the eye, right on the aim line,
@@ -5041,6 +5784,37 @@ class Game:
                 })
         for _v, _dm in rem_dmg.items():
             self.net.send({"t": "hit", "to": _v.nid, "d": int(round(_dm)), "w": e.w})  # the victim applies it
+        # TF2-style shotgun blast jump: shooting nearby floor/walls launches you
+        if blast_n > 0 and pellets > 1 and e.isP:
+            sx, sy, sz = blast_sum
+            ml = math.sqrt(sx * sx + sy * sy + sz * sz) or 1.0
+            # the launch follows the angle you shoot at: it points opposite to your aim (mostly), with a bit of
+            # the surface-geometry direction mixed in so it still feels grounded
+            ax, ay, az = aim_sum
+            al_ = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
+            gx, gy, gz = sx / ml, sy / ml, sz / ml
+            ux, uy, uz = ax / al_, ay / al_, az / al_
+            dx_, dy_, dz_ = (BLAST_AIM_MIX * ux + (1 - BLAST_AIM_MIX) * gx,
+                             BLAST_AIM_MIX * uy + (1 - BLAST_AIM_MIX) * gy,
+                             BLAST_AIM_MIX * uz + (1 - BLAST_AIM_MIX) * gz)
+            dl_ = math.sqrt(dx_ * dx_ + dy_ * dy_ + dz_ * dz_) or 1.0
+            dx_, dy_, dz_ = dx_ / dl_, dy_ / dl_, dz_ / dl_
+            # strength scales with how many pellets connected up close
+            frac = min(1.0, blast_n / float(pellets))
+            power = 675.0 * frac * (ml / max(blast_n, 1))
+            power = min(825.0, power)
+            # shallow shots (aimed near level, e.g. back and a little down) push harder sideways: more forward
+            # momentum; steep shots (straight down) push mostly up
+            flat = 1.0 - min(1.0, abs(dz_))
+            hboost = 1.0 + BLAST_FLAT_BOOST * flat
+            e.vx += dx_ * power * hboost
+            e.vy += dy_ * power * hboost
+            e.vz += dz_ * power
+            # upward kick scales with how far down you aimed: straight down = full kick, shallow = little
+            if dz_ > 0.12:
+                e.vz = max(e.vz, 488 * frac * min(1.0, dz_ / 0.7))
+            if e.isP:
+                self.shake = min(1.0, self.shake + 0.41 * frac)
         if e.isP and self.net.active:
             tl2 = min(bt, 85)
             self.net.send({"t": "shot", "w": e.w,
@@ -5052,14 +5826,23 @@ class Game:
             else:
                 g, pan = self.spatial(e.x, e.y, e.z + 17, .55)
             snd = w.snd
-            if not w.melee and self.custom_shot:  # you and the bots
-                snd = self.custom_shot
             if g > .004:
                 self.audio.play(g, snd, pan)
         if e.isP and e.w == 0 and e.zoom:
             e.zoom = 0  # AWP: scope out after each shot
 
     def bot(self, e, dt):
+        if getattr(e, "static", False):
+            # frozen target dummy: no AI, but still physical (can be tossed / fall)
+            # damp horizontal speed so a shove settles instead of sliding forever
+            e.vx *= max(0.0, 1.0 - 6.0 * dt)
+            e.vy *= max(0.0, 1.0 - 6.0 * dt)
+            if abs(e.vx) < 8:
+                e.vx = 0.0
+            if abs(e.vy) < 8:
+                e.vy = 0.0
+            self.phys(e, dt, e.vx, e.vy, False)
+            return
         e.rt -= dt
         if e.rt <= 0:
             e.rt = .25
@@ -5089,6 +5872,16 @@ class Game:
         x0, y0 = e.x, e.y
         wx = math.cos(h) * sp + math.sin(e.yaw) * st
         wy = math.sin(h) * sp - math.cos(e.yaw) * st
+        # carry leftover knockback / toss velocity into the move
+        kbx, kby = getattr(e, "kbx", 0.0), getattr(e, "kby", 0.0)
+        wx += kbx
+        wy += kby
+        e.kbx = kbx * max(0.0, 1.0 - 5.0 * dt)
+        e.kby = kby * max(0.0, 1.0 - 5.0 * dt)
+        if abs(e.kbx) < 12:
+            e.kbx = 0.0
+        if abs(e.kby) < 12:
+            e.kby = 0.0
         # Only hop over low obstacles. Against a wall (too tall to clear) bots never jump,
         # they just turn away; bots also never wall-jump.
         hop = bool(e.bl) and self.can_hop(e, wx, wy)
@@ -5191,7 +5984,8 @@ class Game:
             else:
                 self.vm_play(vm, "idle")
                 return
-        ff = round(f * 16) / 16
+        # 1/8-frame steps; SrcInst.pose also rate-limits skinning to ~90 Hz
+        ff = round(f * 8) / 8
         if ff >= s["n"]:
             ff = 0.0 if A["loop"] else s["n"] - 1.0
         vm.pose(A["s"], ff, loop=A["loop"])
@@ -5248,7 +6042,7 @@ class Game:
 
     def update_src_player(self, e, pm, A, dt, spd, in_air, crouch, wpn):
         """Drive states for Source / L4D2 player models (sequence clips or procedural IK)."""
-        if e.reloadT > 0:
+        if e.reloadT > 0 and not e.isP:      # your own reload timer already runs in Game.update
             e.reloadT = max(0.0, e.reloadT - dt)
         melee = bool(wpn and wpn.melee)
         kick = max(0.0, min(1.0, e.shootT / 0.15)) if e.shootT > 0 else 0.0     # shot pulse (gun recoil / knife slash)
@@ -5292,15 +6086,26 @@ class Game:
             w.vm = None
             w.wvm = None
             pick = self.wm_pick.get(i)
-            if pick not in asset["mdl"]:
+            if pick not in asset["mdl"] or (pick and not self.mdl_ok_for_weapon(pick, w)):
                 pick = None
+                if i in self.wm_pick and self.wm_pick.get(i) not in (None, pick):
+                    # drop invalid folder pick
+                    if self.wm_pick.get(i) not in asset["mdl"] or not self.mdl_ok_for_weapon(self.wm_pick[i], w):
+                        self.wm_pick.pop(i, None)
+            allowed = [m for m in names if self.mdl_ok_for_weapon(m, w)]
             n = pick or (str(w.model).lower() if w.model else None)
+            if n and n not in asset["mdl"]:
+                n = None
+            if n and not self.mdl_ok_for_weapon(n, w):
+                n = None
             if n not in asset["mdl"] and not self.manual_mods:
                 wk = key_norm(w.n)
-                n = next((m for m in names if key_norm(re.sub(r"^v_", "", m)) == wk), None) or \
-                    next((m for m in names if wk in key_norm(m)), None) or \
-                    (w.match and next((m for m in names if re.search(w.match, m.lower())), None))
+                n = next((m for m in allowed if key_norm(re.sub(r"^v_", "", m)) == wk), None) or \
+                    next((m for m in allowed if wk in key_norm(m)), None) or \
+                    (w.match and next((m for m in allowed if re.search(w.match, m.lower())), None))
             if n and not w.model and not pick and bool(w.melee) != bool(re.search("knife", n)):
+                n = None
+            if n and not self.mdl_ok_for_weapon(n, w):
                 n = None
             w._m = n if (n and n in asset["mdl"]) else None
         for w in CFG["weapons"]:
@@ -5425,10 +6230,120 @@ class Game:
         lat = (dx * math.sin(P.yaw) - dy * math.cos(P.yaw)) / max(hd, 1.0)  # +1 = right of you
         return base * att, lat * min(1.0, hd / 120.0)
 
-    def weapon_mods(self):
-        """Loaded weapon view-models (v_*.mdl style), for the Skins tab. Arms/hands packs are listed under Arms."""
-        return sorted(n for n in self.asset["mdl"]
-                      if not re.match(r"^[pw]_", n) and not _is_arms_mdl(n) and n not in self.arms_all)
+    def weapon_mod_folder(self, path):
+        """Sub-folder under mod/weapon/ that this file lives in (e.g. 'ak-47'), or '' if none."""
+        hint = getattr(self, "_load_folder_hint", None)
+        if hint is not None:
+            return hint
+        try:
+            path = Path(path).resolve()
+        except Exception:
+            path = Path(path)
+        for base in mod_folders("weapon"):
+            try:
+                rel = path.relative_to(Path(base).resolve())
+            except Exception:
+                # also try without resolve (Windows junction / case quirks)
+                try:
+                    rel = Path(path).relative_to(base)
+                except Exception:
+                    continue
+            if len(rel.parts) >= 2:
+                return rel.parts[0].lower()
+            # file sits directly in mod/weapon/ — no sub-folder
+            return ""
+        # last resort: look for .../weapon/<folder>/... in the path
+        parts = [x.lower() for x in Path(path).parts]
+        for i, part in enumerate(parts):
+            if part == "weapon" and i + 1 < len(parts):
+                nxt = parts[i + 1]
+                if nxt and not nxt.endswith((".mdl", ".vpk", ".zip", ".7z", ".rar", ".part")):
+                    return nxt
+        return ""
+
+    def weapon_folder_aliases(self, w):
+        """Normalised folder names that belong to this weapon (mod/weapon/<name>/)."""
+        wn = key_norm(w.n or "")
+        out = {wn} if wn else set()
+        # per-weapon alias groups (folder key_norm must match one of these)
+        table = [
+            (("ak47", "ak", "kalash"), ("ak", "ak47", "ak74", "kalash")),
+            (("awp",), ("awp", "snip", "sniper", "scout", "ssg08", "ssg", "g3sg", "awm", "barrett", "ssg08")),
+            (("knife",), ("knife", "bayonet", "karambit", "melee", "blade", "dagger", "kunai")),
+            (("shotgun",), ("shotgun", "nova", "xm1014", "xm", "mag7", "sawed", "m3", "pump", "shotty")),
+        ]
+        for keys, aliases in table:
+            if any(k in wn or wn in k for k in keys) or (w.melee and "knife" in keys):
+                out.update(aliases)
+                break
+        # also accept anything the weapon's match regex would accept as a folder name
+        if w.match:
+            out.add(key_norm(w.n or ""))
+        return out
+
+    def weapon_accepts_folder(self, w, folder):
+        """True if models from this mod/weapon/<folder>/ belong on weapon w."""
+        if not folder:
+            return True   # loose files (not in a sub-folder) stay available to every slot
+        f = key_norm(folder)
+        wn = key_norm(w.n or "")
+        if f == wn or f in wn or wn in f:
+            return True
+        aliases = self.weapon_folder_aliases(w)
+        if f in aliases or any(a in f or f in a for a in aliases if len(a) >= 3):
+            return True
+        # folder name matches the weapon's file-name pattern (e.g. "nova" for shotgun)
+        if w.match and re.search(w.match, folder, re.I):
+            return True
+        if w.melee and re.search(r"knife|bayonet|karambit|melee|blade", folder, re.I):
+            return True
+        return False
+
+    def _recover_mdl_folder(self, name):
+        """If mdl_folder was missing, try to recover it from the Source archive path."""
+        folders = self.asset.setdefault("mdl_folder", {})
+        if name in folders and folders[name]:
+            return folders[name]
+        spec = self.asset["mdl"].get(name)
+        path = None
+        if isinstance(spec, SrcSpec):
+            arch = spec.arch
+            if hasattr(arch, "path") and arch.path:
+                path = arch.path
+            elif hasattr(arch, "roots") and arch.roots:
+                path = arch.roots[0]
+            elif hasattr(arch, "paths") and arch.paths:
+                # LooseSrcFiles: any known path
+                try:
+                    path = next(iter(arch.paths.values()))
+                except Exception:
+                    path = None
+        if path is not None:
+            # temporarily clear hint so we resolve from the real path
+            prev = getattr(self, "_load_folder_hint", None)
+            self._load_folder_hint = None
+            try:
+                folder = self.weapon_mod_folder(path)
+            finally:
+                self._load_folder_hint = prev
+            if folder:
+                folders[name] = folder
+                return folder
+        return folders.get(name, "")
+
+    def mdl_ok_for_weapon(self, name, w):
+        folder = self._recover_mdl_folder(name)
+        return self.weapon_accepts_folder(w, folder)
+
+    def weapon_mods(self, slot=None):
+        """Loaded weapon view-models for the Skins tab.
+        If slot is given, only models from that weapon's folder (mod/weapon/<name>/) are listed."""
+        names = [n for n in self.asset["mdl"]
+                 if not re.match(r"^[pw]_", n) and not _is_arms_mdl(n) and n not in self.arms_all]
+        if slot is not None and 0 <= slot < len(CFG["weapons"]):
+            w = CFG["weapons"][slot]
+            names = [n for n in names if self.mdl_ok_for_weapon(n, w)]
+        return sorted(names)
 
     def load_src_vpk(self, path):
         """Any Source .vpk (CS:GO, CS:S, L4D2, GMod): view-models, players, arms/hands.
@@ -5450,12 +6365,14 @@ class Game:
         tag = path.stem[:18]
         # strip browser temp suffixes from the display tag
         tag = re.sub(r"\.(part|crdownload|tmp)$", "", tag, flags=re.I)[:18]
+        folder = self.weapon_mod_folder(path)
         for nm in names:
             key = nm.rsplit("/", 1)[-1]
             old = self.asset["mdl"].get(key)
             if old is not None and not (isinstance(old, SrcSpec) and old.arch is arch and old.mdl == nm):
                 key = re.sub(r"\.mdl$", "", key) + " (" + tag + ").mdl"
             self.asset["mdl"][key] = SrcSpec(arch, nm)
+            self.asset.setdefault("mdl_folder", {})[key] = folder
         for nm in pls:
             self.add_src_player(nm.rsplit("/", 1)[-1], SrcSpec(arch, nm), tag)
         self._new_pl += len(pls)
@@ -5667,7 +6584,22 @@ class Game:
                  and f.name.lower().count(".mdl") <= 1]
         if not files:
             return f"{path.name}: no CS:GO / CS:S weapon, arms or player model inside."
-        return self.load_files(files, "weapon") or f"{path.name}: loaded."
+        # keep the mod/weapon/<folder> tag from the archive's original path
+        prev = getattr(self, "_load_folder_hint", None)
+        folder = ""
+        for base in mod_folders("weapon"):
+            try:
+                rel = path.resolve().relative_to(base.resolve())
+                if len(rel.parts) >= 2:
+                    folder = rel.parts[0].lower()
+                break
+            except Exception:
+                continue
+        self._load_folder_hint = folder
+        try:
+            return self.load_files(files, "weapon") or f"{path.name}: loaded."
+        finally:
+            self._load_folder_hint = prev
 
     def load_map(self, path):
         """Load a .fadmap made with the FAD-MOD Map Builder. Returns a status string."""
@@ -5750,25 +6682,13 @@ class Game:
 
     def set_weapon_pick(self, slot, name):
         if name:
+            if 0 <= slot < len(CFG["weapons"]) and not self.mdl_ok_for_weapon(name, CFG["weapons"][slot]):
+                self.vm_msg = f"{name} is not for {CFG['weapons'][slot].n} (wrong folder)."
+                return
             self.wm_pick[slot] = name
         else:
             self.wm_pick.pop(slot, None)
         self.bind_assets()
-
-    def set_custom_sound(self, kind, path):
-        """kind is 'shot' or 'hit'. An empty path clears it. Returns a status string."""
-        snd = None
-        if path:
-            try:
-                snd = pygame.mixer.Sound(str(path))
-            except Exception as ex:
-                path = ""
-                setattr(self, f"custom_{kind}", None)
-                setattr(self, f"custom_{kind}_path", "")
-                return f"Cannot load that sound: {ex}"
-        setattr(self, f"custom_{kind}", snd)
-        setattr(self, f"custom_{kind}_path", str(path) if path else "")
-        return f"Loaded {Path(path).name}." if path else "Back to the default sound."
 
     def load_files(self, paths, mode):
         """Returns a status string."""
@@ -5862,6 +6782,7 @@ class Game:
                         self.add_arms(key, spec, root.name or "mod")
                     else:
                         self.asset["mdl"][key] = spec
+                        self.asset.setdefault("mdl_folder", {})[key] = self.weapon_mod_folder(p)
                     continue
                 # Reject GoldSrc / CS 1.6 (MDL v10) and unknown formats
                 status = f"{n}: only Source engine models (CS:GO / L4D2, MDL v44-49) are supported."
@@ -5884,6 +6805,8 @@ class Game:
     def update(self, dt):
         P = self.P
         P.took_damage_this_frame = False
+        if self.con_open and self.net.active:    # joined an online game with the console open: close it
+            self.con_toggle()
         self.net_update(dt)
         P = self.P
         K = self.keys
@@ -5913,58 +6836,91 @@ class Game:
                     self.spawn(e)
                     continue
                 if e.isP:
-                    f = (1 if K.get(B["forward"]) else 0) - (1 if K.get(B["backward"]) else 0)
-                    s = (1 if K.get(B["right"]) else 0) - (1 if K.get(B["left"]) else 0)
-                    n = math.hypot(f, s) or 1
-                    c, sn = math.cos(e.yaw), math.sin(e.yaw)
-                    e.walk = self.walkable(e)
-                    gr = e.walk
-                    slide = bool(K.get(B["slide"]))
-                    if e.sl > 0 and not slide:
-                        e.sl = 0          # released the slide key: stop sliding
-                        e.aS = 0
-                        e.scd = min(e.scd, .3)
-                    else:
-                        if not gr and slide:
-                            e.aS = 1
-                        if not slide:
-                            e.aS = 0
-                        if slide and (not e.cHeld or e.aS) and e.sl <= 0 and e.scd <= 0 and gr and (f or s):
-                            e.sl = 1.1
-                            e.scd = 1.6
-                            e.sdx = (c * f + sn * s) / n  # slide the way you are moving (any direction)
-                            e.sdy = (sn * f - c * s) / n
-                            e.sdyaw = e.yaw
-                            e.aS = 0
-                        if gr:
-                            e.aS = 0
-                    e.cHeld = slide
-                    e.scd -= dt
-                    e.acc += dt
-                    while e.acc >= TICK:
-                        e.acc -= TICK
-                        e.px, e.py, e.pz = e.x, e.y, e.z
-                        g0 = self.walkable(e)
-                        v0 = math.hypot(e.vx, e.vy)
-                        self.ptick(e, TICK, f, s, n, c, sn)
-                        self.js_tick(e, s, g0, v0, TICK)
-                    crouch = bool(K.get(B["crouch"])) and e.sl <= 0
-                    e.cr += ((1.0 if crouch else 0.0) - e.cr) * min(1.0, dt * 14)
-                    e.slk += ((1.0 if e.sl > 0 else 0.0) - e.slk) * min(1.0, dt * (9 if e.sl > 0 else 6))
-                    cdrop = 11 * e.cr
-                    e.so = -(cdrop + (16 - cdrop) * e.slk)
-                    if K.get("mouse1") and (CFG["weapons"][e.w].auto or not e.held):
-                        self.fire(e)
-                        e.held = 1
-                    if not K.get("mouse1"):
+                    if self.con_open:
+                        # console open: freeze movement input, still apply gravity/stand
+                        e.vx = e.vy = 0.0
                         e.held = 0
-                    if e.shoveT > 0:
-                        e.shoveT = max(0.0, e.shoveT - dt)
-                        if not e.shoveHit and (1.0 - e.shoveT / max(1e-3, e.shoveD)) >= SHOVE_HIT_AT:
-                            e.shoveHit = True
-                            self.shove_strike()
+                        if getattr(e, "noclip", False):
+                            e.vz = 0.0
+                        else:
+                            self.phys(e, dt, 0, 0, False)
+                    elif getattr(e, "noclip", False):
+                        # fly through walls: WASD + jump/crouch
+                        f = (1 if K.get(B["forward"]) else 0) - (1 if K.get(B["backward"]) else 0)
+                        s = (1 if K.get(B["right"]) else 0) - (1 if K.get(B["left"]) else 0)
+                        up = (1 if K.get(B["jump"]) else 0) - (1 if K.get(B["crouch"]) else 0)
+                        n = math.hypot(f, s) or 1
+                        c, sn = math.cos(e.yaw), math.sin(e.yaw)
+                        cp, sp_ = math.cos(e.pitch), math.sin(e.pitch)
+                        spd = 450.0
+                        e.px, e.py, e.pz = e.x, e.y, e.z
+                        e.x += ((c * cp) * f + sn * s) / n * spd * dt if (f or s) else 0
+                        e.y += ((sn * cp) * f - c * s) / n * spd * dt if (f or s) else 0
+                        e.z += (sp_ * f / n * spd + up * spd) * dt
+                        e.vx = e.vy = e.vz = 0.0
+                        e.walk = True
+                        e.so = 0.0
+                        if K.get("mouse1") and (CFG["weapons"][e.w].auto or not e.held):
+                            self.fire(e)
+                            e.held = 1
+                        if not K.get("mouse1"):
+                            e.held = 0
+                    else:
+                        f = (1 if K.get(B["forward"]) else 0) - (1 if K.get(B["backward"]) else 0)
+                        s = (1 if K.get(B["right"]) else 0) - (1 if K.get(B["left"]) else 0)
+                        n = math.hypot(f, s) or 1
+                        c, sn = math.cos(e.yaw), math.sin(e.yaw)
+                        e.walk = self.walkable(e)
+                        gr = e.walk
+                        slide = bool(K.get(B["slide"]))
+                        if e.sl > 0 and not slide:
+                            e.sl = 0          # released the slide key: stop sliding
+                            e.aS = 0
+                            e.scd = min(e.scd, .3)
+                        else:
+                            if not gr and slide:
+                                e.aS = 1
+                            if not slide:
+                                e.aS = 0
+                            if slide and (not e.cHeld or e.aS) and e.sl <= 0 and e.scd <= 0 and gr and (f or s):
+                                e.sl = 1.1
+                                e.scd = 1.6
+                                e.sdx = (c * f + sn * s) / n  # slide the way you are moving (any direction)
+                                e.sdy = (sn * f - c * s) / n
+                                e.sdyaw = e.yaw
+                                e.aS = 0
+                            if gr:
+                                e.aS = 0
+                        e.cHeld = slide
+                        e.jc = bool(K.get(B["crouch"]))     # crouch held (jump-crouch: feet pull up in the air)
+                        e.scd -= dt
+                        e.acc += dt
+                        while e.acc >= TICK:
+                            e.acc -= TICK
+                            e.px, e.py, e.pz = e.x, e.y, e.z
+                            g0 = self.walkable(e)
+                            v0 = math.hypot(e.vx, e.vy)
+                            self.ptick(e, TICK, f, s, n, c, sn)
+                            self.js_tick(e, s, g0, v0, TICK)
+                        crouch = bool(K.get(B["crouch"])) and e.sl <= 0
+                        e.cr += ((1.0 if crouch else 0.0) - e.cr) * min(1.0, dt * 14)
+                        e.slk += ((1.0 if e.sl > 0 else 0.0) - e.slk) * min(1.0, dt * (9 if e.sl > 0 else 6))
+                        cdrop = 11 * e.cr
+                        e.so = -(cdrop + (16 - cdrop) * e.slk)
+                        if K.get("mouse1") and (CFG["weapons"][e.w].auto or not e.held):
+                            self.fire(e)
+                            e.held = 1
+                        if not K.get("mouse1"):
+                            e.held = 0
+                        if e.shoveT > 0:
+                            e.shoveT = max(0.0, e.shoveT - dt)
+                            if not e.shoveHit and (1.0 - e.shoveT / max(1e-3, e.shoveD)) >= SHOVE_HIT_AT:
+                                e.shoveHit = True
+                                self.shove_strike()
                 else:
                     self.bot(e, dt)
+            # CS-style player/bot solid hulls + run-into toss
+            self.resolve_player_collisions(dt)
         elif self.over:
             self.over -= dt
             if self.over <= 0:
@@ -5983,6 +6939,30 @@ class Game:
             self.vm_fov += (vm_target - self.vm_fov) * min(1, dt * 20)
         else:
             self.vm_fov = vm_target
+
+        # viewmodel mouse lag: gun lags behind look direction, then springs back
+        _vb = max(0.0, min(2.0, float(self.viewbob)))
+        if self._vm_lyaw is None:
+            self._vm_lyaw, self._vm_lpitch = P.yaw, P.pitch
+        dyaw = P.yaw - self._vm_lyaw
+        # wrap yaw delta into -pi..pi
+        dyaw = (dyaw + math.pi) % (2 * math.pi) - math.pi
+        dpitch = P.pitch - self._vm_lpitch
+        self._vm_lyaw, self._vm_lpitch = P.yaw, P.pitch
+        # add lag from mouse motion (gun moves opposite to look) — light touch
+        self.vm_lag_y += dyaw * 3.5 * _vb
+        self.vm_lag_p += dpitch * 2.5 * _vb
+        # clamp so it doesn't fly off screen
+        self.vm_lag_y = max(-2.2, min(2.2, self.vm_lag_y))
+        self.vm_lag_p = max(-1.4, min(1.4, self.vm_lag_p))
+        # spring back to centre (snappier recovery)
+        k = min(1.0, dt * 16.0)
+        self.vm_lag_y *= (1.0 - k)
+        self.vm_lag_p *= (1.0 - k)
+        if abs(self.vm_lag_y) < 0.01:
+            self.vm_lag_y = 0.0
+        if abs(self.vm_lag_p) < 0.01:
+            self.vm_lag_p = 0.0
 
         if P.sprayw:
             P.since += dt
@@ -6047,13 +7027,21 @@ class Game:
             self.vm_tick(cvm, dt)
 
     def melee_pressed(self):
-        """E: L4D2 style shove. Works with every weapon, can't be used while reloading or mid-shove."""
+        """E: L4D2 style shove. Works with every weapon and cancels a reload in progress; can't be used mid-shove."""
         P = self.P
-        if not (P and P.alive and not self.over) or P.shoveT > 0 or P.reloadT > 0:
+        if not (P and P.alive and not self.over) or P.shoveT > 0:
             return
         P.zoom = 0
-        dur = SHOVE_TIME
         cvm = CFG["weapons"][P.w].vm
+        if P.reloadT > 0:
+            # melee cancels a reload in progress: you keep the rounds you had before reloading
+            if not CFG["weapons"][P.w].melee:
+                P.ammo[P.w] = int(getattr(P, "rl_prev", 0))
+            P.reloadT = 0.0
+            P.cool = 0.0
+            if cvm:
+                self.vm_play(cvm, "idle")       # drop the reload animation (the shove below replaces it if the model has one)
+        dur = SHOVE_TIME
         self.shove_seq = False
         if cvm:
             d = self.vm_play(cvm, "shove")      # the model's own shove animation, if it has one
@@ -6090,7 +7078,8 @@ class Game:
             if v.remote:
                 self.net.send({"t": "hit", "to": v.nid, "d": SHOVE_DMG, "w": P.w})
             else:
-                v.hp -= SHOVE_DMG
+                if not getattr(v, "god", False):
+                    v.hp -= SHOVE_DMG
                 v.cool = max(v.cool, SHOVE_STAGGER)    # staggered: a shoved bot can't shoot for a moment
                 v.aim = -0.6
                 if v.hp <= 0:
@@ -6099,8 +7088,63 @@ class Game:
         if hit_any:
             self.hm, self.hm_kill = HM_TIME, killed_any
         self.shake = min(1.0, self.shake + (SHOVE_SHAKE if hit_any else SHOVE_SHAKE * .35))
-        if hit_any and self.custom_hit:
-            self.audio.play(.6, self.custom_hit)
+
+    def target_shape(self, v):
+        """Hitboxes of a player / bot that follow its real (posed, shrunk) model:
+        returns (body, head), each (cx, cy, cz, hx, hy, hz) in world units.
+        The body box covers the feet up to the neck, the head box sits on the model's head."""
+        sl = (getattr(v, "sl", 0) or 0) > 0 or (getattr(v, "cr", 0) or 0) > .5
+        vs = PLAYER_SCALE if not v.isP else 1.0
+        pm = getattr(v, "pm", None)
+        vtx = getattr(pm, "vtx", None) if pm is not None else None
+        gy = None
+        if vtx is not None:
+            gy = v.anim.get("gyaw") if getattr(v, "anim", None) else None
+            key = (v.x, v.y, v.z, gy, v.yaw, getattr(v, "pm_dz", 0.0))
+            c = getattr(v, "_shape_c", None)
+            if c is not None and c[0] is vtx and c[1] == key:
+                return c[2]
+        hw = HIT_HALF_W * vs
+        if vtx is not None and len(vtx):
+            zmin, zmax = float(vtx[:, 2].min()), float(vtx[:, 2].max())
+            H = max(1e-3, zmax - zmin)
+            zcut = zmax - HEAD_FRAC * H
+            m_top = vtx[:, 2] >= zcut
+            top = vtx[m_top]
+            low = vtx[~m_top]
+            ang = math.radians(gy if gy is not None else math.degrees(v.yaw))
+            ca, sa = math.cos(ang), math.sin(ang)
+
+            def world(lx, ly, lz):
+                return (v.x + vs * (ca * lx - sa * ly), v.y + vs * (sa * lx + ca * ly),
+                        v.z + v.pm_dz + vs * lz)
+            if len(top):
+                hx_l, hy_l = float(top[:, 0].mean()), float(top[:, 1].mean())
+                ext = max(float(top[:, 0].max() - top[:, 0].min()), float(top[:, 1].max() - top[:, 1].min())) * .5
+            else:
+                hx_l = hy_l = 0.0
+                ext = HEAD_MAX_R
+            hr = max(HEAD_MIN_R, min(HEAD_MAX_R, ext)) * vs
+            bx_l, by_l = (float(low[:, 0].mean()), float(low[:, 1].mean())) if len(low) else (0.0, 0.0)
+            hxw, hyw, _ = world(hx_l, hy_l, 0.0)
+            bxw, byw, _ = world(bx_l, by_l, 0.0)
+            # keep the body box near the root so a stray arm / weapon cannot drag it away
+            bxw = v.x + max(-12.0, min(12.0, bxw - v.x))
+            byw = v.y + max(-12.0, min(12.0, byw - v.y))
+            z0 = v.z + v.pm_dz + vs * zmin
+            z1 = v.z + v.pm_dz + vs * zcut
+            z2 = v.z + v.pm_dz + vs * zmax
+            res = ((bxw, byw, (z0 + z1) * .5, hw, hw, (z1 - z0) * .5),
+                   (hxw, hyw, (z1 + z2) * .5, hr, hr, (z2 - z1) * .5))
+            v._shape_c = (vtx, key, res)
+            return res
+        # no player model (box bots / yourself): fixed box, feet kept in place
+        feet = v.z - (16 if sl else 0) - (21 if sl else 35)
+        H = 2 * (HIT_HALF_H_LOW if sl else HIT_HALF_H) * vs
+        zcut = feet + H * (1 - HEAD_FRAC)
+        hr = max(HEAD_MIN_R, min(HEAD_MAX_R, hw * .8))
+        return ((v.x, v.y, (feet + zcut) * .5, hw, hw, (zcut - feet) * .5),
+                (v.x, v.y, (zcut + feet + H) * .5, hr, hr, (feet + H - zcut) * .5))
 
     def knife_index(self):
         return next((i for i, w in enumerate(CFG["weapons"]) if w.melee), 0)
@@ -6127,6 +7171,7 @@ class Game:
         if P and not CFG["weapons"][P.w].melee:
             if P.reloadT > 0 or P.ammo[P.w] >= CFG["weapons"][P.w].mag:
                 return  # already reloading / full: pressing R must not restart the animation
+            P.rl_prev = P.ammo[P.w]      # so a melee can cancel the reload and give the rounds back
             P.ammo[P.w] = 0
             P.cool = 0
             self._manual_reload = True
@@ -6152,14 +7197,16 @@ RENDER_W, RENDER_H = 1280, 720    # the game always renders at this resolution, 
 
 
 class RenderTarget:
-    """Fixed-size (MSAA) off-screen buffer. The whole game draws into it at RENDER_W x RENDER_H and
+    """Fixed-size off-screen buffer (optional MSAA). The whole game draws into it at RENDER_W x RENDER_H and
     present() scales it into the window, keeping 16:9 (black bars if the window has another shape)."""
 
-    def __init__(self, w, h, samples=4):
+    def __init__(self, w, h, samples=0):
         self.w, self.h = w, h
         self.ok = False
         self.view = (0, 0, w, h)      # where the image sits in the window (pixels, top-left origin)
+        self.msaa = False
         try:
+            # Color = texture (what present() draws). Depth attached so 3D works without MSAA.
             self.res_fbo = gl.glGenFramebuffers(1)
             self.tex = gl.glGenTextures(1)
             gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
@@ -6170,24 +7217,27 @@ class RenderTarget:
             gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
             gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.res_fbo)
             gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, self.tex, 0)
-            self.msaa = False
+            self.depth_rb = gl.glGenRenderbuffers(1)
+            gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, self.depth_rb)
+            gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_DEPTH24_STENCIL8, w, h)
+            gl.glFramebufferRenderbuffer(gl.GL_FRAMEBUFFER, gl.GL_DEPTH_STENCIL_ATTACHMENT,
+                                         gl.GL_RENDERBUFFER, self.depth_rb)
+            if gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER) != gl.GL_FRAMEBUFFER_COMPLETE:
+                raise RuntimeError("resolve FBO incomplete")
             self.fbo = self.res_fbo
-            for n in (samples, 0):
+            self.ok = True
+            # Optional MSAA path (disabled by default: samples=0)
+            if samples > 0:
                 fbo = gl.glGenFramebuffers(1)
                 gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
                 rbs = gl.glGenRenderbuffers(2)
                 for rb, fmt, att in ((rbs[0], gl.GL_RGBA8, gl.GL_COLOR_ATTACHMENT0),
                                      (rbs[1], gl.GL_DEPTH24_STENCIL8, gl.GL_DEPTH_STENCIL_ATTACHMENT)):
                     gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, rb)
-                    if n:
-                        gl.glRenderbufferStorageMultisample(gl.GL_RENDERBUFFER, n, fmt, w, h)
-                    else:
-                        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, fmt, w, h)
+                    gl.glRenderbufferStorageMultisample(gl.GL_RENDERBUFFER, samples, fmt, w, h)
                     gl.glFramebufferRenderbuffer(gl.GL_FRAMEBUFFER, att, gl.GL_RENDERBUFFER, rb)
                 if gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER) == gl.GL_FRAMEBUFFER_COMPLETE:
-                    self.fbo, self.msaa = fbo, bool(n)
-                    self.ok = True
-                    break
+                    self.fbo, self.msaa = fbo, True
             gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
         except Exception as ex:
             print("Render target unavailable, drawing at window size:", ex)
@@ -6368,7 +7418,6 @@ class Menu:
         self.pfp_tex = None
         self.pfp_status = ""
         self.status = "Built-in arena loaded."
-        self.snd_status = ""
         self.vm_prev = 0      # weapon shown in the viewmodel preview
         self.vm_dd = False    # preview dropdown open?
         self.cm_open = False      # Play tab: match settings panel shown?
@@ -6385,7 +7434,7 @@ class Menu:
         self.lo_slot = 0          # weapon slot being edited
         self.lo_team = "CT"       # team being edited
         self.lo_page = 0
-        self.set_sub = "controls"  # Settings sub-tab: controls | sounds | viewmodel | video
+        self.set_sub = "controls"  # Settings sub-tab: controls | viewmodel | crosshair | video
         self.pv = {}              # cached preview model instances
         self.pv_bb = {}           # cached bounding boxes
         self.waiting = None
@@ -6546,7 +7595,8 @@ class Menu:
 
         def panel(x, y, w, h, title, sub=None):
             gfx.rect(x, y, w, h, c255(17, 17, 17))
-            gfx.text(title, x + 20, y + 14, 14, (255, 255, 255), bold=True)
+            if title:
+                gfx.text(title, x + 20, y + 14, 14, (255, 255, 255), bold=True)
             if sub:
                 gfx.text(sub, x + 20, y + 34, 12, (130, 130, 130))
 
@@ -6563,10 +7613,10 @@ class Menu:
 
         cx, cw = 280, max(680, int(LW - 320))
         if self.page == "settings":
-            for i, (sub, lab) in enumerate((("controls", "Controls"), ("sounds", "Sounds"),
+            for i, (sub, lab) in enumerate((("controls", "Controls"),
                                             ("viewmodel", "Viewmodel"), ("crosshair", "Crosshair"),
                                             ("video", "Video"))):
-                button(cx + cw - 5 * 98 + 6 + i * 98, 40, 92, 30, lab,
+                button(cx + cw - 4 * 98 + 6 + i * 98, 40, 92, 30, lab,
                        lambda sub=sub: self.set_sub_tab(sub), self.set_sub == sub)
         if self.page == "play":
             net = g.net
@@ -6840,7 +7890,7 @@ class Menu:
             gfx.text("YOUR IDENTITY", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Profile.", cx, 48, 34, (255, 255, 255), bold=True)
             gfx.text("Change your username and profile picture.", cx, 96, 13, (154, 154, 154))
-            panel(cx, 128, cw, 250, "Your profile", "Your username is shown to other players on online servers and on the scoreboard.")
+            panel(cx, 128, cw, 250, "")
             px, py = cx + 20, 176
             gfx.box(px - 2, py - 2, 164, 164, c255(10, 10, 10), c255(42, 42, 42))
             if self.pfp_tex:
@@ -6953,9 +8003,9 @@ class Menu:
             button(cx, 124, 130, 32, "Weapon mods", lambda: self.lo_set("weapons"), wp)
             button(cx + 140, 124, 130, 32, "Player models", lambda: self.lo_set("players"), self.lo_tab == "players")
             button(cx + 280, 124, 100, 32, "Arms", lambda: self.lo_set("arms"), ar)
-            ws = CFG["weapons"][:4]
+            ws = CFG["weapons"][:5]
             if wp:
-                items = g.weapon_mods()
+                items = g.weapon_mods(self.lo_slot)
             elif ar:
                 # leading empty string = "No arms" (procedural / built-in hands)
                 items = [""] + sorted(g.arms_all.keys())
@@ -6976,7 +8026,7 @@ class Menu:
             if wp:
                 self.lo_slot = max(0, min(self.lo_slot, len(ws) - 1)) if ws else 0
                 for i, w in enumerate(ws):
-                    button(cx + i * 160, 166, 150, 30, w.n[:18],
+                    button(cx + i * 140, 166, 132, 30, w.n[:16],
                            lambda i=i: setattr(self, "lo_slot", i), self.lo_slot == i)
                 cur = ws[self.lo_slot] if ws else None
                 info = ("%s: " % cur.n + (cur._m or "no model - box")
@@ -7003,12 +8053,17 @@ class Menu:
 
             gy, cw2, ch2 = 226, 216, 170
             if not items or (ar and len(items) <= 1 and not g.arms_all):
-                empty = ("No weapon mods loaded yet." if wp else
-                         ("No arms models loaded yet." if ar else "No player models loaded yet."))
+                if wp and ws:
+                    wname = str(ws[self.lo_slot].n)
+                    empty = f"No models for {wname}."
+                    hint = f"Put them in mod/weapon/{key_norm(wname)}/  (e.g. mod/weapon/ak-47/)."
+                else:
+                    empty = ("No weapon mods loaded yet." if wp else
+                             ("No arms models loaded yet." if ar else "No player models loaded yet."))
+                    hint = "Use Add files, drop files on the window, or put them in the " + (
+                        "weapons" if wp else ("arms (or drop a .vpk)" if ar else "player")) + " folder."
                 gfx.text(empty, cx + cw / 2, gy + 120, 15, (200, 200, 200), bold=True, anchor="c")
-                folder = "weapons" if wp else ("arms (or drop a .vpk)" if ar else "player")
-                gfx.text("Use Add files, drop files on the window, or put them in the " + folder + " folder.",
-                         cx + cw / 2, gy + 146, 12, (130, 130, 130), anchor="c")
+                gfx.text(hint, cx + cw / 2, gy + 146, 12, (130, 130, 130), anchor="c")
             for idx, name in enumerate(items[self.lo_page * per:(self.lo_page + 1) * per]):
                 r, c = divmod(idx, 3)
                 x, y = cx + c * (cw2 + 16), gy + r * (ch2 + 14)
@@ -7087,26 +8142,6 @@ class Menu:
                 self.hot.append((rx + 320 - bw - 6, ry + 3, bw, 26, lambda a=aid: setattr(self, "waiting", a), None))
             button(cx + 350, 282 + 44 + 6 * 38, 150, 32, "Reset defaults", self.reset_keys)
             button(cx + 512, 282 + 44 + 6 * 38, 150, 32, "Back to play", lambda: self.set_page("play"), True)
-        elif self.page == "settings" and self.set_sub == "sounds":
-            gfx.text("CUSTOM SOUNDS", cx, 32, 11, (119, 119, 119), bold=True)
-            gfx.text("Sounds.", cx, 48, 34, (255, 255, 255), bold=True)
-            gfx.text("Pick your own .wav / .ogg / .mp3 files. Volume follows the weapon volume slider in Settings.",
-                     cx, 96, 13, (154, 154, 154))
-            rows = (("shot", "Shooting sound", "Plays when you fire a gun, instead of the weapon's own sound (not the knife)."),
-                    ("hit", "Hit sound", "Plays when your shot hits an enemy."))
-            for i, (kind, title, sub) in enumerate(rows):
-                py = 126 + i * 130
-                panel(cx, py, cw, 112, title, sub)
-                path = getattr(g, f"custom_{kind}_path")
-                gfx.text(("File: " + Path(path).name) if path else "Using the default sound", cx + 20, py + 58, 12,
-                         (230, 230, 230) if path else (136, 136, 136))
-                button(cx + 20, py + 76, 140, 28, "Choose file", lambda k=kind: self.pick_sound(k))
-                button(cx + 172, py + 76, 90, 28, "Test",
-                       lambda k=kind: g.audio.play(.6, getattr(g, f"custom_{k}")) if getattr(g, f"custom_{k}") else None)
-                button(cx + 274, py + 76, 90, 28, "Reset",
-                       lambda k=kind: setattr(self, "snd_status", g.set_custom_sound(k, "")))
-            if self.snd_status:
-                gfx.text(self.snd_status[:110], cx + 20, 396, 12, (170, 170, 170))
         elif self.page == "settings" and self.set_sub == "viewmodel":
             gfx.text("WEAPON POSITION", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Viewmodel.", cx, 48, 34, (255, 255, 255), bold=True)
@@ -7330,6 +8365,9 @@ class Menu:
             for e in g.ents:
                 if not e.isP:
                     g.build_entity_model(e)
+            if g.P:
+                g.P.pm = None              # third-person model is rebuilt on demand
+                g.P._pm_tried = False
         save_settings(g, self)
 
     def pv_weapon(self, name):
@@ -7462,16 +8500,38 @@ class Menu:
                 if inst.is_mirrored():
                     gl.glScalef(1, -1, 1)
                 gl.glTranslatef(-c[0], -c[1], -c[2])
+                # Stable idle pose (force) so the shared instance is not mid-fade / rate-limited
+                if hasattr(inst, "pose") and hasattr(inst, "find"):
+                    try:
+                        idle = inst.find("idle")
+                        if idle:
+                            inst.pose(idle[0], 0.0, loop=True, force=True)
+                    except Exception:
+                        pass
             inst.draw()
             gl.glPopMatrix()
             gl.glMatrixMode(gl.GL_PROJECTION)
             gl.glPopMatrix()
             gl.glMatrixMode(gl.GL_MODELVIEW)
+        self._end_3d_preview(W, H)
+
+    def _end_3d_preview(self, W, H):
+        """Restore fixed-function state so the 2D menu is not corrupted after a 3D preview."""
+        try:
+            gl.glFrontFace(gl.GL_CCW)
+            gl.glDisableClientState(gl.GL_VERTEX_ARRAY)
+            gl.glDisableClientState(gl.GL_TEXTURE_COORD_ARRAY)
+            gl.glDisable(gl.GL_ALPHA_TEST)
+            gl.glDepthMask(gl.GL_TRUE)
+            gl.glDisable(gl.GL_CULL_FACE)
+        except Exception:
+            pass
         gl.glViewport(0, 0, W, H)
         gl.glDisable(gl.GL_SCISSOR_TEST)
         gl.glDisable(gl.GL_DEPTH_TEST)
         gl.glEnable(gl.GL_BLEND)
         gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glEnable(gl.GL_TEXTURE_2D)
         gl.glColor4f(1, 1, 1, 1)
 
     def draw_preview(self, W, H, px, py, pw, ph):
@@ -7486,51 +8546,51 @@ class Menu:
         gl.glClearColor(0x8a / 255, 0x9b / 255, 0xb0 / 255, 1)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
         gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthMask(gl.GL_TRUE)
         gl.glDisable(gl.GL_BLEND)
+        gl.glDisable(gl.GL_ALPHA_TEST)
         gl.glMatrixMode(gl.GL_PROJECTION)
         gl.glPushMatrix()
         gl.glLoadIdentity()
-        glu.gluPerspective(75, g.aspect or vw / vh, VM_NEAR, VM_FAR)
+        # Always use the preview panel aspect — g.aspect can be 0 or stale from a previous match
+        aspect = (vw / max(1, vh)) if vw and vh else (16 / 9)
+        glu.gluPerspective(75, aspect, VM_NEAR, VM_FAR)
         gl.glMatrixMode(gl.GL_MODELVIEW)
         gl.glPushMatrix()
         gl.glLoadIdentity()
         glu.gluLookAt(0, 0, 0, 1, 0, 0, 0, 0, 1)
         ws = CFG["weapons"]
-        if ws:
-            w = ws[max(0, min(self.vm_prev, len(ws) - 1))]
-            if w.vm:
-                idle = w.vm.find("idle")
-                if idle and 0 <= idle[0] < len(w.vm.seqs):
-                    sq = w.vm.seqs[idle[0]]
-                    f = (time.time() * sq["fps"]) % sq["n"]
-                    w.vm.pose(idle[0], min(sq["n"] - 1, round(f * 16) / 16))
-                o = w.vm_ofs or (0, 0, 0)
-                gl.glTranslatef(o[0] + g.vm_adj[0], o[1] - g.vm_adj[1], o[2] + g.vm_adj[2])
-                flip = bool(w.vm_flip) != bool(g.hand_swap)
-                if flip:
-                    gl.glScalef(1, -1, 1)
-                    gl.glFrontFace(gl.GL_CW)
-                w.vm.draw()
-                if flip:
+        flip = False
+        try:
+            if ws:
+                w = ws[max(0, min(self.vm_prev, len(ws) - 1))]
+                if w.vm:
+                    idle = w.vm.find("idle")
+                    if idle and 0 <= idle[0] < len(w.vm.seqs):
+                        # Hold idle frame 0 (force): avoids rate-limit stutter and leftover
+                        # shoot/reload fade from the live viewmodel instance.
+                        w.vm.pose(idle[0], 0.0, loop=True, force=True)
+                    o = w.vm_ofs or (0, 0, 0)
+                    gl.glTranslatef(o[0] + g.vm_adj[0], o[1] - g.vm_adj[1], o[2] + g.vm_adj[2])
+                    flip = bool(w.vm_flip) != bool(g.hand_swap)
+                    if flip:
+                        gl.glScalef(1, -1, 1)
+                        gl.glFrontFace(gl.GL_CW)
+                    w.vm.draw()
+                else:
+                    gl.glTranslatef(g.vm_adj[0], -g.vm_adj[1], g.vm_adj[2])
+                    draw_box(12, -5, -5, 8, 1.25, 1.75, (0x2b / 255, 0x2b / 255, 0x2b / 255))
+        finally:
+            if flip:
+                try:
                     gl.glFrontFace(gl.GL_CCW)
-            else:
-                gl.glTranslatef(g.vm_adj[0], -g.vm_adj[1], g.vm_adj[2])
-                draw_box(12, -5, -5, 8, 1.25, 1.75, (0x2b / 255, 0x2b / 255, 0x2b / 255))
-        gl.glPopMatrix()
-        gl.glMatrixMode(gl.GL_PROJECTION)
-        gl.glPopMatrix()
-        gl.glMatrixMode(gl.GL_MODELVIEW)
-        gl.glViewport(0, 0, W, H)
-        gl.glDisable(gl.GL_SCISSOR_TEST)
-        gl.glDisable(gl.GL_DEPTH_TEST)
-        gl.glEnable(gl.GL_BLEND)
-        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-        gl.glColor4f(1, 1, 1, 1)
-
-    def pick_sound(self, kind):
-        paths = self.pick_files("sound")
-        if paths:
-            self.snd_status = self.g.set_custom_sound(kind, paths[0])
+                except Exception:
+                    pass
+            gl.glPopMatrix()
+            gl.glMatrixMode(gl.GL_PROJECTION)
+            gl.glPopMatrix()
+            gl.glMatrixMode(gl.GL_MODELVIEW)
+            self._end_3d_preview(W, H)
 
     def pick(self, mode):
         paths = self.pick_files(mode)
@@ -7643,6 +8703,7 @@ def render_scene(game, W, H):
     ex = P.px + (P.x - P.px) * al
     ey = P.py + (P.y - P.py) * al
     ez = P.pz + (P.z - P.pz) * al + 17 + P.so
+    ppx, ppy, ppz = ex, ey, P.pz + (P.z - P.pz) * al      # where your own body is drawn (third person)
     vp = max(-1.5, min(1.5, P.pitch + P.pun_p))   # view = aim + recoil punch
     vy = P.yaw + P.pun_y
     _sk = game.shake * SHAKE
@@ -7656,6 +8717,22 @@ def render_scene(game, W, H):
     if P.slk > 0.001:
         lat = P.sdx * math.sin(P.yaw) - P.sdy * math.cos(P.yaw)   # sideways part of the slide
         gl.glRotatef(P.slk * (1.2 + 2.5 * lat), 0, 0, 1)           # slight lean into the slide
+    tp = bool(game.thirdperson) and not (P.zoom and P.w == 0)       # scoped AWP always stays first person
+    if tp:
+        if getattr(P, "_pm_team", None) != P.team:
+            P._pm_team = P.team
+            P._pm_tried = False
+        if P.pm is None and not getattr(P, "_pm_tried", False):
+            P._pm_tried = True
+            game.build_entity_model(P, True)
+        # pull the camera back along the view direction, stopping short of walls
+        back = 0.0
+        for dd in range(6, 121, 6):
+            if game.world.solid(ex - fx * dd, ey - fy * dd, ez - fz * dd + 6):
+                break
+            back = float(dd)
+        back = max(0.0, back - 8.0)
+        ex, ey, ez = ex - fx * back, ey - fy * back, ez - fz * back + 6.0 * (back / 120.0)
     glu.gluLookAt(ex, ey, ez, ex + fx, ey + fy, ez + fz, 0, 0, 1)
 
     game.world.draw_sky(ex, ey, ez)
@@ -7663,17 +8740,18 @@ def render_scene(game, W, H):
     game.world.draw()
 
     for e in game.ents:
-        if e.isP:
+        if e.isP and not tp:
             continue
         if not e.alive and not (e.pm and e.anim.get("ds", -1) >= 0):
             continue  # no death sequence to show: the body just vanishes
-        ddx, ddy = e.x - ex, e.y - ey
+        bx, by, bz = (ppx, ppy, ppz) if e.isP else (e.x, e.y, e.z)     # your own body uses the smoothed position
+        ddx, ddy = bx - ex, by - ey
         if ddx * ddx + ddy * ddy > 90000 and ddx * fx + ddy * fy < 0:
             continue  # behind the camera: don't draw
         if e.pm:
             gy = e.anim.get("gyaw")
             gl.glPushMatrix()
-            gl.glTranslatef(e.x, e.y, e.z + e.pm_dz)
+            gl.glTranslatef(bx, by, bz + e.pm_dz)
             gl.glScalef(PLAYER_SCALE, PLAYER_SCALE, PLAYER_SCALE)   # shrink around the feet
             gl.glRotatef(gy if gy is not None else math.degrees(e.yaw), 0, 0, 1)  # legs yaw; torso twists on top
             e.pm.draw()
@@ -7683,7 +8761,7 @@ def render_scene(game, W, H):
             gl.glPopMatrix()
         else:
             gl.glPushMatrix()
-            gl.glTranslatef(e.x, e.y, e.z - 36)
+            gl.glTranslatef(bx, by, bz - 36)
             gl.glScalef(PLAYER_SCALE, PLAYER_SCALE, PLAYER_SCALE)   # shrink around the feet
             gl.glTranslatef(0, 0, 36)
             gl.glRotatef(math.degrees(e.yaw), 0, 0, 1)
@@ -7707,6 +8785,56 @@ def render_scene(game, W, H):
                 draw_box(0, 0, -11, 3, 3, 11, body)
                 gl.glPopMatrix()
             gl.glPopMatrix()
+
+    # sv_showhitboxes: wireframe player collision + bullet hitboxes
+    if game.show_hitboxes:
+        tex2d(False)
+        gl.glDisable(gl.GL_TEXTURE_2D)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        for e in game.ents:
+            if not e.alive and not (e.pm and e.anim.get("ds", -1) >= 0):
+                continue
+            if e.isP:
+                continue  # own body is the camera; show others only
+            sl = (getattr(e, "sl", 0) or 0) > 0 or (getattr(e, "cr", 0) or 0) > 0.5
+            scale = PLAYER_SCALE
+            # bullet hitbox (tight)
+            hh = (HIT_HALF_H_LOW if sl else HIT_HALF_H) * scale
+            hw = HIT_HALF_W * scale
+            # collision hull (slightly wider — what bodies block with)
+            chw = hw * 1.15
+            cx, cy, cz = e.x, e.y, e.z - (16 if sl else 0)
+            # match the raycast vertical placement used in fire()
+            cz_adj = cz - ((21 if sl else 35) - hh)
+            def _wire_box(x, y, z, hx, hy, hz, rgba):
+                gl.glColor4f(*rgba)
+                x0, x1 = x - hx, x + hx
+                y0, y1 = y - hy, y + hy
+                z0, z1 = z - hz, z + hz
+                edges = (
+                    (x0, y0, z0), (x1, y0, z0), (x1, y0, z0), (x1, y1, z0),
+                    (x1, y1, z0), (x0, y1, z0), (x0, y1, z0), (x0, y0, z0),
+                    (x0, y0, z1), (x1, y0, z1), (x1, y0, z1), (x1, y1, z1),
+                    (x1, y1, z1), (x0, y1, z1), (x0, y1, z1), (x0, y0, z1),
+                    (x0, y0, z0), (x0, y0, z1), (x1, y0, z0), (x1, y0, z1),
+                    (x1, y1, z0), (x1, y1, z1), (x0, y1, z0), (x0, y1, z1),
+                )
+                gl.glBegin(gl.GL_LINES)
+                for v in edges:
+                    gl.glVertex3f(*v)
+                gl.glEnd()
+            # collision hull in cyan
+            _wire_box(e.x, e.y, e.z, chw, chw, hh, (0.2, 0.9, 1.0, 0.85))
+            # bullet hitboxes: body in yellow, head in red (exactly what fire() tests)
+            _bb, _hb = game.target_shape(e)
+            _wire_box(*_bb, (1.0, 0.9, 0.2, 0.9))
+            _wire_box(*_hb, (1.0, 0.15, 0.15, 0.95))
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDisable(gl.GL_BLEND)
+        gl.glColor4f(1, 1, 1, 1)
+        tex2d(True)
 
     if game.tracers:
         tex2d(False)
@@ -7736,16 +8864,27 @@ def render_scene(game, W, H):
     gl.glMatrixMode(gl.GL_MODELVIEW)
     gl.glLoadIdentity()
     glu.gluLookAt(0, 0, 0, 1, 0, 0, 0, 0, 1)
-    hide = P.zoom and P.w == 0
+    hide = (P.zoom and P.w == 0) or tp          # no first-person gun in third person
     w = CFG["weapons"][P.w]
     gl.glPushMatrix()
     if P.slk > 0.001:
         gl.glTranslatef(0.4 * P.slk, 0.8 * P.slk, -1.2 * P.slk)    # gun drops and shifts while sliding
         gl.glRotatef(-9 * P.slk, 1, 0, 0)
         gl.glRotatef(-5 * P.slk, 0, 1, 0)
-    gl.glTranslatef(0, math.sin(P.ph) * VM_BOB_SIDE * P.bob,
-                    -(math.sin(P.ph) ** 2) * VM_BOB_UP * P.bob
-                    + P.air * .4 - P.land * VM_LAND)
+    # run bob (subtle) + mouse-look lag (main feel)
+    _vb = max(0.0, min(2.0, float(getattr(game, "viewbob", 1.0))))
+    _lag_y = getattr(game, "vm_lag_y", 0.0)   # +right when looking left
+    _lag_p = getattr(game, "vm_lag_p", 0.0)   # +up when looking down
+    gl.glTranslatef(
+        0,
+        math.sin(P.ph) * VM_BOB_SIDE * P.bob * 0.35 * _vb - _lag_y,
+        -(math.sin(P.ph) ** 2) * VM_BOB_UP * P.bob * 0.35 * _vb
+        + P.air * .4 - P.land * VM_LAND - _lag_p,
+    )
+    # slight rotate so the gun feels heavier when turning
+    if abs(_lag_y) > 0.01 or abs(_lag_p) > 0.01:
+        gl.glRotatef(-_lag_y * 0.9, 0, 0, 1)   # yaw lag
+        gl.glRotatef(_lag_p * 1.1, 0, 1, 0)    # pitch lag
     if P.alive and P.shoveT > 0 and not game.shove_seq:
         # L4D2 style shove: pull back, thrust forward and sweep across, then recover
         sf, sl, su, syaw, spit, sroll = shove_pose(1.0 - P.shoveT / max(1e-3, P.shoveD))
@@ -7883,7 +9022,22 @@ def draw_scoreboard(game, gfx, W, H):
             if e.isP:
                 gfx.rect(x, y - 2, colw, rh - 2, (42 / 255, 42 / 255, 42 / 255, 1))
             c = (255, 193, 7) if e.isP else ((255, 255, 255) if e.alive else (130, 130, 130))
-            gfx.text(e.name or "UNKNOWN", x + 10, y, 14, c, bold=bool(e.isP), mono=True)
+            nx = x + 10
+            _m = getattr(game, "menu", None)
+            if e.isP and _m is not None and getattr(_m, "pfp_tex", None):
+                # tiny profile picture before your username
+                gfx.rect(x + 9, y - 1, 16, 16, (157 / 255, 211 / 255, 103 / 255, 1))
+                gl.glEnable(gl.GL_TEXTURE_2D)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, _m.pfp_tex)
+                gl.glColor4f(1, 1, 1, 1)
+                gl.glBegin(gl.GL_QUADS)
+                gl.glTexCoord2f(0, 0); gl.glVertex2f(x + 10, y)
+                gl.glTexCoord2f(1, 0); gl.glVertex2f(x + 24, y)
+                gl.glTexCoord2f(1, 1); gl.glVertex2f(x + 24, y + 14)
+                gl.glTexCoord2f(0, 1); gl.glVertex2f(x + 10, y + 14)
+                gl.glEnd()
+                nx = x + 30
+            gfx.text(e.name or "UNKNOWN", nx, y, 14, c, bold=bool(e.isP), mono=True)
             if e.isP:
                 gfx.text(str(xp_info(game.xp)[0]), x + colw - 120, y, 14, (255, 214, 0), bold=True, anchor="r", mono=True)
             gfx.text(str(e.kills), x + colw - 70, y, 14, c, anchor="r", mono=True)
@@ -7934,16 +9088,8 @@ def render_hud(game, gfx, W, H, menu_visible):
         gfx.text("RANK UP!", W / 2, H * 0.22, 40, XP_YELLOW, alpha=min(1.0, game.rank_flash), bold=True, anchor="c")
         gfx.text("RANK %d" % lv_, W / 2, H * 0.22 + 46, 22, (255, 255, 255), alpha=min(1.0, game.rank_flash), bold=True, anchor="c")
 
-    # score
+    # (top score bar removed; the win message below still shows when the match ends)
     sc = game.score
-    cw_ = gfx.text_w(f"BLACK {sc[0]}", 20, True) + 20
-    tw_ = gfx.text_w(f"{sc[1]} YELLOW", 20, True) + 20
-    gfx.rect(W / 2 - 14 - cw_, 12, cw_, 32, team_tint(TEAM_CT))
-    gfx.rect(W / 2 + 14, 12, tw_, 32, team_tint(TEAM_T))
-    gfx.text(f"BLACK {sc[0]}", W / 2 - 14 - 10, 16, 20, TEAM_CT, bold=True, anchor="r")
-    gfx.text("-", W / 2, 16, 20, (255, 255, 255), bold=True, anchor="c")
-    gfx.text(f"{sc[1]} YELLOW", W / 2 + 14 + 10, 16, 20, TEAM_T, bold=True)
-    gfx.text(f"(limit {CFG['frags']})", W / 2, 50, 12, (200, 200, 200), anchor="c")
     if game.over:
         gfx.text(("Black" if sc[0] > sc[1] else "Yellow") + " team wins!", W / 2, 62, 20, (255, 255, 255), bold=True, anchor="c")
 
@@ -8035,6 +9181,28 @@ def render_hud(game, gfx, W, H, menu_visible):
         col_ = (255, int(255 - 62 * t_), int(255 - 248 * t_))
         gfx.text(f"{int(round(sp_))}", W / 2, H - 92, 26, col_, bold=True, anchor="c", mono=True)
         gfx.text("UNITS / SEC", W / 2, H - 62, 10, (154, 154, 154), bold=True, anchor="c")
+
+    # CS:GO-style developer console
+    if game.con_open:
+        ch = min(int(H * 0.42), 320)
+        gfx.rect(0, 0, W, ch, (12 / 255, 14 / 255, 18 / 255, 0.92))
+        gfx.rect(0, ch - 1, W, 1, (60 / 255, 70 / 255, 85 / 255, 1))
+        # log lines (bottom of panel = input area)
+        line_h = 16
+        max_lines = max(1, (ch - 36) // line_h)
+        log = game.con_log
+        start = max(0, len(log) - max_lines - game.con_scroll)
+        end = max(0, len(log) - game.con_scroll)
+        visible = log[start:end]
+        y0 = ch - 36 - line_h * len(visible)
+        for i, ln in enumerate(visible):
+            gfx.text(ln["t"][:120], 10, y0 + i * line_h, 13, ln.get("c", (200, 200, 200)), mono=True)
+        # input row
+        gfx.rect(0, ch - 28, W, 28, (8 / 255, 10 / 255, 14 / 255, 0.98))
+        caret = "|" if int(time.time() * 2) % 2 == 0 else " "
+        gfx.text("] " + game.con_text + caret, 10, ch - 22, 14, (255, 255, 255), mono=True)
+        gfx.text("~ close  |  help  |  arrows history", W - 12, ch - 20, 11, (120, 130, 140), anchor="r", mono=True)
+
     gl.glColor4f(1, 1, 1, 1)
     gl.glEnable(gl.GL_TEXTURE_2D)
 
@@ -8079,14 +9247,14 @@ def load_settings(game, menu):
         game.show_fps = bool(j.get("show_fps", False))
         game.show_speed = bool(j.get("show_speed", False))
         game.show_jstats = bool(j.get("show_jstats", True))
+        try:
+            game.viewbob = max(0.0, min(2.0, float(j.get("viewbob", 0.5))))
+        except Exception:
+            game.viewbob = 0.5
         FX.day = bool(j.get("day", False))
         vo = j.get("vm_offset")
         if isinstance(vo, list) and len(vo) == 3:
             game.vm_adj = [max(-15.0, min(15.0, float(x))) for x in vo]
-        for kind in ("shot", "hit"):
-            sp = j.get(kind + "_sound")
-            if sp and Path(sp).is_file():
-                game.set_custom_sound(kind, sp)
         game.audio.volume = float(j.get("volume", .25))
         try:
             pw = int(j.get("primary", game.primary))
@@ -8128,7 +9296,7 @@ def save_settings(game, menu):
     try:
         SETTINGS_FILE.write_text(json.dumps({
             "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "hand_swap": game.hand_swap, "bots_on": game.bots_on, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "primary": game.primary, "day": bool(FX.day), "res": list(game.res), "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "show_speed": bool(game.show_speed), "show_jstats": bool(game.show_jstats), "fov": game.fov_cfg, "vm_offset": game.vm_adj,
-            "shot_sound": game.custom_shot_path, "hit_sound": game.custom_hit_path, "sens": game.sens, "xp": int(game.xp), "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh,
+            "sens": game.sens, "xp": int(game.xp), "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh, "viewbob": float(game.viewbob),
         }, indent=2))
     except Exception:
         pass
@@ -8151,7 +9319,6 @@ def file_dialog(mode):
         "arms": [("Arms / hands packs", "*.zip *.7z *.rar *.mdl *.vpk *.vpk.part *.vvd *.vtx *.vtf *.vmt")],
         "weapon": [("Weapon mods (CS / L4D2)", "*.mdl *.wav *.json *.vpk *.vpk.part *.zip *.7z *.rar *.vvd *.vtx *.vtf *.vmt")],
         "player": [("Player models", "*.mdl *.zip *.7z *.rar *.vpk *.vpk.part")],
-        "sound": [("Sound files", "*.wav *.ogg *.mp3")],
         "image": [("Images", "*.png *.jpg *.jpeg *.bmp *.gif")],
     }[mode]
     try:
@@ -8175,16 +9342,22 @@ def main():
         except Exception:
             pass
     pygame.init()
+    # MSAA off (sharper image; no edge soft-blur from multisampling)
+    flags = pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+    # vsync off: uncapped FPS (may tear; highest frame rate)
     try:
-        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 1)
-        pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 4)
+        pygame.display.gl_set_attribute(pygame.GL_SWAP_CONTROL, 0)
     except Exception:
         pass
-    flags = pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
     try:
         pygame.display.set_mode((1280, 720), flags, vsync=0)
-    except Exception:
+    except TypeError:
         pygame.display.set_mode((1280, 720), flags)
+    except Exception:
+        try:
+            pygame.display.set_mode((1280, 720), flags, vsync=0)
+        except Exception:
+            pygame.display.set_mode((1280, 720), flags)
     pygame.display.set_caption("FAD-MOD")
     pygame.font.init()
 
@@ -8215,6 +9388,7 @@ def main():
             save_settings(game, menu)      # keeps your XP
 
     menu = Menu(game, gfx, launch, file_dialog)
+    game.menu = menu               # lets the scoreboard draw your profile picture
     load_settings(game, menu)
     game.set_world(ArenaWorld())
     if getattr(game, "want_fullscreen", False):
@@ -8223,7 +9397,7 @@ def main():
     game.P.name = game.player_name
 
     # Scan the mod folders so everything shows up in Skins. Nothing is EQUIPPED automatically
-    # (game.manual_mods): you pick the weapons / players / arms / sounds yourself, or play with none.
+    # (game.manual_mods): you pick the weapons / players / arms yourself, or play with none.
     # Weapon mods (.mdl / .wav / .json) from mod/weapon (never created).
     try:
         wfiles = sorted(f for wdir in mod_folders("weapon") for f in wdir.rglob("*")
@@ -8255,28 +9429,8 @@ def main():
     except Exception as ex:
         menu.status = (menu.status + " Arms: " + str(ex)).strip()
 
-    # Auto-load custom sounds from mod/sound (never created):
-    # a file with "shoot" / "shot" / "fire" in its name = shooting sound,
-    # a file with "hit" in its name = hit sound. A sound picked in the menu wins.
-    try:
-        sfiles = sorted(f for sdir in mod_folders("sound") for f in sdir.rglob("*")
-                        if f.is_file() and f.suffix.lower() in (".wav", ".ogg", ".mp3"))
-        got = []
-        for kind, rx in (("hit", r"hit"), ("shot", r"shoot|shot|fire")):
-            if game.manual_mods or getattr(game, f"custom_{kind}_path"):
-                continue   # sounds are picked in Settings > Sounds, not applied automatically
-            f = next((f for f in sfiles if re.search(rx, f.stem, re.I)), None)
-            if f:
-                game.set_custom_sound(kind, str(f))
-                if getattr(game, f"custom_{kind}_path"):
-                    got.append(f"{kind} sound <- {f.name}")
-        if got:
-            menu.status = (menu.status + " Sounds: " + ", ".join(got) + ".").strip()
-    except Exception as ex:
-        menu.status = "mod/sound: " + str(ex)
-
-    if not any(mod_folders(n) for n in ("weapon", "player", "arms", "sound")):
-        menu.status = (menu.status + " No mod folder found next to the script (mod/weapon, mod/player, mod/arms, mod/sound).").strip()
+    if not any(mod_folders(n) for n in ("weapon", "player", "arms")):
+        menu.status = (menu.status + " No mod folder found next to the script (mod/weapon, mod/player, mod/arms).").strip()
 
     clock = pygame.time.Clock()
     last = time.perf_counter()
@@ -8288,8 +9442,14 @@ def main():
             old = rt
             rt = RenderTarget(*game.res)
             try:
-                gl.glDeleteFramebuffers(2, [old.fbo, old.res_fbo])
-                gl.glDeleteTextures([old.tex])
+                # Without MSAA, fbo == res_fbo — must not delete the same id twice
+                fbos = list({int(x) for x in (getattr(old, "fbo", 0), getattr(old, "res_fbo", 0)) if x})
+                if fbos:
+                    gl.glDeleteFramebuffers(len(fbos), fbos)
+                if getattr(old, "tex", None):
+                    gl.glDeleteTextures([old.tex])
+                if getattr(old, "depth_rb", None):
+                    gl.glDeleteRenderbuffers(1, [old.depth_rb])
             except Exception:
                 pass
         W, H = (rt.w, rt.h) if rt.ok else (win_w, win_h)
@@ -8308,6 +9468,65 @@ def main():
                 set_fullscreen(game, not game.fullscreen)
                 save_settings(game, menu)
             elif ev.type == pygame.KEYDOWN:
+                # toggle console with the bound key (default ` / tilde)
+                _ck = (game.binds.get("console") or "`").lower().strip()
+                _kn = pygame.key.name(ev.key).lower()
+                _uni = (ev.unicode or "").lower()
+                if _ck in ("`", "~", "tilde", "backquote"):
+                    _is_con = (ev.key == pygame.K_BACKQUOTE or _kn in ("`", "~", "tilde", "backquote")
+                               or _uni in ("`", "~"))
+                else:
+                    _is_con = (_kn == _ck or _uni == _ck)
+                if _is_con:
+                    game.con_toggle()
+                    continue
+                if game.con_open:
+                    if ev.key == pygame.K_ESCAPE:
+                        game.con_toggle()
+                    elif ev.key == pygame.K_RETURN or ev.key == pygame.K_KP_ENTER:
+                        game.con_run(game.con_text)
+                        game.con_text = ""
+                    elif ev.key == pygame.K_BACKSPACE:
+                        game.con_text = game.con_text[:-1]
+                    elif ev.key == pygame.K_UP:
+                        if game.con_hist:
+                            if game.con_hist_i < 0:
+                                game.con_hist_i = len(game.con_hist) - 1
+                            else:
+                                game.con_hist_i = max(0, game.con_hist_i - 1)
+                            game.con_text = game.con_hist[game.con_hist_i]
+                    elif ev.key == pygame.K_DOWN:
+                        if game.con_hist and game.con_hist_i >= 0:
+                            game.con_hist_i += 1
+                            if game.con_hist_i >= len(game.con_hist):
+                                game.con_hist_i = -1
+                                game.con_text = ""
+                            else:
+                                game.con_text = game.con_hist[game.con_hist_i]
+                    elif ev.key == pygame.K_PAGEUP:
+                        game.con_scroll = min(len(game.con_log), game.con_scroll + 3)
+                    elif ev.key == pygame.K_PAGEDOWN:
+                        game.con_scroll = max(0, game.con_scroll - 3)
+                    elif ev.key == pygame.K_TAB:
+                        # simple autocomplete for common commands
+                        prefix = game.con_text.strip().lower()
+                        cands = [c for c in (
+                            "help", "bot_add", "bot_add_ct", "bot_add_t", "bot_place",
+                            "bot_kick", "bot_kick_all", "bot_stop", "bot_go", "bot_quota",
+                            "bot_kill", "bot_toss", "kill", "restart", "god", "noclip", "status",
+                            "clear", "fps", "cl_viewbob", "viewbob", "bind", "unbind",
+                            "sv_showhitboxes", "quit", "exit", "day", "night", "sv_cheats") if c.startswith(prefix)]
+                        if len(cands) == 1:
+                            game.con_text = cands[0] + " "
+                        elif len(cands) > 1:
+                            game.con_print("  ".join(cands), (160, 180, 200))
+                    else:
+                        ch = ev.unicode
+                        if ch and ch.isprintable() and ch not in "`~":
+                            game.con_text += ch
+                            if len(game.con_text) > 120:
+                                game.con_text = game.con_text[:120]
+                    continue
                 if game.lock:
                     if ev.key == pygame.K_ESCAPE:
                         set_lock(False)
@@ -8331,18 +9550,23 @@ def main():
                 else:
                     menu.key_down(ev)
             elif ev.type == pygame.KEYUP:
-                game.keys[pygame.key.name(ev.key)] = False
+                if not game.con_open:
+                    game.keys[pygame.key.name(ev.key)] = False
             elif ev.type == pygame.MOUSEMOTION:
-                if game.lock:
+                if game.con_open:
+                    pass
+                elif game.lock:
                     P = game.P
-                    if P.alive or True:
-                        sens = game.sens * ((0.0008 / 0.0022) if (P.zoom and P.w == 0) else 1)
-                        P.yaw -= ev.rel[0] * sens
-                        P.pitch = max(-1.5, min(1.5, P.pitch - ev.rel[1] * sens))
+                    # Allow look while dead (death cam). Scoped AWP uses reduced sensitivity.
+                    sens = game.sens * ((0.0008 / BASE_SENS) if (P.zoom and P.w == 0) else 1)
+                    P.yaw -= ev.rel[0] * sens
+                    P.pitch = max(-1.5, min(1.5, P.pitch - ev.rel[1] * sens))
                 else:
                     menu.mouse_move(ev.pos)
             elif ev.type == pygame.MOUSEBUTTONDOWN:
-                if game.lock:
+                if game.con_open:
+                    pass
+                elif game.lock:
                     btn = ev.button
                     if btn in (4, 5):
                         continue  # wheel handled by MOUSEWHEEL
@@ -8387,7 +9611,7 @@ def main():
                 else:
                     menu.wheel(ev.y)
 
-        if menu.quit_req:
+        if menu.quit_req or game.quit_req:
             running = False
         now = time.perf_counter()
         raw_dt = now - last
@@ -8431,6 +9655,24 @@ def main():
             if menu.name.strip() != game.P.name and menu.name.strip():
                 game.player_name = menu.name.strip()
                 game.P.name = game.player_name
+            if game.con_open:
+                # console also available from the menu
+                ch = min(int(H * 0.42), 320)
+                gfx.rect(0, 0, W, ch, (12 / 255, 14 / 255, 18 / 255, 0.92))
+                gfx.rect(0, ch - 1, W, 1, (60 / 255, 70 / 255, 85 / 255, 1))
+                line_h = 16
+                max_lines = max(1, (ch - 36) // line_h)
+                log = game.con_log
+                start = max(0, len(log) - max_lines - game.con_scroll)
+                end = max(0, len(log) - game.con_scroll)
+                visible = log[start:end]
+                y0 = ch - 36 - line_h * len(visible)
+                for i, ln in enumerate(visible):
+                    gfx.text(ln["t"][:120], 10, y0 + i * line_h, 13, ln.get("c", (200, 200, 200)), mono=True)
+                gfx.rect(0, ch - 28, W, 28, (8 / 255, 10 / 255, 14 / 255, 0.98))
+                caret = "|" if int(time.time() * 2) % 2 == 0 else " "
+                gfx.text("] " + game.con_text + caret, 10, ch - 22, 14, (255, 255, 255), mono=True)
+                gfx.text("~ close  |  help", W - 12, ch - 20, 11, (120, 130, 140), anchor="r", mono=True)
         pygame.display.flip()
         clock.tick()   # no FPS cap
 
