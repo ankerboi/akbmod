@@ -632,7 +632,7 @@ class FadMapWorld(World):
             raise ValueError("not a FAD-MOD map file")
         self.name = str(d.get("name", "map"))
         self.B, self.meta = [], []
-        self.K, self.D = [], []      # shape kind per box (0 box, 1 slope, 2 cylinder) and slope uphill direction
+        self.K, self.D, self.Y = [], [], []      # shape kind per box (0 box, 1 slope, 2 cylinder), slope uphill direction, spin (deg)
         for b in d.get("boxes", []):
             v = [float(x) for x in b["b"]]
             for i in range(3):
@@ -642,6 +642,11 @@ class FadMapWorld(World):
             _k = int(b.get("k", 0) or 0)
             self.K.append(_k if _k in (0, 1, 2) else 0)
             self.D.append(int(b.get("d", 0) or 0) % 4)
+            try:
+                _y = float(b.get("yaw", 0) or 0) % 360.0
+            except (TypeError, ValueError):
+                _y = 0.0
+            self.Y.append(0.0 if (_y < 1e-4 or _y > 360.0 - 1e-4) else _y)
             col = b.get("c") or (176, 160, 144)
             self.meta.append((int(b.get("t", -1)), int(b.get("tt", b.get("t", -1)) if b.get("tt") is not None else b.get("t", -1)),
                               float(b.get("tile", 128) or 128), tuple(col),
@@ -649,8 +654,14 @@ class FadMapWorld(World):
         if not self.B:
             raise ValueError("the map has no boxes")
         # plain boxes are tested the fast way; slopes / cylinders have their own tests
-        self._bx = [b for b, k in zip(self.B, self.K) if k == 0]
-        self._sp = [(b, k, d) for b, k, d in zip(self.B, self.K, self.D) if k]
+        self._bx = [b for b, k, y in zip(self.B, self.K, self.Y) if k == 0 and not y]
+        self._sp = [(b, k, dd) for b, k, dd, y in zip(self.B, self.K, self.D, self.Y) if k and not y]
+        # spun shapes: tested in their own frame (point is turned back by the spin, normals are turned forward)
+        self._rt = []
+        for b, k, dd, y in zip(self.B, self.K, self.D, self.Y):
+            if y:
+                a = math.radians(y)
+                self._rt.append((b, k, dd, math.cos(a), math.sin(a), (b[0] + b[3]) * .5, (b[1] + b[4]) * .5))
         self.spawns = [[], []]
         for team, lst in enumerate((d.get("spawns") or [[], []])[:2]):
             for sp in lst:
@@ -764,6 +775,20 @@ class FadMapWorld(World):
                     return True
             elif z < self._slope_top(b, d, x, y) + 36:
                 return True
+        for b, k, d, c, s, cx, cy in self._rt:
+            dx, dy = x - cx, y - cy
+            lx, ly = cx + dx * c + dy * s, cy - dx * s + dy * c
+            if not (b[0] - 16 < lx < b[3] + 16 and b[1] - 16 < ly < b[4] + 16 and b[2] - 36 < z < b[5] + 36):
+                continue
+            if k == 0:
+                return True
+            if k == 2:
+                ex = (lx - cx) / ((b[3] - b[0]) * .5 + 16)
+                ey = (ly - cy) / ((b[4] - b[1]) * .5 + 16)
+                if ex * ex + ey * ey < 1.0:
+                    return True
+            elif z < self._slope_top(b, d, lx, ly) + 36:
+                return True
         return False
 
     def bullet_solid(self, x, y, z):
@@ -780,7 +805,57 @@ class FadMapWorld(World):
                     return True
             elif z < self._slope_top(b, d, x, y):
                 return True
+        for b, k, d, c, s, cx, cy in self._rt:
+            dx, dy = x - cx, y - cy
+            lx, ly = cx + dx * c + dy * s, cy - dx * s + dy * c
+            if not (b[0] < lx < b[3] and b[1] < ly < b[4] and b[2] < z < b[5]):
+                continue
+            if k == 0:
+                return True
+            if k == 2:
+                ex = (lx - cx) / ((b[3] - b[0]) * .5)
+                ey = (ly - cy) / ((b[4] - b[1]) * .5)
+                if ex * ex + ey * ey < 1.0:
+                    return True
+            elif z < self._slope_top(b, d, lx, ly):
+                return True
         return False
+
+    def _cand1(self, b, k, d, x, y, z):
+        """(signed distances, normals) of one slope / cylinder / box at the point, in the shape's own frame."""
+        if k == 0:
+            return ((b[0] - 16 - x, x - (b[3] + 16), b[1] - 16 - y, y - (b[4] + 16), b[2] - 36 - z, z - (b[5] + 36)),
+                    self._FACES)
+        if k == 2:
+            cx, cy = (b[0] + b[3]) * .5, (b[1] + b[4]) * .5
+            Rx, Ry = (b[3] - b[0]) * .5 + 16, (b[4] - b[1]) * .5 + 16
+            dx, dy = x - cx, y - cy
+            r = math.hypot(dx, dy)
+            if r > 1e-6:
+                ca, sa = dx / r, dy / r
+                rr = 1.0 / math.sqrt((ca / Rx) ** 2 + (sa / Ry) ** 2)
+                gx, gy = dx / (Rx * Rx), dy / (Ry * Ry)
+                gl_ = math.hypot(gx, gy) or 1.0
+                side, ns = r - rr, (gx / gl_, gy / gl_, 0.0)
+            else:
+                side, ns = -min(Rx, Ry), (1.0, 0.0, 0.0)
+            return ((side, b[2] - 36 - z, z - (b[5] + 36)), (ns, (0.0, 0.0, -1.0), (0.0, 0.0, 1.0)))
+        u = self._slope_u(b, d, x, y)
+        if 0.0 < u < 1.0:
+            tn = self._slope_n(b, d)
+            top = b[2] + u * (b[5] - b[2])
+            tsv = (z - 36 - top) * tn[2]
+        else:
+            tn = (0.0, 0.0, 1.0)
+            tsv = z - 36 - (b[5] if u >= 1.0 else b[2])
+        if d in (0, 2):
+            sides = ((b[1] - 16 - y, (0.0, -1.0, 0.0)), (y - (b[4] + 16), (0.0, 1.0, 0.0)))
+        else:
+            sides = ((b[0] - 16 - x, (-1.0, 0.0, 0.0)), (x - (b[3] + 16), (1.0, 0.0, 0.0)))
+        back = ((x - (b[3] + 16), (1.0, 0.0, 0.0)), (y - (b[4] + 16), (0.0, 1.0, 0.0)),
+                (b[0] - 16 - x, (-1.0, 0.0, 0.0)), (b[1] - 16 - y, (0.0, -1.0, 0.0)))[d]
+        return ((b[2] - 36 - z, tsv, sides[0][0], sides[1][0], back[0]),
+                ((0.0, 0.0, -1.0), tn, sides[0][1], sides[1][1], back[1]))
 
     def normal_at(self, x, y, z, want_up=False, move=None):
         if want_up:
@@ -792,6 +867,18 @@ class FadMapWorld(World):
                         top = b[2] + u * (b[5] - b[2])
                         if top - 3.0 <= z - 36 <= top + 6.0:
                             return self._slope_n(b, d)
+            for b, k, d, c, s, cx, cy in self._rt:
+                if k != 1:
+                    continue
+                dx, dy = x - cx, y - cy
+                lx, ly = cx + dx * c + dy * s, cy - dx * s + dy * c
+                if b[0] - 16 < lx < b[3] + 16 and b[1] - 16 < ly < b[4] + 16:
+                    u = self._slope_u(b, d, lx, ly)
+                    if 0.0 < u < 1.0:
+                        top = b[2] + u * (b[5] - b[2])
+                        if top - 3.0 <= z - 36 <= top + 6.0:
+                            n = self._slope_n(b, d)
+                            return (n[0] * c - n[1] * s, n[0] * s + n[1] * c, n[2])
             return (0.0, 0.0, 1.0)
         best, bd = None, 1e30
         F = self._FACES
@@ -800,37 +887,11 @@ class FadMapWorld(World):
             cand.append(((b[0] - 16 - x, x - (b[3] + 16), b[1] - 16 - y,
                           y - (b[4] + 16), b[2] - 36 - z, z - (b[5] + 36)), F))
         for b, k, d in self._sp:
-            if k == 2:
-                cx, cy = (b[0] + b[3]) * .5, (b[1] + b[4]) * .5
-                Rx, Ry = (b[3] - b[0]) * .5 + 16, (b[4] - b[1]) * .5 + 16
-                dx, dy = x - cx, y - cy
-                r = math.hypot(dx, dy)
-                if r > 1e-6:
-                    ca, sa = dx / r, dy / r
-                    rr = 1.0 / math.sqrt((ca / Rx) ** 2 + (sa / Ry) ** 2)
-                    gx, gy = dx / (Rx * Rx), dy / (Ry * Ry)
-                    gl_ = math.hypot(gx, gy) or 1.0
-                    side, ns = r - rr, (gx / gl_, gy / gl_, 0.0)
-                else:
-                    side, ns = -min(Rx, Ry), (1.0, 0.0, 0.0)
-                cand.append(((side, b[2] - 36 - z, z - (b[5] + 36)), (ns, (0.0, 0.0, -1.0), (0.0, 0.0, 1.0))))
-            else:
-                u = self._slope_u(b, d, x, y)
-                if 0.0 < u < 1.0:
-                    tn = self._slope_n(b, d)
-                    top = b[2] + u * (b[5] - b[2])
-                    tsv = (z - 36 - top) * tn[2]
-                else:                              # flat lip beyond either end
-                    tn = (0.0, 0.0, 1.0)
-                    tsv = z - 36 - (b[5] if u >= 1.0 else b[2])
-                if d in (0, 2):
-                    sides = ((b[1] - 16 - y, (0.0, -1.0, 0.0)), (y - (b[4] + 16), (0.0, 1.0, 0.0)))
-                else:
-                    sides = ((b[0] - 16 - x, (-1.0, 0.0, 0.0)), (x - (b[3] + 16), (1.0, 0.0, 0.0)))
-                back = ((x - (b[3] + 16), (1.0, 0.0, 0.0)), (y - (b[4] + 16), (0.0, 1.0, 0.0)),
-                        (b[0] - 16 - x, (-1.0, 0.0, 0.0)), (b[1] - 16 - y, (0.0, -1.0, 0.0)))[d]
-                cand.append(((b[2] - 36 - z, tsv, sides[0][0], sides[1][0], back[0]),
-                             ((0.0, 0.0, -1.0), tn, sides[0][1], sides[1][1], back[1])))
+            cand.append(self._cand1(b, k, d, x, y, z))
+        for b, k, d, c, s, cx, cy in self._rt:
+            dx, dy = x - cx, y - cy
+            sv, ns = self._cand1(b, k, d, cx + dx * c + dy * s, cy - dx * s + dy * c, z)
+            cand.append((sv, tuple((n[0] * c - n[1] * s, n[0] * s + n[1] * c, n[2]) for n in ns)))
         for sv, ns in cand:
             m = max(sv)
             for i in range(len(sv)):
@@ -884,9 +945,18 @@ class FadMapWorld(World):
             self._tids.append(make_texture(arr, w, h))
         self._list = gl.glGenLists(1)
         gl.glNewList(self._list, gl.GL_COMPILE)
-        for b, (t, tt, tile, col, fo), _k, _d in zip(self.B, self.meta, self.K, self.D):
+        for b, (t, tt, tile, col, fo), _k, _d, _y in zip(self.B, self.meta, self.K, self.D, self.Y):
+            if _y:
+                _a = math.radians(_y)
+                _c, _s = math.cos(_a), math.sin(_a)
+                _cx, _cy = (b[0] + b[3]) * .5, (b[1] + b[4]) * .5
+                R = lambda p, _c=_c, _s=_s, _cx=_cx, _cy=_cy: (_cx + (p[0] - _cx) * _c - (p[1] - _cy) * _s,
+                                                              _cy + (p[0] - _cx) * _s + (p[1] - _cy) * _c, p[2])
+                RV = lambda v, _c=_c, _s=_s: (v[0] * _c - v[1] * _s, v[0] * _s + v[1] * _c, v[2])
+            else:
+                R = RV = (lambda p: p)
             if _k:
-                self._build_shape(b, _k, _d, t, tt, tile, col, fo)
+                self._build_shape(b, _k, _d, t, tt, tile, col, fo, R, RV)
                 continue
             for fi, f in enumerate(self._faces(b)):
                 n = f[4]
@@ -901,8 +971,10 @@ class FadMapWorld(World):
                 else:
                     gl.glColor3f(col[0] / 255 * sh, col[1] / 255 * sh, col[2] / 255 * sh)
                 gl.glBegin(gl.GL_QUADS)
+                nr = RV(n)
                 for pt in f[:4]:
-                    u, v = self._uv(pt, n, tile)
+                    pt = R(pt)
+                    u, v = self._uv(pt, nr, tile)
                     gl.glTexCoord2f(u, v)
                     gl.glVertex3f(*pt)
                 gl.glEnd()
@@ -921,9 +993,11 @@ class FadMapWorld(World):
             gl.glVertex3f(*pt)
         gl.glEnd()
 
-    def _build_shape(self, b, k, d, t, tt, tile, col, fo):
+    def _build_shape(self, b, k, d, t, tt, tile, col, fo, R=None, RV=None):
         """Slope (wedge) or cylinder, drawn exactly like the Map Builder shows it."""
         x0, y0, z0, x1, y1, z1 = b
+        R = R or (lambda p: p)
+        RV = RV or (lambda v: v)
         top_t = fo[0] if fo[0] >= 0 else tt
         bot_t = fo[1] if fo[1] >= 0 else t
         side_t = next((v for v in fo[2:] if v >= 0), t)
@@ -948,12 +1022,13 @@ class FadMapWorld(World):
                 ([(0, 0, 0), (1, 0, 0), (1, 0, 1)], sa, side_t),
                 ([(0, 1, 0), (1, 1, 0), (1, 1, 1)], sb, side_t))
             for loc, n, ti in polys:
-                pts = [W(*q) for q in loc]
-                self._poly(ti, col, pts, self._shade(n), [self._uv(pt, n, tile) for pt in pts])
+                pts = [R(W(*q)) for q in loc]
+                nr = RV(n)
+                self._poly(ti, col, pts, self._shade(n), [self._uv(pt, nr, tile) for pt in pts])
         else:
             cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
             N = 64
-            ring = [(cx + rx * math.cos(2 * math.pi * i / N), cy + ry * math.sin(2 * math.pi * i / N)) for i in range(N)]
+            ring = [R((cx + rx * math.cos(2 * math.pi * i / N), cy + ry * math.sin(2 * math.pi * i / N), 0.0))[:2] for i in range(N)]
             run = 0.0
             for i in range(N):
                 a, c = ring[i], ring[(i + 1) % N]
@@ -3423,69 +3498,75 @@ def lan_ip():
 
 
 class Broker:
-    """Free public MQTT broker used as the phone book (room list) and as the signalling
-    channel for NAT hole punching. Runs in a background thread; results arrive in self.q."""
+    """Free public MQTT brokers used as the phone book (room list) and as the signalling
+    channel for NAT hole punching. We connect to ALL of them at the same time (one thread
+    each) and publish / subscribe on every one that is up, so a slow or dead broker never
+    delays you and two players can never end up on different brokers.
+    Results arrive in self.q (duplicates from several brokers are harmless)."""
 
     def __init__(self):
-        self.cli = None
-        self.ok = False
+        self.clis = {}            # host -> paho client
+        self.okh = set()          # hosts that are connected right now
         self.err = ""
         self.q = queue.Queue()
         self.want = set()
-        self.thread = None
+        self.threads = []
         self.stop = False
 
-    def start(self):
-        if self.thread:
-            return
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+    @property
+    def ok(self):
+        return bool(self.okh)
 
-    def _run(self):
+    def start(self):
+        if self.threads:
+            return
+        for h in BROKER_HOSTS:
+            t = threading.Thread(target=self._run, args=(h,), daemon=True)
+            t.start()
+            self.threads.append(t)
+
+    def _run(self, host):
         try:
             import paho.mqtt.client as mqtt
         except Exception:
             self.err = "paho-mqtt missing (pip install paho-mqtt)"
             return
         cid = "akb-%012x" % random.getrandbits(48)
-        i = 0
         while not self.stop:
-            host = BROKER_HOSTS[i % len(BROKER_HOSTS)]
-            i += 1
             try:
                 try:
-                    cli = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=cid)   # paho 2.x
+                    cli = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=cid, userdata=host)   # paho 2.x
                 except AttributeError:
-                    cli = mqtt.Client(client_id=cid)                                      # paho 1.x
+                    cli = mqtt.Client(client_id=cid, userdata=host)                                      # paho 1.x
                 cli.on_connect = self._on_connect
                 cli.on_disconnect = self._on_disc
                 cli.on_message = self._on_msg
-                cli.connect(host, 1883, keepalive=30)
-            except Exception as ex:
-                self.err = "%s: %s" % (host, str(ex)[:40])
-                time.sleep(2.0)
-                continue
-            self.cli = cli
-            self.err = ""
-            cli.loop_start()      # keeps running and reconnects by itself
-            # stay in the thread so we can rotate brokers if this one dies for good
-            while not self.stop:
-                time.sleep(2.0)
-                if self.ok or self.stop:
-                    continue
-                # disconnected and paho has not recovered yet — try the next broker
                 try:
-                    cli.loop_stop()
-                    cli.disconnect()
+                    cli.reconnect_delay_set(min_delay=1, max_delay=5)
                 except Exception:
                     pass
-                break
-            if self.stop:
-                return
+                self.clis[host] = cli
+                cli.connect(host, 1883, keepalive=20)      # paho's own connect timeout is 5s
+            except Exception as ex:
+                self.clis.pop(host, None)
+                if not self.okh:
+                    self.err = "%s: %s" % (host, str(ex)[:40])
+                time.sleep(3.0)
+                continue
+            cli.loop_start()      # keeps running and reconnects by itself
+            while not self.stop:
+                time.sleep(1.0)
+            try:
+                cli.loop_stop()
+                cli.disconnect()
+            except Exception:
+                pass
+            return
 
-    def _on_connect(self, c, u, flags, rc, *a):
-        self.ok = (rc == 0)
-        if self.ok:
+    def _on_connect(self, c, host, flags, rc, *a):
+        good = (rc == 0) or (str(rc) == "Success")
+        if good:
+            self.okh.add(host)
             self.err = ""
             for t in list(self.want):
                 try:
@@ -3493,10 +3574,12 @@ class Broker:
                 except Exception:
                     pass
         else:
-            self.err = "refused (%s)" % (rc,)
+            self.okh.discard(host)
+            if not self.okh:
+                self.err = "%s refused (%s)" % (host, rc)
 
-    def _on_disc(self, c, u, *a):
-        self.ok = False
+    def _on_disc(self, c, host, *a):
+        self.okh.discard(host)
 
     def _on_msg(self, c, u, msg):
         try:
@@ -3505,43 +3588,71 @@ class Broker:
             return
         self.q.put((msg.topic, j))
 
+    def _live(self):
+        return [self.clis[h] for h in list(self.okh) if h in self.clis]
+
     def sub(self, topic):
         self.want.add(topic)
-        if self.cli and self.ok:
+        for c in self._live():
             try:
-                self.cli.subscribe(topic, qos=0)
+                c.subscribe(topic, qos=0)
             except Exception:
                 pass
 
     def unsub(self, topic):
         self.want.discard(topic)
-        if self.cli and self.ok:
+        for c in self._live():
             try:
-                self.cli.unsubscribe(topic)
+                c.unsubscribe(topic)
             except Exception:
                 pass
 
     def pub(self, topic, obj, retain=False):
-        """obj=None with retain=True deletes a retained message."""
-        if not (self.cli and self.ok):
+        """obj=None with retain=True deletes a retained message. Goes out on every live broker."""
+        live = self._live()
+        if not live:
             return False
-        try:
-            self.cli.publish(topic, b"" if obj is None else json.dumps(obj, separators=(",", ":")),
-                             qos=0, retain=retain)
-            return True
-        except Exception:
-            return False
+        payload = b"" if obj is None else json.dumps(obj, separators=(",", ":"))
+        sent = False
+        infos = []
+        for c in live:
+            try:
+                infos.append(c.publish(topic, payload, qos=0, retain=retain))
+                sent = True
+            except Exception:
+                pass
+        if obj is None and retain:
+            # a room-closed delete must really leave the machine before we disconnect,
+            # otherwise the dead room stays on the broker and shows up for everyone
+            t_end = time.time() + 0.6
+            for inf in infos:
+                try:
+                    inf.wait_for_publish(timeout=max(0.05, t_end - time.time()))
+                except Exception:
+                    pass
+        return sent
+
+    def pub_raw(self, topic, payload):
+        """Publish ready-made bytes (relay traffic) on every live broker."""
+        sent = False
+        for c in self._live():
+            try:
+                c.publish(topic, payload, qos=0)
+                sent = True
+            except Exception:
+                pass
+        return sent
 
     def close(self):
         self.stop = True
-        if self.cli:
+        for c in list(self.clis.values()):
             try:
-                self.cli.disconnect()
-                self.cli.loop_stop()
+                c.disconnect()
+                c.loop_stop()
             except Exception:
                 pass
-            self.cli = None
-        self.ok = False
+        self.clis = {}
+        self.okh = set()
 
 
 class UConn:
@@ -3652,8 +3763,31 @@ class UConn:
         self.dead = True
 
 
+class _Mux:
+    """What UConn sends through: a real UDP address goes out the UDP socket, an address of
+    the form ("relay", key) goes through the MQTT brokers instead (no-NAT-needed fallback)."""
+
+    def __init__(self, net):
+        self.net = net
+
+    def sendto(self, data, addr):
+        if addr and addr[0] == "relay":
+            self.net._relay_send(data, addr)
+            return len(data)
+        s = self.net.sock
+        if s is None:
+            raise OSError("no socket")
+        return s.sendto(data, addr)
+
+
 class Net:
     def __init__(self):
+        self.mux = _Mux(self)
+        self._rts = {}            # room id -> last announce timestamp seen (stale-room filter)
+        self.relayed = False      # joiner: this connection runs through the broker relay
+        self._rly_n = 0
+        self._rly_seen = set()
+        self._rly_topics = []
         self.mode = None          # None | "host" | "joining" | "client"
         self.room = ""
         self.rid = ""
@@ -3704,6 +3838,7 @@ class Net:
     def start_broker(self):
         self.broker.sub("%s/rooms/+" % BROKER_ROOT)
         self.broker.start()
+        self._stun_start()        # resolve the STUN servers now so Host / Join don't wait for DNS
 
     def broker_state(self):
         b = self.broker
@@ -3772,6 +3907,8 @@ class Net:
             del self.lan_rooms[k]
         for k in [k for k, r in self.net_rooms.items() if now - r["seen"] > 15.0]:
             del self.net_rooms[k]
+        if len(self._rts) > 200:
+            self._rts.clear()
 
     # ----- internet broker: room list + hole-punch signalling -----
     def _broker_poll(self, now):
@@ -3782,18 +3919,29 @@ class Net:
             except queue.Empty:
                 break
             parts = topic.split("/")
+            if len(parts) >= 4 and parts[1] == "rly":
+                self._relay_in(parts, j)
+                continue
             if len(parts) != 3:
                 continue
             kind, rid = parts[1], parts[2]
             if kind == "rooms":
                 if j is None:
                     self.net_rooms.pop(rid, None)
+                    self._rts.pop(rid, None)
                     continue
                 if not isinstance(j, dict) or j.get("g") != NET_MAGIC or rid == self.rid:
                     continue
                 try:
-                    if abs(time.time() - float(j.get("ts", 0))) > 60:
-                        continue      # leftover of a room whose host vanished
+                    ts = float(j.get("ts", 0))
+                    if abs(time.time() - ts) > 120:
+                        # Looks old: either a leftover of a closed room, or the host's PC clock
+                        # is off. A live host re-announces every few seconds with a new ts,
+                        # a dead room never does - so only show it once its ts changes.
+                        if self._rts.get(rid) is None or self._rts[rid] == ts:
+                            self._rts[rid] = ts
+                            continue
+                    self._rts[rid] = ts
                     pub = j["pub"]
                     lan = j.get("lan")
                     self.net_rooms[rid] = {
@@ -3847,26 +3995,37 @@ class Net:
             return
         self.stun_started = True
 
-        def run():
-            for h, p in STUN_HOSTS:
-                try:
-                    self.stun_addrs.append((socket.gethostbyname(h), p))
-                except OSError:
-                    pass
-        threading.Thread(target=run, daemon=True).start()
+        def one(h, p):
+            try:
+                self.stun_addrs.append((socket.gethostbyname(h), p))
+            except OSError:
+                pass
+        for h, p in STUN_HOSTS:      # one thread per server: a slow DNS lookup blocks nobody
+            threading.Thread(target=one, args=(h, p), daemon=True).start()
 
     def _stun_tick(self, now):
-        if self.pub is None and self.sock and self.stun_addrs and now >= self.t_stun:
-            self.t_stun = now + 0.8
-            if len(self.stun_tids) > 60:
-                self.stun_tids.clear()
-            for a in self.stun_addrs[:3]:
-                tid = os.urandom(12)
-                self.stun_tids.add(tid)
-                try:
-                    self.sock.sendto(struct.pack(">HHI", 1, 0, STUN_COOKIE) + tid, a)
-                except OSError:
-                    pass
+        if not (self.sock and self.stun_addrs and now >= self.t_stun):
+            return
+        if self.pub is None:                 # still looking for our public address: ask fast
+            self.t_stun = now + 0.25
+            targets = list(self.stun_addrs)
+        elif self.mode == "host":
+            # Keep asking while hosting: this (a) keeps the router's UDP mapping from timing out
+            # (typically 30-60s idle) and (b) notices if the router gave us a different public
+            # port, so the room list never advertises a dead address.
+            self.t_stun = now + 8.0
+            targets = self.stun_addrs[:2]
+        else:
+            return
+        if len(self.stun_tids) > 120:
+            self.stun_tids.clear()
+        for a in targets:
+            tid = os.urandom(12)
+            self.stun_tids.add(tid)
+            try:
+                self.sock.sendto(struct.pack(">HHI", 1, 0, STUN_COOKIE) + tid, a)
+            except OSError:
+                pass
 
     def _stun_reply(self, data):
         mt, ln = struct.unpack_from(">HH", data, 0)
@@ -3884,9 +4043,11 @@ class Net:
             elif at == 0x0001 and al >= 8 and v[1] == 1:
                 mapped = (".".join(str(x) for x in v[4:8]), struct.unpack(">H", v[2:4])[0])
             p += 4 + al + (-al % 4)
-        self.pub = xor or mapped
-        if self.pub and self.mode == "host":
-            self.t_ann = 0.0
+        newpub = xor or mapped
+        changed = newpub != self.pub
+        self.pub = newpub
+        if self.pub and self.mode == "host" and changed:
+            self.t_ann = 0.0          # announce the (new) public address right away
             self.status = "Hosting '%s' - friends can join from the server browser, no port forwarding needed." % self.room
 
     # ----- sockets -----
@@ -3927,23 +4088,52 @@ class Net:
                 pkt = json.loads(data)
             except ValueError:
                 continue
-            if not isinstance(pkt, dict) or "p" in pkt:     # "p" = hole-punch noise
-                continue
-            c = None
-            if self.mode == "host":
-                c = self.by_addr.get(addr)
-                if c is None:
-                    m = pkt.get("m")
-                    if (isinstance(m, dict) and m.get("t") == "hello" and pkt.get("q") == 1
-                            and len(self.pending) < 16):
-                        c = UConn(self.sock, [addr])
-                        c.locked = True
-                        self.by_addr[addr] = c
-                        self.pending.append(c)
-            elif self.conn is not None and self.conn.accepts(addr):
-                c = self.conn
-            if c is not None:
-                c.feed(pkt, addr)
+            self._route(pkt, addr)
+
+    def _route(self, pkt, addr):
+        if not isinstance(pkt, dict) or "p" in pkt:     # "p" = hole-punch noise
+            return
+        c = None
+        if self.mode == "host":
+            c = self.by_addr.get(addr)
+            if c is None:
+                m = pkt.get("m")
+                if (isinstance(m, dict) and m.get("t") == "hello" and pkt.get("q") == 1
+                        and len(self.pending) < 16):
+                    c = UConn(self.mux, [addr])
+                    c.locked = True
+                    self.by_addr[addr] = c
+                    self.pending.append(c)
+        elif self.conn is not None and self.conn.accepts(addr):
+            c = self.conn
+        if c is not None:
+            c.feed(pkt, addr)
+
+    # ----- relay through the brokers (used when the direct UDP hole-punch fails) -----
+    def _relay_send(self, data, addr):
+        self._rly_n += 1
+        if self.mode == "host":
+            topic = "%s/rly/%s/c/%s" % (BROKER_ROOT, self.rid, addr[1])
+            who = "h"
+        else:
+            topic = "%s/rly/%s/h" % (BROKER_ROOT, self.join_rid)
+            who = self.cid
+        self.broker.pub_raw(topic, b'{"s":"%s","n":%d,"p":' % (who.encode(), self._rly_n) + data + b"}")
+
+    def _relay_in(self, parts, j):
+        if not isinstance(j, dict) or not isinstance(j.get("p"), dict):
+            return
+        key = (str(j.get("s")), j.get("n"))
+        if key in self._rly_seen:        # same packet came in through several brokers
+            return
+        if len(self._rly_seen) > 4096:
+            self._rly_seen.clear()
+        self._rly_seen.add(key)
+        if self.mode == "host" and parts[3] == "h" and parts[2] == self.rid:
+            self._route(j["p"], ("relay", str(j.get("s"))[:16]))
+        elif (self.mode in ("joining", "client") and parts[3] == "c" and len(parts) == 5
+                and parts[2] == self.join_rid and parts[4] == self.cid):
+            self._route(j["p"], ("relay", self.join_rid))
 
     # ----- host / join / leave -----
     def host(self, room, pname, map_sig, team=0):
@@ -3970,6 +4160,8 @@ class Net:
         self.t_stun = 0.0
         self._stun_start()
         self.broker.sub("%s/sig/%s" % (BROKER_ROOT, self.rid))
+        self._rly_topics = ["%s/rly/%s/h" % (BROKER_ROOT, self.rid)]
+        self.broker.sub(self._rly_topics[0])
         self.status = "Hosting '%s' - finding your public address..." % room
         return True
 
@@ -4028,13 +4220,20 @@ class Net:
         self._join_punch_t = 0.0
         self._stun_start()
         self.cid = "%08x" % random.getrandbits(32)      # new for every attempt
-        self.conn = UConn(sock, cands)
+        self._jcands = list(cands)
+        self._try_t0 = time.time()
+        self._join_try = 1
+        self.relayed = False
+        self.conn = UConn(self.mux, cands)
         self.conn.send({"t": "hello", "g": NET_MAGIC, "v": NET_PROTO, "n": pname, "map": map_sig,
                         "cid": self.cid})
         self.status = "Connecting to the server (UDP hole-punch, up to 25s)..."
         return True
 
     def leave(self, status=None):
+        for t in self._rly_topics:
+            self.broker.unsub(t)
+        self._rly_topics = []
         if self.mode == "host" and self.rid:
             self.broker.pub("%s/rooms/%s" % (BROKER_ROOT, self.rid), None, retain=True)
             self.broker.unsub("%s/sig/%s" % (BROKER_ROOT, self.rid))
@@ -4212,6 +4411,46 @@ class Net:
             if c.dead or now - c.last > 10:
                 self._drop(c, msgs)
 
+    def _retry_join(self, now):
+        """The first hole-punch attempt is often the one that gets stuck (stale NAT mapping,
+        firewall prompt, lost signal). A fresh socket + new id a few seconds later usually
+        works - exactly what pressing Leave then Join did by hand. Do it automatically."""
+        sock = self._open_udp()
+        if sock is None:
+            return
+        old_sock, old_conn = self.sock, self.conn
+        if old_conn:
+            old_conn.close()
+        if old_sock:
+            try:
+                old_sock.close()
+            except OSError:
+                pass
+        self.sock = sock
+        self.port = sock.getsockname()[1]
+        self.pub = None
+        self.stun_tids.clear()
+        self.t_stun = 0.0
+        self.t_sig = 0.0
+        self._join_pub_sent = False
+        self._join_punch_t = 0.0
+        self.cid = "%08x" % random.getrandbits(32)
+        self._try_t0 = now
+        self._join_try += 1
+        cands = self._jcands
+        if self._join_try >= 3 and self.join_rid:
+            # direct connection keeps failing: both NATs refuse to cooperate. Talk through the
+            # brokers instead - slower, but it works through any router.
+            self.relayed = True
+            for t in self._rly_topics:
+                self.broker.unsub(t)
+            self._rly_topics = ["%s/rly/%s/c/%s" % (BROKER_ROOT, self.join_rid, self.cid)]
+            self.broker.sub(self._rly_topics[0])
+            cands = [("relay", self.join_rid)]
+        self.conn = UConn(self.mux, cands)
+        self.conn.send({"t": "hello", "g": NET_MAGIC, "v": NET_PROTO, "n": self.pname,
+                        "map": self.map_sig, "cid": self.cid})
+
     def _poll_joining(self, now, msgs):
         c = self.conn
         # After STUN resolves, re-send hello so the host sees the correct return path
@@ -4223,7 +4462,7 @@ class Net:
                         "map": self.map_sig, "cid": self.cid})
             except Exception:
                 pass
-        if self.join_rid and now - self.t_sig >= 0.4 and (self.pub or now - self.join_t0 > 1.0):
+        if self.join_rid and now - self.t_sig >= 0.25 and (self.pub or now - self.join_t0 > 0.6):
             # tell the host (via the broker) where to punch through to us
             self.t_sig = now
             self.broker.pub("%s/sig/%s" % (BROKER_ROOT, self.join_rid), {
@@ -4233,11 +4472,17 @@ class Net:
         if c and c.addrs and now - getattr(self, "_join_punch_t", 0.0) >= 0.05:
             self._join_punch_t = now
             for a in list(c.addrs):
+                if a[0] == "relay":
+                    continue
                 try:
                     self.sock.sendto(b'{"p":1}', a)
                 except OSError:
                     pass
         c.flush()
+        if self.mode == "joining" and int(now - self.join_t0) != getattr(self, "_join_sec", -1):
+            self._join_sec = int(now - self.join_t0)
+            self.status = "Connecting to the server (%s, attempt %d, %ds / 25s)..." % (
+                "via relay" if self.relayed else "direct", self._join_try, self._join_sec)
         for m in c.read():
             t = m.get("t")
             if t == "welcome":
@@ -4249,12 +4494,16 @@ class Net:
                                 for p in m.get("ps", [])}
                 CFG["frags"] = int(m.get("frags", CFG["frags"]))
                 FX.day = bool(m.get("day", 0))       # the host picks night / day for the map
-                self.status = f"Joined '{self.room}'."
+                self.status = f"Joined '{self.room}'." + (" (via relay - slightly higher ping)" if self.relayed else "")
                 msgs.append(m)
             elif t == "deny":
                 self.leave("Denied: " + str(m.get("why", "Denied.")))
                 msgs.append({"t": "failed"})
                 return
+        if (self.mode == "joining" and not c.dead and not self.relayed
+                and now - self._try_t0 > 4.0 and now - self.join_t0 < 20.0):
+            self._retry_join(now)
+            return
         if self.mode == "joining" and (c.dead or now - self.join_t0 > 25.0):
             why = ("Could not reach the server. Both of you should: "
                    "1) stay in the game while connecting  2) try a phone hotspot  "
@@ -4624,7 +4873,7 @@ class Game:
             self.spawn(e)
         self.ents.append(e)
         kind = "static bot" if static else "bot"
-        side = "Yellow" if team else "Black"
+        side = TEAM_NAMES[1 if team else 0]
         self.con_print("Added %s '%s' (%s)" % (kind, name, side), (157, 211, 103))
         return e
 
@@ -4681,7 +4930,7 @@ class Game:
             help_lines = [
                 "=== Dev console (offline) ===",
                 "bot_add [ct|t]          add a bot (auto team if omitted)",
-                "bot_add_ct / bot_add_t  add bot to Black / Yellow",
+                "bot_add_ct / bot_add_t  add bot to BUM / FAD",
                 "bot_place [ct|t]        spawn static bot in front of you",
                 "bot_kick [all|name]     kick bots (default: all)",
                 "bot_kick_all            kick every bot",
@@ -4725,7 +4974,7 @@ class Game:
                     flags.append("static")
                 if not e.alive:
                     flags.append("dead")
-                side = "Yellow" if e.team else "Black"
+                side = TEAM_NAMES[1 if e.team else 0]
                 self.con_print("  %s  [%s]  hp=%d  %s" % (e.name, side, int(e.hp), " ".join(flags)),
                                (220, 220, 220))
         elif cmd in ("bot_add", "bot"):
@@ -4938,6 +5187,17 @@ class Game:
             return self.net.join_room(room, self.player_name, self.map_sig())
         return self.net.join(room, rid, self.player_name, self.map_sig())
 
+    def net_set_team(self, tm):
+        """Switch to team tm (0 = BUM, 1 = FAD) while on a server; everyone is told."""
+        tm = int(tm) & 1
+        if not self.net.active or not self.P or self.P.team == tm:
+            return
+        self.net.my_team = tm
+        self.my_team = tm
+        self.P.team = tm
+        self.spawn(self.P)
+        self.net.send({"t": "team", "tm": tm})
+
     def net_leave(self, status=None):
         self.net.leave(status)
         self.my_team = 0
@@ -4955,7 +5215,7 @@ class Game:
                 print("net message error:", ex)
         if net.active and self.P:
             net.t_st += dt
-            if net.t_st >= 1.0 / NET_STATE_HZ:
+            if net.t_st >= 1.0 / (20 if net.relayed else NET_STATE_HZ):
                 net.t_st = 0.0
                 P = self.P
                 net.send({"t": "st", "s": [
@@ -5032,6 +5292,18 @@ class Game:
                 e.shoveD = max(0.2, min(1.5, float(m.get("d", SHOVE_TIME))))
                 e.shoveT = e.shoveD
                 e.shoveHit = True            # the damage is sent by the shover; this is only the look
+        elif t == "team":
+            try:
+                pid, tm = int(f), int(m.get("tm", 0)) & 1
+            except (TypeError, ValueError):
+                return
+            if pid in net.players:
+                net.players[pid]["tm"] = tm
+            e = self.remotes.get(pid)
+            if e and e.team != tm:
+                e.team = tm
+                self.build_entity_model(e)
+                self.spawn(e)
         elif t == "hit":
             P = self.P
             if P.alive and not self.over and not getattr(P, "god", False):
@@ -6836,15 +7108,7 @@ class Game:
                     self.spawn(e)
                     continue
                 if e.isP:
-                    if self.con_open:
-                        # console open: freeze movement input, still apply gravity/stand
-                        e.vx = e.vy = 0.0
-                        e.held = 0
-                        if getattr(e, "noclip", False):
-                            e.vz = 0.0
-                        else:
-                            self.phys(e, dt, 0, 0, False)
-                    elif getattr(e, "noclip", False):
+                    if getattr(e, "noclip", False):
                         # fly through walls: WASD + jump/crouch
                         f = (1 if K.get(B["forward"]) else 0) - (1 if K.get(B["backward"]) else 0)
                         s = (1 if K.get(B["right"]) else 0) - (1 if K.get(B["left"]) else 0)
@@ -7193,6 +7457,53 @@ def team_tint(col):
     return (1.0, 214 / 255, 0.0, 1.0) if col == TEAM_CT else (0.0, 0.0, 0.0, 1.0)
 
 
+TEAM_NAMES = ("BUM", "FAD")     # team 0 (black) = BUM, team 1 (yellow) = FAD
+_TEAM_LOGO = {}
+
+
+def team_logo(team):
+    """(texture id, w, h) of the faction logo, or None. Looks for bum.png / fad.png in the mod/image folder."""
+    team = int(team) & 1
+    if team in _TEAM_LOGO:
+        return _TEAM_LOGO[team]
+    res = None
+    nm = TEAM_NAMES[team].lower()
+    try:
+        for d in mod_folders("image"):
+            for f in sorted(d.iterdir()):
+                if (res is None and f.is_file() and f.stem.lower() == nm
+                        and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                    surf = pygame.image.load(str(f)).convert_alpha()
+                    w, h = surf.get_size()
+                    arr = np.frombuffer(pygame.image.tostring(surf, "RGBA", False), np.uint8).reshape(h, w, 4)
+                    res = (make_texture(arr, w, h), w, h)
+    except Exception as ex:
+        print("team logo failed:", nm, ex)
+    _TEAM_LOGO[team] = res
+    return res
+
+
+def draw_team_logo(x, y, size, team):
+    """Draw the faction logo fitted in a size x size box (layout units). Returns True if drawn."""
+    lg = team_logo(team)
+    if not lg:
+        return False
+    tid, w, h = lg
+    k = size / float(max(w, h))
+    dw, dh = w * k, h * k
+    x0, y0 = x + (size - dw) / 2, y + (size - dh) / 2
+    gl.glEnable(gl.GL_TEXTURE_2D)
+    gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
+    gl.glColor4f(1, 1, 1, 1)
+    gl.glBegin(gl.GL_QUADS)
+    gl.glTexCoord2f(0, 0); gl.glVertex2f(x0, y0)
+    gl.glTexCoord2f(1, 0); gl.glVertex2f(x0 + dw, y0)
+    gl.glTexCoord2f(1, 1); gl.glVertex2f(x0 + dw, y0 + dh)
+    gl.glTexCoord2f(0, 1); gl.glVertex2f(x0, y0 + dh)
+    gl.glEnd()
+    return True
+
+
 RENDER_W, RENDER_H = 1280, 720    # the game always renders at this resolution, then is scaled to the window
 
 
@@ -7474,6 +7785,10 @@ class Menu:
 
     def mouse_up(self):
         self.drag = None
+        if getattr(self, "team_drag", False):
+            self.team_drag = False
+            if self.g.net.active:
+                self.g.net_set_team(1 if self.mp[0] > getattr(self, "_team_mid", 0) else 0)
 
     def bind_press(self, code):
         """Assign `code` to the waiting action; returns True if consumed."""
@@ -7747,13 +8062,52 @@ class Menu:
             if net.active:
                 panel(cx, ly, cw, LH - 22 - ly, "Players on the server")
                 rows = [(g.P.name or "You", g.P.team, True)] + [(p["n"], p["tm"], False) for p in net.players.values()]
-                for i, (nm, tm, me) in enumerate(rows[:NET_MAX_PLAYERS]):
-                    xx = cx + 20 + (i % 2) * 330
-                    yy = ly + 40 + (i // 2) * 34
-                    col = TEAM_CT if tm == 0 else TEAM_T
-                    gfx.box(xx, yy, 320, 28, team_tint(col), c255(42, 42, 42))
-                    gfx.text(nm[:20] + ("  (you)" if me else ""), xx + 10, yy + 6, 13, (0, 0, 0) if tm == 0 else (255, 214, 0), bold=me, mono=True)
-                    gfx.text("BLACK" if tm == 0 else "YELLOW", xx + 308, yy + 6, 12, col, bold=True, anchor="r")
+                gfx.text("Drag yourself to the other team to switch", cx + cw - 20, ly + 16, 11, (130, 130, 130), anchor="r")
+                colw_ = (cw - 60) / 2
+                self._team_mid = cx + cw / 2
+                dragging = bool(getattr(self, "team_drag", False))
+                mx_, my_ = self.mp
+
+                def draw_row(rx, ry, rw, nm, tm, me):
+                    col_ = TEAM_CT if tm == 0 else TEAM_T
+                    gfx.box(rx, ry, rw, 28, c255(36, 36, 36), c255(157, 211, 103) if me else c255(48, 48, 48))
+                    gfx.rect(rx + 4, ry + 2, 24, 24, c255(157, 211, 103) if me else c255(60, 60, 60))
+                    if me and self.pfp_tex:
+                        gl.glEnable(gl.GL_TEXTURE_2D)
+                        gl.glBindTexture(gl.GL_TEXTURE_2D, self.pfp_tex)
+                        gl.glColor4f(1, 1, 1, 1)
+                        gl.glBegin(gl.GL_QUADS)
+                        gl.glTexCoord2f(0, 0); gl.glVertex2f(rx + 7, ry + 5)
+                        gl.glTexCoord2f(1, 0); gl.glVertex2f(rx + 25, ry + 5)
+                        gl.glTexCoord2f(1, 1); gl.glVertex2f(rx + 25, ry + 23)
+                        gl.glTexCoord2f(0, 1); gl.glVertex2f(rx + 7, ry + 23)
+                        gl.glEnd()
+                    else:
+                        gfx.text((nm.strip() or "?")[0].upper(), rx + 16, ry + 5, 13, (230, 230, 230), bold=True, anchor="c")
+                    gfx.text(nm[:20] + ("  (you)" if me else ""), rx + 36, ry + 6, 13,
+                             (255, 255, 255), bold=me, mono=True)
+
+                for t_ in (0, 1):
+                    x0 = cx + 20 + t_ * (colw_ + 20)
+                    over = dragging and ((mx_ > cx + cw / 2) == bool(t_))
+                    gfx.box(x0, ly + 44, colw_, LH - 22 - ly - 64,
+                            c255(34, 46, 28) if over else c255(22, 22, 22),
+                            c255(157, 211, 103) if over else c255(42, 42, 42))
+                    gfx.rect(x0, ly + 44, colw_, 34, team_tint(TEAM_CT if t_ == 0 else TEAM_T))
+                    draw_team_logo(x0 + 4, ly + 46, 30, t_)
+                    gfx.text(TEAM_NAMES[t_], x0 + 44, ly + 52, 15, TEAM_CT if t_ == 0 else TEAM_T, bold=True)
+                    yy = ly + 86
+                    for nm, tm, me in rows:
+                        if tm != t_:
+                            continue
+                        if not (me and dragging):
+                            draw_row(x0 + 6, yy, colw_ - 12, nm, tm, me)
+                            if me:
+                                self.hot.append((x0 + 6, yy, colw_ - 12, 28, None,
+                                                 lambda mxl: setattr(self, "team_drag", True)))
+                        yy += 34
+                if dragging:
+                    draw_row(mx_ - (colw_ - 12) / 2, my_ - 14, colw_ - 12, g.P.name or "You", g.P.team, True)
             elif not net.mode and not self.cm_open:
                 allr = net.rooms
                 shown = list(allr.values())
@@ -8045,10 +8399,11 @@ class Menu:
                         gfx.box(bx_, 166, 150, 30, team_tint(TEAM_CT if ct_ else TEAM_T), None)
                     else:
                         gfx.rect(bx_, 166, 150, 30, c255(42, 42, 42) if hover(bx_, 166, 150, 30) else c255(24, 24, 24))
-                    gfx.text("Black team" if ct_ else "Yellow team", bx_ + 75, 166 + 30 / 2 - 9, 13,
+                    draw_team_logo(bx_ + 6, 168, 26, 0 if ct_ else 1)
+                    gfx.text(TEAM_NAMES[0 if ct_ else 1], bx_ + 90, 166 + 30 / 2 - 9, 13,
                              (TEAM_CT if ct_ else TEAM_T) if on_ else (154, 154, 154), bold=True, anchor="c")
                     self.hot.append((bx_, 166, 150, 30, lambda tk=tk: setattr(self, "lo_team", tk), None))
-                info = ("Black" if self.lo_team == "CT" else "Yellow") + " team: " + (g.pm_cfg[self.lo_team] or "none picked yet")
+                info = TEAM_NAMES[0 if self.lo_team == "CT" else 1] + " team: " + (g.pm_cfg[self.lo_team] or "none picked yet")
             gfx.text(info[:100], cx, 204, 12, (170, 170, 170))
 
             gy, cw2, ch2 = 226, 216, 170
@@ -8097,7 +8452,7 @@ class Menu:
                 elif ar:
                     tags = [("EQUIPPED", (1, 1, 1, .14), (255, 193, 7))] if here else []
                 else:
-                    tags = [("BLACK" if tk == "CT" else "YELLOW", team_tint(TEAM_CT) if tk == "CT" else team_tint(TEAM_T),
+                    tags = [(TEAM_NAMES[0 if tk == "CT" else 1], team_tint(TEAM_CT) if tk == "CT" else team_tint(TEAM_T),
                              TEAM_CT if tk == "CT" else TEAM_T)
                             for tk in ("CT", "T") if g.pm_cfg[tk] == name]
                 bx = x + 10
@@ -8994,54 +9349,76 @@ def draw_crosshair(gfx, cx, cy, xh):
 
 
 def draw_scoreboard(game, gfx, W, H):
-    """Hold Tab: both teams, sorted by kills, with K / D."""
-    colw = min(430, (W - 60) / 2)
-    gap = 20
-    rows = max(sum(1 for e in game.ents if e.team == 0), sum(1 for e in game.ents if e.team == 1))
-    rh = 26
-    top = max(60, H / 2 - (rows * rh + 110) / 2)
+    """Hold Tab: big team logos + names on each side, the score in the middle, player tables under them."""
+    colw = min(470, (W - 120) / 2)
+    gap = 120
+    rh = 28
+    rows = max(1, max(sum(1 for e in game.ents if e.team == 0), sum(1 for e in game.ents if e.team == 1)))
+    head_h, th_h = 104, 26
     total_w = colw * 2 + gap
+    total_h = head_h + th_h + rows * rh + 24
     x0 = W / 2 - total_w / 2
-    gfx.rect(x0 - 12, top - 12, total_w + 24, rows * rh + 110, (22 / 255, 22 / 255, 22 / 255, .94))
-    gfx.text("SCOREBOARD", W / 2, top - 4, 12, (154, 154, 154), bold=True, anchor="c")
+    top = max(20, H / 2 - total_h / 2)
+    gfx.rect(x0 - 16, top - 12, total_w + 32, total_h + 24, (14 / 255, 14 / 255, 14 / 255, .93))
+    LOGO = 84
+    sc = game.score
+    accent = ((210, 210, 210), (210, 210, 210))
+    # header: logo + name on the outer edges, score in the middle
     for team in (0, 1):
         x = x0 + team * (colw + gap)
-        col = TEAM_CT if team == 0 else TEAM_T
-        gfx.rect(x, top + 22, colw, 34, team_tint(col))
-        gfx.text("BLACK TEAM" if team == 0 else "YELLOW TEAM", x + 10, top + 30, 15, col, bold=True)
-        gfx.text(str(game.score[team]), x + colw - 10, top + 28, 22, col, bold=True, anchor="r")
-        y = top + 62
-        gfx.text("PLAYER", x + 10, y, 11, (154, 154, 154), bold=True)
-        gfx.text("RANK", x + colw - 120, y, 11, (154, 154, 154), bold=True, anchor="r")
-        gfx.text("K", x + colw - 70, y, 11, (154, 154, 154), bold=True, anchor="r")
-        gfx.text("D", x + colw - 12, y, 11, (154, 154, 154), bold=True, anchor="r")
-        y += 20
+        col = accent[team]
+        if team == 0:
+            lg = draw_team_logo(x, top + 4, LOGO, 0)
+            if not lg:   # logo only; the name is just a fallback when no logo could be drawn
+                gfx.text(TEAM_NAMES[0], x + 6, top + 30, 34, (255, 255, 255), bold=True)
+        else:
+            lg = draw_team_logo(x + colw - LOGO, top + 4, LOGO, 1)
+            if not lg:
+                gfx.text(TEAM_NAMES[1], x + colw - 6, top + 30, 34, (255, 255, 255), bold=True, anchor="r")
+        gfx.rect(x, top + head_h - 4, colw, 3, (col[0] / 255, col[1] / 255, col[2] / 255, 1))
+    mid = W / 2
+    gfx.text(str(sc[0]), mid - 22, top + 26, 44, (255, 255, 255), bold=True, anchor="r", mono=True)
+    gfx.text(str(sc[1]), mid + 22, top + 26, 44, (255, 255, 255), bold=True, anchor="l", mono=True)
+    gfx.rect(mid - 1, top + 22, 2, 50, (1, 1, 1, .25))
+    # tables
+    for team in (0, 1):
+        x = x0 + team * (colw + gap)
+        y = top + head_h + 4
+        gfx.rect(x, y, colw, th_h, (30 / 255, 30 / 255, 30 / 255, 1))
+        gfx.text("PLAYER", x + 12, y + 6, 11, (154, 154, 154), bold=True)
+        gfx.text("RANK", x + colw - 130, y + 6, 11, (154, 154, 154), bold=True, anchor="r")
+        gfx.text("KILLS", x + colw - 70, y + 6, 11, (154, 154, 154), bold=True, anchor="r")
+        gfx.text("DEATHS", x + colw - 10, y + 6, 11, (154, 154, 154), bold=True, anchor="r")
+        y += th_h
         members = sorted((e for e in game.ents if e.team == team),
                          key=lambda e: (-e.kills, e.deaths, e.name))
-        for e in members:
+        for i, e in enumerate(members):
             if e.isP:
-                gfx.rect(x, y - 2, colw, rh - 2, (42 / 255, 42 / 255, 42 / 255, 1))
+                gfx.rect(x, y, colw, rh, (48 / 255, 48 / 255, 48 / 255, 1))
+                gfx.rect(x, y, 3, rh, (157 / 255, 211 / 255, 103 / 255, 1))
+            else:
+                v = 24 if i % 2 else 19
+                gfx.rect(x, y, colw, rh, (v / 255, v / 255, v / 255, 1))
             c = (255, 193, 7) if e.isP else ((255, 255, 255) if e.alive else (130, 130, 130))
-            nx = x + 10
+            nx = x + 12
             _m = getattr(game, "menu", None)
             if e.isP and _m is not None and getattr(_m, "pfp_tex", None):
-                # tiny profile picture before your username
-                gfx.rect(x + 9, y - 1, 16, 16, (157 / 255, 211 / 255, 103 / 255, 1))
+                gfx.rect(x + 11, y + 3, 22, 22, (157 / 255, 211 / 255, 103 / 255, 1))
                 gl.glEnable(gl.GL_TEXTURE_2D)
                 gl.glBindTexture(gl.GL_TEXTURE_2D, _m.pfp_tex)
                 gl.glColor4f(1, 1, 1, 1)
                 gl.glBegin(gl.GL_QUADS)
-                gl.glTexCoord2f(0, 0); gl.glVertex2f(x + 10, y)
-                gl.glTexCoord2f(1, 0); gl.glVertex2f(x + 24, y)
-                gl.glTexCoord2f(1, 1); gl.glVertex2f(x + 24, y + 14)
-                gl.glTexCoord2f(0, 1); gl.glVertex2f(x + 10, y + 14)
+                gl.glTexCoord2f(0, 0); gl.glVertex2f(x + 13, y + 5)
+                gl.glTexCoord2f(1, 0); gl.glVertex2f(x + 31, y + 5)
+                gl.glTexCoord2f(1, 1); gl.glVertex2f(x + 31, y + 23)
+                gl.glTexCoord2f(0, 1); gl.glVertex2f(x + 13, y + 23)
                 gl.glEnd()
-                nx = x + 30
-            gfx.text(e.name or "UNKNOWN", nx, y, 14, c, bold=bool(e.isP), mono=True)
+                nx = x + 40
+            gfx.text(e.name or "UNKNOWN", nx, y + 6, 14, c, bold=bool(e.isP), mono=True)
             if e.isP:
-                gfx.text(str(xp_info(game.xp)[0]), x + colw - 120, y, 14, (255, 214, 0), bold=True, anchor="r", mono=True)
-            gfx.text(str(e.kills), x + colw - 70, y, 14, c, anchor="r", mono=True)
-            gfx.text(str(e.deaths), x + colw - 12, y, 14, c, anchor="r", mono=True)
+                gfx.text(str(xp_info(game.xp)[0]), x + colw - 130, y + 6, 14, (255, 214, 0), bold=True, anchor="r", mono=True)
+            gfx.text(str(e.kills), x + colw - 70, y + 6, 14, c, anchor="r", mono=True)
+            gfx.text(str(e.deaths), x + colw - 10, y + 6, 14, c, anchor="r", mono=True)
             y += rh
 
 
@@ -9091,7 +9468,7 @@ def render_hud(game, gfx, W, H, menu_visible):
     # (top score bar removed; the win message below still shows when the match ends)
     sc = game.score
     if game.over:
-        gfx.text(("Black" if sc[0] > sc[1] else "Yellow") + " team wins!", W / 2, 62, 20, (255, 255, 255), bold=True, anchor="c")
+        gfx.text(TEAM_NAMES[0 if sc[0] > sc[1] else 1] + " wins!", W / 2, 62, 20, (255, 255, 255), bold=True, anchor="c")
 
     # Minimal health indicator: dark gray track + bar (green, red under 30 HP), no number or cross.
     hp_value = max(0, min(100, math.ceil(P.hp / 2)))
@@ -9550,8 +9927,7 @@ def main():
                 else:
                     menu.key_down(ev)
             elif ev.type == pygame.KEYUP:
-                if not game.con_open:
-                    game.keys[pygame.key.name(ev.key)] = False
+                game.keys[pygame.key.name(ev.key)] = False       # always: keys held when the console opened must not get stuck
             elif ev.type == pygame.MOUSEMOTION:
                 if game.con_open:
                     pass

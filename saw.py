@@ -30,10 +30,10 @@ Controls
            , and . = turn the selection one step      U = change the step (5 / 15 / 30 / 45 / 90)
   Stretch  press 6 (or X), click a box. Arrows appear on its faces: DRAG an arrow to push / pull that
            face (snaps to the grid, Shift = free). Works on slopes and circles too.
-           F5 turns spun boxes into plain boxes for the game (a spin of 0/90/180/270 stays exact).
+           F5 keeps spun objects spun: the game rotates them for real (look and collision).
   Skybox   "Set image" in the left panel (or drop an image on the empty sky) = skybox.
            Use a wide panorama (2:1) for best results.
-           CUBEMAP: "Set cubemap" and pick 6 images named px nx py ny pz nz (also posx/negx..., or
+           CUBEMAP: "Set cubemap" and pick 6 images named px nx py ny pz nz, OR ONE cross picture (4x3) with all faces (also posx/negx..., or
            right left up down front back, or rt lf up dn ft bk). Or drop the face files on the sky
            one by one. px/nx = east/west, py/ny = up/down, pz/nz = south/north. The game gets it baked.
 Texture  DRAG an image file from your PC and DROP it on the face you want (that one face gets it).
@@ -52,6 +52,7 @@ import time
 import base64
 import re
 import zlib
+import struct
 from pathlib import Path
 
 
@@ -229,9 +230,143 @@ def sky_sphere_list(R):
     return lid
 
 
+# ----- Valve VTF textures (DXT1 / DXT3 / DXT5 + common plain formats) -----
+_VTF_BPP = {0: 4, 1: 4, 2: 3, 3: 3, 4: 2, 5: 1, 6: 2, 7: 1, 8: 1, 11: 4, 12: 4, 16: 4, 17: 2,
+            18: 2, 19: 2, 21: 2, 22: 2, 23: 4, 26: 4}
+
+
+def _vtf_size(fmt, w, h):
+    if fmt in (13, 20):
+        return ((w + 3) // 4) * ((h + 3) // 4) * 8
+    if fmt in (14, 15):
+        return ((w + 3) // 4) * ((h + 3) // 4) * 16
+    return w * h * _VTF_BPP.get(fmt, 4)
+
+
+def _rgb565(c):
+    c = c.astype(np.int32)
+    r = (c >> 11) & 31
+    g = (c >> 5) & 63
+    b = c & 31
+    return np.stack([(r * 255 + 15) // 31, (g * 255 + 31) // 63, (b * 255 + 15) // 31], -1)
+
+
+def dxt_decode(data, w, h, fmt):
+    bw, bh = (w + 3) // 4, (h + 3) // 4
+    bs = 8 if fmt in (13, 20) else 16
+    a = np.frombuffer(data, np.uint8, bw * bh * bs).reshape(bw * bh, bs)
+    cb = a[:, bs - 8:].astype(np.uint32)
+    c0 = cb[:, 0] | (cb[:, 1] << 8)
+    c1 = cb[:, 2] | (cb[:, 3] << 8)
+    bits = cb[:, 4] | (cb[:, 5] << 8) | (cb[:, 6] << 16) | (cb[:, 7] << 24)
+    p0, p1 = _rgb565(c0), _rgb565(c1)
+    four = (c0 > c1)[:, None]
+    p2 = np.where(four, (2 * p0 + p1) // 3, (p0 + p1) // 2)
+    p3 = np.where(four, (p0 + 2 * p1) // 3, 0)
+    pal = np.stack([p0, p1, p2, p3], 1)                                  # (n,4,3)
+    sh = (np.arange(16, dtype=np.uint32) * 2)[None, :]
+    idx = ((bits[:, None] >> sh) & 3).astype(np.int64)                   # (n,16)
+    rgb = np.take_along_axis(pal, idx[:, :, None].repeat(3, 2), 1)       # (n,16,3)
+    alpha = np.full((bw * bh, 16), 255, np.int32)
+    if fmt in (13, 20):
+        if fmt == 20:
+            alpha = np.where((~four) & (idx == 3), 0, 255).astype(np.int32)
+    elif fmt == 14:
+        ab = a[:, :8].astype(np.uint64)
+        v = np.zeros(bw * bh, np.uint64)
+        for i in range(8):
+            v |= ab[:, i] << np.uint64(8 * i)
+        al = ((v[:, None] >> (np.arange(16, dtype=np.uint64) * np.uint64(4))[None, :]) & np.uint64(15)).astype(np.int32)
+        alpha = al * 17
+    else:
+        a0 = a[:, 0].astype(np.int32)
+        a1 = a[:, 1].astype(np.int32)
+        v = np.zeros(bw * bh, np.uint64)
+        for i in range(6):
+            v |= a[:, 2 + i].astype(np.uint64) << np.uint64(8 * i)
+        ai = ((v[:, None] >> (np.arange(16, dtype=np.uint64) * np.uint64(3))[None, :]) & np.uint64(7)).astype(np.int64)
+        ap = np.zeros((bw * bh, 8), np.int32)
+        ap[:, 0], ap[:, 1] = a0, a1
+        big = (a0 > a1)
+        for k in range(1, 7):
+            ap[:, k + 1] = np.where(big, ((7 - k) * a0 + k * a1) // 7, 0)
+        for k in range(1, 5):
+            ap[:, k + 1] = np.where(big, ap[:, k + 1], ((5 - k) * a0 + k * a1) // 5)
+        ap[:, 6] = np.where(big, ap[:, 6], 0)
+        ap[:, 7] = np.where(big, ap[:, 7], 255)
+        alpha = np.take_along_axis(ap, ai, 1)
+    px = np.concatenate([rgb, alpha[:, :, None]], 2).astype(np.uint8)   # (n,16,4)
+    px = px.reshape(bh, bw, 4, 4, 4).transpose(0, 2, 1, 3, 4).reshape(bh * 4, bw * 4, 4)
+    return px[:h, :w]
+
+
+def load_vtf_bytes(blob, max_dim=1024):
+    """VTF file bytes -> (rgba uint8 array (h,w,4), has_real_alpha), biggest mip <= max_dim."""
+    head = blob[:96]
+    if head[:4] != b"VTF\0":
+        raise ValueError("bad VTF")
+    hsize = struct.unpack_from("<I", head, 12)[0]
+    w, h = struct.unpack_from("<HH", head, 16)
+    flags = struct.unpack_from("<I", head, 20)[0]
+    frames = max(1, struct.unpack_from("<H", head, 24)[0])
+    fmt = struct.unpack_from("<i", head, 52)[0]
+    mips = head[56]
+    lfmt = struct.unpack_from("<i", head, 57)[0]
+    lw, lh = head[61], head[62]
+    off = hsize + (_vtf_size(lfmt, lw, lh) if lfmt != -1 and lw and lh else 0)
+    m = 0
+    while max(w >> m, h >> m) > max_dim and m < mips - 1:
+        m += 1
+    sizes = [_vtf_size(fmt, max(1, w >> k), max(1, h >> k)) for k in range(mips)]
+    faces = 6 if flags & 0x4000 else 1
+    pos = off + sum(sizes[m + 1:]) * frames * faces
+    mw, mh = max(1, w >> m), max(1, h >> m)
+    raw = blob[pos:pos + sizes[m]]
+    if len(raw) < sizes[m]:
+        raise ValueError("VTF file is cut off")
+    if fmt in (13, 14, 15, 20):
+        img = dxt_decode(raw, mw, mh, fmt)
+    else:
+        bpp = _VTF_BPP.get(fmt, 4)
+        a = np.frombuffer(raw, np.uint8, mw * mh * bpp).reshape(mh, mw, bpp)
+        if fmt == 0:
+            img = a
+        elif fmt == 12:
+            img = a[:, :, [2, 1, 0, 3]]
+        elif fmt == 11:
+            img = a[:, :, [1, 2, 3, 0]]
+        elif fmt == 1:
+            img = a[:, :, [3, 2, 1, 0]]
+        elif fmt == 16:
+            img = np.concatenate([a[:, :, [2, 1, 0]], np.full((mh, mw, 1), 255, np.uint8)], 2)
+        elif fmt == 2:
+            img = np.concatenate([a, np.full((mh, mw, 1), 255, np.uint8)], 2)
+        elif fmt == 3:
+            img = np.concatenate([a[:, :, ::-1], np.full((mh, mw, 1), 255, np.uint8)], 2)
+        elif fmt in (5, 8):
+            g = a[:, :, 0]
+            img = np.stack([g, g, g, np.full_like(g, 255)], 2)
+        elif fmt == 6:
+            img = np.stack([a[:, :, 0]] * 3 + [a[:, :, 1]], 2)
+        else:
+            raise ValueError("unsupported VTF format %d" % fmt)
+    return np.ascontiguousarray(img, dtype=np.uint8), bool(flags & 0x2000 or flags & 0x1000)
+
+
+
+def load_vtf_surface(path, max_side):
+    rgba, _alpha = load_vtf_bytes(Path(path).read_bytes(), max_side)
+    h, w = rgba.shape[:2]
+    s = pygame.image.frombuffer(rgba.tobytes(), (w, h), "RGBA").convert_alpha()
+    return s
+
+
 def load_image(path, max_side=1024):
-    """Any image file -> opaque RGBA Surface, shrunk to max_side."""
-    s = pygame.image.load(str(path))
+    """Any image file (also Valve .vtf) -> opaque RGBA Surface, shrunk to max_side."""
+    if str(path).lower().endswith(".vtf"):
+        s = load_vtf_surface(path, max_side)
+    else:
+        s = pygame.image.load(str(path))
     s = s.convert_alpha()
     w, h = s.get_size()
     if max(w, h) > max_side:
@@ -292,6 +427,31 @@ def face_index(path):
     for a, i in toks:                                   # glued on the end: "skyboxpz", "cloudsft"
         if len(a) >= 2 and stem.endswith(a):
             return i
+    return None
+
+
+def split_cube_image(surf):
+    """ONE image that holds all 6 faces -> 6 Surfaces in the order px nx py ny pz nz, or None.
+    Understands: horizontal cross (4 wide x 3 high), vertical cross (3 x 4), and a strip of 6 (6 x 1 or 1 x 6)."""
+    w, h = surf.get_size()
+
+    def cut(col, row, tw, th, turn=0):
+        sub = surf.subsurface((col * tw, row * th, tw, th)).copy()
+        if turn:
+            sub = pygame.transform.rotate(sub, turn)
+        return sub
+    if w * 3 == h * 4 and w >= 12:                      # horizontal cross:   .  +Y .  .
+        t = w // 4                                      #                    -X +Z +X -Z
+        pos = ((2, 1), (0, 1), (1, 0), (1, 2), (1, 1), (3, 1))   #            .  -Y .  .
+        return [cut(c, r, t, t) for c, r in pos]
+    if w * 4 == h * 3 and w >= 9:                       # vertical cross: +Y / -X +Z +X / -Y / -Z (turned)
+        t = w // 3
+        faces = [cut(2, 1, t, t), cut(0, 1, t, t), cut(1, 0, t, t), cut(1, 2, t, t), cut(1, 1, t, t), cut(1, 3, t, t, 180)]
+        return faces
+    if w == h * 6:                                      # strip: px nx py ny pz nz
+        return [cut(i, 0, h, h) for i in range(6)]
+    if h == w * 6:
+        return [cut(0, i, w, w) for i in range(6)]
     return None
 
 
@@ -420,8 +580,20 @@ class MapDoc:
 # Compile (checks the map, fixes spawn points, writes the game file)
 # --------------------------------------------------------------------------
 def hull_hits(boxes, x, y, zc):
-    """True if the player hull centred at (x, y, zc) overlaps a box (strict, like the game)."""
+    """True if the player hull centred at (x, y, zc) overlaps a box (strict, like the game).
+    A box is [x0,y0,z0,x1,y1,z1] or (that list, yaw degrees) for a spun one."""
     for b in boxes:
+        if isinstance(b, tuple):
+            b, yaw = b
+            c, s = yaw_cs(yaw)
+            cx, cy = (b[0] + b[3]) / 2, (b[1] + b[4]) / 2
+            dx, dy = x - cx, y - cy
+            x, y = cx + dx * c + dy * s, cy - dx * s + dy * c      # point in the box's own frame
+            if (b[0] - HULL_R < x < b[3] + HULL_R and b[1] - HULL_R < y < b[4] + HULL_R
+                    and b[2] - HULL_H / 2 < zc < b[5] + HULL_H / 2):
+                return True
+            x, y = cx + dx, cy + dy
+            continue
         if (b[0] - HULL_R < x < b[3] + HULL_R and b[1] - HULL_R < y < b[4] + HULL_R
                 and b[2] - HULL_H / 2 < zc < b[5] + HULL_H / 2):
             return True
@@ -440,21 +612,19 @@ def compile_doc(doc, out_path):
     """Returns (summary lines, warnings). Writes out_path."""
     msgs, warns = [], []
     boxes, seen, dropped, dups = [], set(), 0, 0
-    flat, spun, spun_out = [], 0, 0
-    for src in doc.boxes:
-        if src.yaw % 360.0:
-            pieces = bake_box(src)           # the game only knows axis-aligned boxes
-            spun += 1
-            spun_out += len(pieces)
-            flat.extend(pieces)
-        else:
-            flat.append(src)
+    flat = []
+    for src in doc.boxes:                    # the game turns spun objects itself: keep their spin
+        nb = src.copy()
+        nb.yaw = src.yaw % 360.0
+        if nb.yaw < 1e-4 or nb.yaw > 360.0 - 1e-4:
+            nb.yaw = 0.0
+        flat.append(nb)
     for b in flat:
         c = tuple(round(v, 2) for v in b.b)
         if c[3] - c[0] < 1 or c[4] - c[1] < 1 or c[5] - c[2] < 1:
             dropped += 1
             continue
-        key = (c, b.t, b.tt, b.tile, b.col, tuple(b.f), b.k, b.d)
+        key = (c, b.t, b.tt, b.tile, b.col, tuple(b.f), b.k, b.d, round(b.yaw, 3))
         if key in seen:
             dups += 1
             continue
@@ -466,21 +636,29 @@ def compile_doc(doc, out_path):
         warns.append("removed %d empty box(es)" % dropped)
     if dups:
         warns.append("removed %d duplicate box(es)" % dups)
-    if spun:
-        warns.append("%d spun object(s) became %d plain boxes" % (spun, spun_out))
     if not boxes:
         raise ValueError("The map is empty. Build something first.")
-    bl = [b.b for b in boxes]
+    def _aabb(b):                            # box that holds a spun box (for bounds / centre)
+        x0, y0, z0, x1, y1, z1 = b.b
+        if not b.yaw:
+            return [x0, y0, z0, x1, y1, z1]
+        c, s = yaw_cs(b.yaw)
+        hx, hy = (x1 - x0) / 2, (y1 - y0) / 2
+        ex, ey = abs(hx * c) + abs(hy * s), abs(hx * s) + abs(hy * c)
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        return [cx - ex, cy - ey, z0, cx + ex, cy + ey, z1]
+    bl = [_aabb(b) for b in boxes]
+    hl = [(b.b, b.yaw) if b.yaw else b.b for b in boxes]      # for the spawn checks
 
     spawns = []
     for s in doc.spawns:
-        if standing_ok(bl, s.x, s.y, s.z):
+        if standing_ok(hl, s.x, s.y, s.z):
             spawns.append(s.copy())
         else:
             warns.append("a %s spawn at (%d, %d, %d) is inside a wall or floating: dropped" % (TEAM_NAMES[s.team], s.x, s.y, s.z))
     # a team without spawn points gets some automatically
     cands = []
-    for b in [x.b for x in boxes if x.k != 1]:
+    for b in [x.b for x in boxes if x.k != 1 and not x.yaw]:
         if b[3] - b[0] < 96 or b[4] - b[1] < 96:
             continue
         z = b[5]
@@ -488,7 +666,7 @@ def compile_doc(doc, out_path):
         while x <= b[3] - 47:
             y = b[1] + 48
             while y <= b[4] - 47:
-                if standing_ok(bl, x, y, z):
+                if standing_ok(hl, x, y, z):
                     cands.append((x, y, z))
                 y += 64
             x += 64
@@ -804,7 +982,7 @@ def ask_save(default, ext, title="Save as"):
     return r or None
 
 
-IMG_KINDS = [("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tga *.webp")]
+IMG_KINDS = [("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tga *.webp *.vtf")]
 
 
 # --------------------------------------------------------------------------
@@ -975,6 +1153,8 @@ class App:
         return self.cur_tex
 
     def set_sky(self, path):
+        if self.try_cube_image(path):                     # a cross / strip picture is a cubemap, not a panorama
+            return
         try:
             surf = load_image(path, 2048)
         except Exception as ex:
@@ -1003,6 +1183,29 @@ class App:
         self.cube_gid = None
         self.cube_dirty = True
 
+    def try_cube_image(self, path):
+        """If the image is one picture with all 6 faces (cross / strip): use it as the cubemap. True if it was."""
+        try:
+            surf = load_image(path, 8192)
+        except Exception:
+            return False
+        parts = split_cube_image(surf)
+        if parts is None:
+            return False
+        if self.doc.sky is not None:
+            if self.doc.sky.gid:
+                gl.glDeleteTextures([self.doc.sky.gid])
+            self.doc.sky = None
+        name = Path(path).stem
+        for i, p in enumerate(parts):
+            if p.get_width() > 1024:
+                p = pygame.transform.smoothscale(p, (1024, 1024))
+            self.doc.cube[i] = Tex("%s_%s" % (name, CUBE_FACES[i]), p)
+        self.reset_cube_gl()
+        self.doc.dirty = True
+        self.msg("Cubemap skybox ready (cut from one image)", 6)
+        return True
+
     def set_cube_face(self, i, path):
         try:
             surf = load_image(path, 1024)
@@ -1029,6 +1232,8 @@ class App:
         if not paths:
             if _tk_dialog(lambda fd: True) is None:
                 self.msg("No file dialog here: drop the face images onto the sky instead.")
+            return
+        if len(paths) == 1 and self.try_cube_image(paths[0]):
             return
         named = [(face_index(p), p) for p in paths]
         if len(paths) == 6 and (any(i is None for i, _ in named) or len({i for i, _ in named}) < 6):
@@ -1608,6 +1813,8 @@ class App:
                 fi = face_index(p)
                 hit = self.pick_all(pos, False)[0] if self.in_view(pos) else None
                 on_sky = self.in_view(pos) and (hit is None or hit[1] == "ground")
+                if (on_sky or (pos[0] < LW and not self.in_view(pos))) and self.try_cube_image(p):
+                    return                                  # one picture with all 6 faces
                 if fi is not None and (on_sky or (pos[0] < LW and not self.in_view(pos))):
                     self.set_cube_face(fi, p)        # a cubemap face (px nx py ny pz nz)
                     return
