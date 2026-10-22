@@ -13,13 +13,17 @@ Controls
   Camera   hold RIGHT mouse + mouse = look      W A S D = move     Q / E = down / up
            Shift = fast       mouse wheel = camera speed
   Tools    V select    B box    1 spawn BLACK team    2 spawn YELLOW team
+           7 ladder (click a vertical wall face)
   Box      click + drag on the floor (or on top of another box) = draw the footprint.
            It gets the current Height. Mouse wheel while dragging changes the height.
   Slope    press 3, press R (or T) to pick the uphill direction, then drag the footprint like a box.
            Height = how high the top end is.  A real smooth slope.
   Circle   press 4, click the CENTER and drag outward = radius.  Height works like a box.
            A real smooth cylinder.  Select / move / resize / texture them like boxes.
-  Select   click a box / spawn.   Drag it to move it.
+  Ladder   press 7, click a vertical face of a box. Invisible climb volume (Hammer func_ladder):
+           only shown as a green tool box in the editor. Full face height, half-width 22.
+           Select + arrows / PageUp/Down / Shift+arrows (width). Del removes. F5 compiles it.
+  Select   click a box / spawn / ladder.   Drag it to move it.
            Arrows = move    PageUp / PageDown = up / down
            Shift + Up/Down = longer / shorter      Shift + Left/Right = narrower / wider
            Shift + PageUp/PageDown = taller / shorter
@@ -96,8 +100,10 @@ DEFAULT_COL = (176, 160, 144)
 HULL_R, HULL_H = 16.0, 72.0          # player: 32 wide, 72 tall (same as the game)
 SELECT, BOX, SPAWN0, SPAWN1, RAMP, CIRC, ROT = "select", "box", "spawn0", "spawn1", "ramp", "circle", "rotate"
 STRETCH = "stretch"
+LADDER = "ladder"
 TURN_SNAPS = (5, 15, 30, 45, 90)     # degrees, for the spin / turn tool
 RAMP_DIRS = ("+X", "+Y", "-X", "-Y")
+DEFAULT_LADDER_HW = 22.0             # half-width (same as the built-in arena ladders)
 
 
 def gen_ramp(x0, y0, x1, y1, z, h, d):
@@ -173,6 +179,27 @@ class Spawn:
 
     def copy(self):
         return Spawn(self.team, self.x, self.y, self.z, self.yaw)
+
+
+class Ladder:
+    """Climbable ladder on a vertical wall face.
+    Stored as (face_x, face_y, normal_x, normal_y, half_width, bottom_z, top_z) — same as the game."""
+    __slots__ = ("fx", "fy", "nx", "ny", "hw", "z0", "z1")
+
+    def __init__(self, fx, fy, nx, ny, hw, z0, z1):
+        self.fx, self.fy = float(fx), float(fy)
+        self.nx, self.ny = float(nx), float(ny)
+        # keep normal unit length on the XY plane
+        ln = math.hypot(self.nx, self.ny) or 1.0
+        self.nx, self.ny = self.nx / ln, self.ny / ln
+        self.hw = float(max(4.0, hw))
+        self.z0, self.z1 = float(min(z0, z1)), float(max(z0, z1))
+
+    def copy(self):
+        return Ladder(self.fx, self.fy, self.nx, self.ny, self.hw, self.z0, self.z1)
+
+    def as_tuple(self):
+        return (self.fx, self.fy, self.nx, self.ny, self.hw, self.z0, self.z1)
 
 
 class Tex:
@@ -517,6 +544,7 @@ class MapDoc:
         self.cube = [None] * 6            # sky as 6 faces (px nx py ny pz nz): Tex or None
         self.boxes = []
         self.spawns = []
+        self.ladders = []                 # list of Ladder
         self.tex = []
         self.sky = None
         self.path = None
@@ -526,13 +554,16 @@ class MapDoc:
     def new_default(self):
         self.boxes = [Box([-1024, -1024, -32, 1024, 1024, 0])]
         self.spawns = []
+        self.ladders = []
 
     def snap(self):
-        return ([b.copy() for b in self.boxes], [s.copy() for s in self.spawns])
+        return ([b.copy() for b in self.boxes], [s.copy() for s in self.spawns],
+                [L.copy() for L in self.ladders])
 
     def restore(self, s):
         self.boxes = [b.copy() for b in s[0]]
         self.spawns = [x.copy() for x in s[1]]
+        self.ladders = [L.copy() for L in (s[2] if len(s) > 2 else [])]
 
     def to_dict(self, compiled=False, cam=None, max_side=1024):
         boxes = self.boxes
@@ -547,6 +578,8 @@ class MapDoc:
                            **({"yaw": round(b.yaw, 3)} if b.yaw else {})) for b in boxes],
             "spawns": [[{"p": [round(s.x, 2), round(s.y, 2), round(s.z, 2)], "yaw": round(s.yaw, 1)}
                         for s in self.spawns if s.team == t] for t in (0, 1)],
+            "ladders": [[round(L.fx, 2), round(L.fy, 2), round(L.nx, 4), round(L.ny, 4),
+                         round(L.hw, 2), round(L.z0, 2), round(L.z1, 2)] for L in self.ladders],
         }
         if self.sky is not None:
             d["sky"] = encode_tex(self.sky, 2048)
@@ -569,6 +602,13 @@ class MapDoc:
             for s in lst:
                 p = s["p"]
                 self.spawns.append(Spawn(t, p[0], p[1], p[2], s.get("yaw", 0)))
+        self.ladders = []
+        for row in d.get("ladders", []) or []:
+            try:
+                if len(row) >= 7:
+                    self.ladders.append(Ladder(row[0], row[1], row[2], row[3], row[4], row[5], row[6]))
+            except Exception:
+                pass
         self.sky = decode_tex(d["sky"]) if d.get("sky") else None
         sc = d.get("skycube")
         self.cube = [decode_tex(x) for x in sc] if sc and len(sc) == 6 else [None] * 6
@@ -693,8 +733,16 @@ def compile_doc(doc, out_path):
             spawns.append(Spawn(team, p[0], p[1], p[2], yaw))
         warns.append("no %s spawn points were placed: added %d automatically" % (TEAM_NAMES[team], len(picked)))
 
+    # keep valid ladders (positive height, unit normal)
+    ladders = []
+    for L in doc.ladders:
+        if L.z1 - L.z0 < 8 or L.hw < 4:
+            warns.append("removed a tiny ladder at (%.0f, %.0f)" % (L.fx, L.fy))
+            continue
+        ladders.append(L.copy())
+
     tmp = MapDoc()
-    tmp.boxes, tmp.spawns, tmp.tex, tmp.name = boxes, spawns, doc.tex, doc.name
+    tmp.boxes, tmp.spawns, tmp.ladders, tmp.tex, tmp.name = boxes, spawns, ladders, doc.tex, doc.name
     tmp.sky = doc.sky
     if all(doc.cube):
         tmp.sky = Tex("sky_from_cubemap", cube_to_equirect(doc.cube))
@@ -704,8 +752,8 @@ def compile_doc(doc, out_path):
     raw = json.dumps(d, separators=(",", ":")).encode("utf-8")
     Path(out_path).write_bytes(raw)
     n0 = sum(1 for s in spawns if s.team == 0)
-    msgs.append("%d boxes, %d textures, spawns: %d BLACK / %d YELLOW, %.1f KB" % (
-        len(boxes), len(d["textures"]), n0, len(spawns) - n0, len(raw) / 1024.0))
+    msgs.append("%d boxes, %d textures, spawns: %d BLACK / %d YELLOW, %d ladders, %.1f KB" % (
+        len(boxes), len(d["textures"]), n0, len(spawns) - n0, len(ladders), len(raw) / 1024.0))
     return msgs, warns
 
 
@@ -1082,7 +1130,14 @@ class App:
         if not self.sel:
             return None
         kind, i = self.sel
-        lst = self.doc.boxes if kind == "box" else self.doc.spawns
+        if kind == "box":
+            lst = self.doc.boxes
+        elif kind == "spawn":
+            lst = self.doc.spawns
+        elif kind == "ladder":
+            lst = self.doc.ladders
+        else:
+            return None
         return lst[i] if 0 <= i < len(lst) else None
 
     # ----- camera / rays -----
@@ -1121,6 +1176,16 @@ class App:
                 h = ray_box(o, d, (s.x - 16, s.y - 16, s.z, s.x + 16, s.y + 16, s.z + HULL_H))
                 if h and (best is None or h[0] < best[0]):
                     best = (h[0], "spawn", i, h[1])
+            for i, L in enumerate(self.doc.ladders):
+                # thin volume in front of the ladder face (same zone the game uses to grab)
+                tx, ty = -L.ny, L.nx
+                # AABB around the ladder zone for a quick ray test
+                xs = [L.fx + L.nx * o_ + tx * lat for o_ in (0.5, 8.0) for lat in (-L.hw - 2, L.hw + 2)]
+                ys = [L.fy + L.ny * o_ + ty * lat for o_ in (0.5, 8.0) for lat in (-L.hw - 2, L.hw + 2)]
+                bb = (min(xs), min(ys), L.z0 - 2, max(xs), max(ys), L.z1 + 2)
+                h = ray_box(o, d, bb)
+                if h and (best is None or h[0] < best[0]):
+                    best = (h[0], "ladder", i, (L.nx, L.ny, 0.0))
         if d[2] < -1e-6 and o[2] > 0:
             t = -o[2] / d[2]
             if best is None or t < best[0]:
@@ -1566,6 +1631,28 @@ class App:
         dirs = {pygame.K_UP: "f+", pygame.K_DOWN: "f-", pygame.K_RIGHT: "r+", pygame.K_LEFT: "r-"}
         if key in dirs or key in (pygame.K_PAGEUP, pygame.K_PAGEDOWN):
             self.push_undo()
+            if self.sel[0] == "ladder":
+                if key in (pygame.K_PAGEUP, pygame.K_PAGEDOWN):
+                    s = g if key == pygame.K_PAGEUP else -g
+                    if shift:
+                        obj.z1 = max(obj.z0 + 16, obj.z1 + s)
+                    else:
+                        obj.z0 += s
+                        obj.z1 += s
+                else:
+                    code = dirs[key]
+                    fwd, right = self.nav_axes()
+                    ax, sg = (fwd if code[0] == "f" else right)
+                    s = sg * (g if code[1] == "+" else -g)
+                    if shift:
+                        obj.hw = max(4.0, obj.hw + (g if code[1] == "+" else -g))
+                    else:
+                        if ax == 0:
+                            obj.fx += s
+                        else:
+                            obj.fy += s
+                self.dirty_list = True
+                return True
             if key in (pygame.K_PAGEUP, pygame.K_PAGEDOWN):
                 s = g if key == pygame.K_PAGEUP else -g
                 if self.sel[0] == "spawn":
@@ -1612,7 +1699,12 @@ class App:
         if key == pygame.K_DELETE or key == pygame.K_BACKSPACE:
             self.push_undo()
             kind, i = self.sel
-            (self.doc.boxes if kind == "box" else self.doc.spawns).pop(i)
+            if kind == "box":
+                self.doc.boxes.pop(i)
+            elif kind == "spawn":
+                self.doc.spawns.pop(i)
+            elif kind == "ladder":
+                self.doc.ladders.pop(i)
             self.sel = None
             return True
         if key == pygame.K_r and self.sel[0] == "spawn":
@@ -1635,6 +1727,11 @@ class App:
             c.b[4] += g
             self.doc.boxes.append(c)
             self.sel = ("box", len(self.doc.boxes) - 1)
+        elif self.sel[0] == "ladder":
+            c.fx += g
+            c.fy += g
+            self.doc.ladders.append(c)
+            self.sel = ("ladder", len(self.doc.ladders) - 1)
         else:
             c.x += g
             c.y += g
@@ -1644,13 +1741,18 @@ class App:
     def copy_sel(self, cut=False):
         obj = self.sel_obj()
         if obj is None:
-            self.msg("Select a box or spawn first, then copy it")
+            self.msg("Select a box, spawn or ladder first, then copy it")
             return
         self.clip = (self.sel[0], obj.copy())
         if cut:
             self.push_undo()
             kind, i = self.sel
-            (self.doc.boxes if kind == "box" else self.doc.spawns).pop(i)
+            if kind == "box":
+                self.doc.boxes.pop(i)
+            elif kind == "spawn":
+                self.doc.spawns.pop(i)
+            elif kind == "ladder":
+                self.doc.ladders.pop(i)
             self.sel = None
             self.msg("Cut. Ctrl+V to paste it")
         else:
@@ -1689,6 +1791,10 @@ class App:
             self.doc.boxes.append(c)
             self.sel = ("box", len(self.doc.boxes) - 1)
             self.dirty_list = True
+        elif kind == "ladder":
+            c.fx, c.fy = c.fx + g, c.fy + g
+            self.doc.ladders.append(c)
+            self.sel = ("ladder", len(self.doc.ladders) - 1)
         else:
             gg = max(8, g)
             if spot:
@@ -1706,6 +1812,9 @@ class App:
         if self.sel[0] == "box":
             c = np.array([(obj.b[0] + obj.b[3]) / 2, (obj.b[1] + obj.b[4]) / 2, (obj.b[2] + obj.b[5]) / 2])
             r = max(obj.b[3] - obj.b[0], obj.b[4] - obj.b[1], obj.b[5] - obj.b[2], 100)
+        elif self.sel[0] == "ladder":
+            c = np.array([obj.fx + obj.nx * 20, obj.fy + obj.ny * 20, (obj.z0 + obj.z1) / 2])
+            r = max(obj.z1 - obj.z0, obj.hw * 2, 100)
         else:
             c = np.array([obj.x, obj.y, obj.z + 36])
             r = 120
@@ -1891,6 +2000,9 @@ class App:
             self.set_tool(ROT)
         elif k == pygame.K_6 or k == pygame.K_x:
             self.set_tool(STRETCH)
+        elif k == pygame.K_7:
+            self.set_tool(LADDER)
+            self.msg("Ladder: click a vertical wall face to place one", 5)
         elif k == pygame.K_u:
             self.cycle_turn_snap()
         elif k == pygame.K_COMMA or k == pygame.K_PERIOD:
@@ -1954,12 +2066,18 @@ class App:
             return
         if self.tool == SELECT:
             hit, o, d = self.pick_all(ev.pos)
-            if hit and hit[1] in ("box", "spawn"):
+            if hit and hit[1] in ("box", "spawn", "ladder"):
                 self.sel = (hit[1], hit[2])
                 p = o + d * hit[0]
                 obj = self.sel_obj()
+                if hit[1] == "box":
+                    orig = list(obj.b)
+                elif hit[1] == "spawn":
+                    orig = (obj.x, obj.y)
+                else:
+                    orig = (obj.fx, obj.fy, obj.z0, obj.z1)
                 self.drag = {"kind": "move", "z": float(p[2]), "start": self.plane_point(o, d, float(p[2])),
-                             "orig": list(obj.b) if hit[1] == "box" else (obj.x, obj.y), "pushed": False}
+                             "orig": orig, "pushed": False}
             else:
                 self.sel = None
         elif self.tool == ROT:
@@ -1993,6 +2111,43 @@ class App:
                 return
             g = self.grid
             self.drag = {"kind": "box", "tool": self.tool, "z": z, "a": (snap(p[0], g), snap(p[1], g)), "cur": (snap(p[0], g), snap(p[1], g))}
+        elif self.tool == LADDER:
+            hit, o, d = self.pick_all(ev.pos, False)
+            if not hit or hit[1] != "box":
+                self.msg("Click a vertical wall face of a box to place a ladder")
+                return
+            n = hit[3]
+            if abs(n[2]) > 0.5:
+                self.msg("Ladders go on vertical faces (sides), not top or bottom")
+                return
+            p = o + d * hit[0]
+            box = self.doc.boxes[hit[2]]
+            # world-space normal (spun boxes)
+            wn = rot_vec(box, n)
+            nx, ny = float(wn[0]), float(wn[1])
+            ln = math.hypot(nx, ny) or 1.0
+            nx, ny = nx / ln, ny / ln
+            # face plane: project click onto the box face, snap along the wall
+            g = self.grid
+            tx, ty = -ny, nx
+            lat = (p[0] - (box.b[0] + box.b[3]) / 2) * tx + (p[1] - (box.b[1] + box.b[4]) / 2) * ty
+            # face centre in XY
+            if abs(n[0]) > 0.5:
+                fx = box.b[3] if n[0] > 0 else box.b[0]
+                fy = snap(p[1], g)
+                fx, fy, _ = rot_point(box, (fx, fy, 0.0))
+            else:
+                fx = snap(p[0], g)
+                fy = box.b[4] if n[1] > 0 else box.b[1]
+                fx, fy, _ = rot_point(box, (fx, fy, 0.0))
+            z0, z1 = box.b[2], box.b[5]
+            if z1 - z0 < 16:
+                self.msg("That wall is too short for a ladder")
+                return
+            self.push_undo()
+            self.doc.ladders.append(Ladder(fx, fy, nx, ny, DEFAULT_LADDER_HW, z0, z1))
+            self.sel = ("ladder", len(self.doc.ladders) - 1)
+            self.msg("Ladder placed (%d high). Select + arrows / PageUp to adjust." % int(z1 - z0), 5)
         else:
             hit, o, d = self.pick_all(ev.pos, False)
             if hit and hit[1] in ("box", "ground") and hit[3] == (0, 0, 1):
@@ -2119,7 +2274,12 @@ class App:
                 return
             if not dr["pushed"] and (dx or dy):
                 # the object is still in its original place: remember it for undo
-                cur = list(obj.b) if self.sel[0] == "box" else (obj.x, obj.y)
+                if self.sel[0] == "box":
+                    cur = list(obj.b)
+                elif self.sel[0] == "ladder":
+                    cur = (obj.fx, obj.fy, obj.z0, obj.z1)
+                else:
+                    cur = (obj.x, obj.y)
                 self.restore_obj(obj, dr["orig"])
                 self.push_undo()
                 self.restore_obj(obj, cur)
@@ -2128,6 +2288,8 @@ class App:
                 o0 = dr["orig"]
                 if self.sel[0] == "box":
                     obj.b = [o0[0] + dx, o0[1] + dy, o0[2], o0[3] + dx, o0[4] + dy, o0[5]]
+                elif self.sel[0] == "ladder":
+                    obj.fx, obj.fy = o0[0] + dx, o0[1] + dy
                 else:
                     obj.x, obj.y = o0[0] + dx, o0[1] + dy
                 self.dirty_list = True
@@ -2135,6 +2297,8 @@ class App:
     def restore_obj(self, obj, v):
         if self.sel[0] == "box":
             obj.b = list(v)
+        elif self.sel[0] == "ladder":
+            obj.fx, obj.fy, obj.z0, obj.z1 = v[0], v[1], v[2], v[3]
         else:
             obj.x, obj.y = v
 
@@ -2165,7 +2329,7 @@ class App:
         if not self.look and not self.drag and self.in_view(self.mouse):
             hit, o, d = self.pick_all(self.mouse, self.tool in (SELECT, ROT))
             if self.tool in (SELECT, ROT, STRETCH):
-                if hit and hit[1] in ("box", "spawn"):
+                if hit and hit[1] in ("box", "spawn", "ladder"):
                     self.hover = (hit[1], hit[2])
                 if self.tool == ROT:
                     self.gz_hover = self.gizmo_hit(self.mouse) is not None
@@ -2366,6 +2530,38 @@ class App:
             gl.glVertex3f(ex + math.cos(yaw + a) * 14, ey + math.sin(yaw + a) * 14, cz)
         gl.glEnd()
 
+    def draw_ladder(self, L, selected=False, hover=False):
+        """Editor-only: translucent climb volume (Hammer func_ladder style). Invisible in-game."""
+        fx, fy, nx, ny, hw, zb, zt = L.as_tuple()
+        tx, ty = -ny, nx
+        # thin slab in front of the wall = the climb zone the game uses
+        o0, o1 = 0.5, 20.0
+        xs = [fx + nx * o + tx * lat for o in (o0, o1) for lat in (-hw, hw)]
+        ys = [fy + ny * o + ty * lat for o in (o0, o1) for lat in (-hw, hw)]
+        b = (min(xs), min(ys), zb, max(xs), max(ys), zt)
+        gl.glDisable(gl.GL_TEXTURE_2D)
+        gl.glDepthMask(gl.GL_FALSE)
+        a = 0.45 if selected else (0.32 if hover else 0.22)
+        gl.glColor4f(0.2, 0.85, 0.45, a)          # green tool volume
+        gl.glBegin(gl.GL_QUADS)
+        for f in box_faces(b):
+            for p in f[:4]:
+                gl.glVertex3f(*p)
+        gl.glEnd()
+        gl.glDepthMask(gl.GL_TRUE)
+        col = (1.0, 0.85, 0.1, 1.0) if selected else ((0.5, 1.0, 0.6, 0.95) if hover else (0.25, 0.9, 0.5, 0.7))
+        self.wire_box(b, col, 2.5 if selected else 1.4, 0)
+        # normal arrow so you see which way the wall faces
+        mx = (b[0] + b[3]) / 2
+        my = (b[1] + b[4]) / 2
+        mz = (zb + zt) / 2
+        gl.glLineWidth(2.5)
+        gl.glColor4f(1.0, 0.9, 0.2, 0.95)
+        gl.glBegin(gl.GL_LINES)
+        gl.glVertex3f(mx, my, mz)
+        gl.glVertex3f(mx + nx * 28, my + ny * 28, mz)
+        gl.glEnd()
+
     def draw_gizmo(self):
         """Hammer-style spin handle: a ring with tick marks, turn arrows and a big arrow showing the facing."""
         gi = self.gizmo_info()
@@ -2459,6 +2655,9 @@ class App:
         gl.glDisable(gl.GL_TEXTURE_2D)
         for i, s in enumerate(self.doc.spawns):
             self.draw_spawn(s, self.sel == ("spawn", i))
+        for i, L in enumerate(self.doc.ladders):
+            self.draw_ladder(L, self.sel == ("ladder", i),
+                             self.hover == ("ladder", i))
         if self.hover and self.hover[0] == "box":
             hb = self.doc.boxes[self.hover[1]]
             self.wire_box(hb.b, (1, 1, 1, 0.8), 2.0, 0.4, hb.yaw)
@@ -2639,6 +2838,7 @@ class App:
         for tool, label in ((SELECT, "Select / move  (V)"), (BOX, "Build box  (B)"),
                             (RAMP, "Build slope  (3)"), (CIRC, "Build circle  (4)"),
                             (ROT, "Spin / turn  (5)"), (STRETCH, "Stretch  (6)"),
+                            (LADDER, "Build ladder  (7)"),
                             (SPAWN0, "Spawn BLACK  (1)"), (SPAWN1, "Spawn YELLOW  (2)")):
             self.button(x, y, LW - 24, 28, label, lambda t=tool: self.set_tool(t), self.tool == tool)
             if tool in (SPAWN0, SPAWN1):
@@ -2739,6 +2939,13 @@ class App:
             self.text("tile   %d     turn  %d deg" % (obj.tile, round(obj.yaw)), rx, py + 98, 12, (190, 198, 210))
             self.text("Drop / drag an image on a face", rx, py + 120, 11, (120, 128, 140))
             self.text("= texture just that face", rx, py + 135, 11, (120, 128, 140))
+        elif self.sel[0] == "ladder":
+            self.text("Ladder %d" % (self.sel[1] + 1), rx, py, 14, (255, 255, 255))
+            self.text("at    %d, %d" % (obj.fx, obj.fy), rx, py + 22, 13)
+            self.text("height %d   width %d" % (int(obj.z1 - obj.z0), int(obj.hw * 2)), rx, py + 40, 13)
+            self.text("z     %d .. %d" % (int(obj.z0), int(obj.z1)), rx, py + 58, 13)
+            self.text("arrows move, Shift+arrows width", rx, py + 80, 11, (120, 128, 140))
+            self.text("PageUp/Down height, Del remove", rx, py + 96, 11, (120, 128, 140))
         else:
             self.text("%s spawn" % TEAM_NAMES[obj.team], rx, py, 14, (*[int(c * 255) for c in TEAM_COL[obj.team]],))
             self.text("at  %d, %d, %d" % (obj.x, obj.y, obj.z), rx, py + 22, 13)
@@ -2747,8 +2954,8 @@ class App:
         # ---- status bar ----
         n0 = sum(1 for s in self.doc.spawns if s.team == 0)
         n1 = len(self.doc.spawns) - n0
-        info = "%d boxes   spawns: %d black / %d yellow   grid %d   %s" % (
-            len(self.doc.boxes), n0, n1, self.grid, {SELECT: "select", BOX: "build box", RAMP: "build slope", CIRC: "build circle", ROT: "spin / turn", STRETCH: "stretch", SPAWN0: "spawn black", SPAWN1: "spawn yellow"}[self.tool])
+        info = "%d boxes   spawns: %d black / %d yellow   %d ladders   grid %d   %s" % (
+            len(self.doc.boxes), n0, n1, len(self.doc.ladders), self.grid, {SELECT: "select", BOX: "build box", RAMP: "build slope", CIRC: "build circle", ROT: "spin / turn", STRETCH: "stretch", LADDER: "build ladder", SPAWN0: "spawn black", SPAWN1: "spawn yellow"}[self.tool])
         if self.tool == RAMP:
             info += "   uphill %s (R = turn it)" % RAMP_DIRS[self.ramp_dir]
         elif self.tool == ROT:

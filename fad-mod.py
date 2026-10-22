@@ -130,12 +130,22 @@ BIND_META = [
     ("console", "Developer console"),
 ]
 BASE_SENS = 0.0022
+MENU_CONTENT_SCALE = 0.75   # menu pages (everything right of the side menu) are drawn at this fraction of their old size; the side menu keeps its size. 1.0 = old size
 STEP_H = 18  # max step / slope rise per move
 MAXV = 3500.0  # max speed (surfing can get fast)
 SURF_NZ = 0.7  # surfaces steeper than this (normal.z below it) cannot be walked on - you slide / surf on them
 BOT_NAMES = ["Rick", "Sun", "Moon", "Ace", "Blaze", "Nova", "Jinx", "Echo", "Rex", "Luna",
              "Max", "Zed", "Kai", "Axel", "Milo", "Ziggy", "Storm", "Bolt", "Pixel", "Fang"]
 VM_NEAR, VM_FAR = 0.1, 1000.0  # viewmodel clip planes
+LADDER_SPEED = 200.0     # climb speed on a ladder (CS:GO = 200)
+LADDER_SIDE = 100.0      # sideways speed on a ladder
+LADDER_JUMP = 180.0      # push away from the ladder when you jump off
+LADDER_LOOK_DOWN = -0.35 # looking down more than this (radians) + forward = climb DOWN
+LADDER_FAST = True       # CS:GO-style fast ladder: climb speed comes from your VIEW direction (pitch + yaw) and your W/A/S/D combo.
+                         # Look up + hold W = faster; look ~45 deg off the ladder + W+A / W+D = the classic fast-ladder boost (up to ~1.41x).
+                         # False = the old fixed-speed climb
+LADDER_MAX_SPEED = 283.0 # hard cap on climb speed (200 * sqrt(2), what W+strafe reaches in CS:GO)
+LADDER_LATERAL = 0.5     # how much of the sideways slide along the ladder you keep (1.0 = full CS:GO drift, lower = easier to stay on the ladder)
 
 SKIP_TEX = re.compile(r"^(sky|aaatrigger|clip|null|origin|hint|skip|trigger|bevel|noclip|black_hidden)")
 
@@ -251,7 +261,7 @@ def default_cfg():
             # semi-auto pistol: slow fire. `head_dmg` = damage of a hit in the head (kills in one shot);
             # body hits do `dmg` = 25, so 4 body shots kill a 100 hp target
             Wpn(n="Pistol", cls="Pistol", dmg=25, head_dmg=1000, rpm=130, mag=5, spr=.004, auto=0, recoil=.07,
-                match=r"pistol|glock|usp|p228|p250|fiveseven|five-seven|deagle|elite|tec9|revolver"),
+                match=r"pistol|glock|usp|p228|p250|fiveseven|five-seven|deagle|desert_?eagle|magnum|elite|tec9|revolver"),
         ],
         "bots": 2,
         "frags": 30,
@@ -506,6 +516,7 @@ PROBES = _fib_dirs(48)
 
 class World:
     feet_offset = 36
+    ladders = ()   # (face_x, face_y, normal_x, normal_y, half_width, bottom_z, top_z)
 
     def draw_sky(self, x, y, z):
         pass
@@ -543,6 +554,18 @@ class ArenaWorld(World):
          [-500, -100, 0, -400, 0, 100], [400, 0, 0, 500, 100, 100],
          [-250, 150, 0, -150, 250, 100], [150, -250, 0, 250, -150, 100],
          [-60, -60, 0, 60, 60, 160]]
+
+    # test ladders: (face_x, face_y, normal_x, normal_y, half_width, bottom_z, top_z)
+    # the normal points away from the wall, into the open space
+    ladders = [
+        (0, -60, 0, -1, 22, 0, 160),        # middle block, south side
+        (-250, 200, -1, 0, 22, 0, 100),     # block, west side
+        (400, 50, -1, 0, 22, 0, 100),       # block, west side
+        (200, -150, 0, 1, 22, 0, 100),      # block, north side
+        (-400, -50, 1, 0, 22, 0, 100),      # block, east side
+        (-1000, 0, 1, 0, 22, 0, 400),       # tall: outer wall (long climb)
+        (1000, 0, -1, 0, 22, 0, 400),       # tall: outer wall (long climb)
+    ]
 
     def __init__(self):
         B = self.B
@@ -611,7 +634,45 @@ class ArenaWorld(World):
                     gl.glTexCoord2f(u, v)
                     gl.glVertex3f(*p)
             gl.glEnd()
+        self._build_ladders()
+        gl.glEnable(gl.GL_TEXTURE_2D)
         gl.glEndList()
+
+    @staticmethod
+    def _solid_box(x0, y0, z0, x1, y1, z1):
+        gl.glBegin(gl.GL_QUADS)
+        for f in (((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)),
+                  ((x0, y1, z0), (x1, y1, z0), (x1, y0, z0), (x0, y0, z0)),
+                  ((x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)),
+                  ((x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1)),
+                  ((x0, y1, z0), (x0, y0, z0), (x0, y0, z1), (x0, y1, z1)),
+                  ((x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1))):
+            for p in f:
+                gl.glVertex3f(*p)
+        gl.glEnd()
+
+    def _build_ladders(self):
+        """Draw every ladder: two rails + rungs, a few units off the wall."""
+        gl.glDisable(gl.GL_TEXTURE_2D)
+
+        def obox(L, l0, l1, o0, o1, z0, z1):
+            fx, fy, nx, ny, hw, _a, _b = L
+            tx, ty = -ny, nx
+            xa, ya = fx + tx * l0 + nx * o0, fy + ty * l0 + ny * o0
+            xb, yb = fx + tx * l1 + nx * o1, fy + ty * l1 + ny * o1
+            self._solid_box(min(xa, xb), min(ya, yb), z0, max(xa, xb), max(ya, yb), z1)
+
+        for L in self.ladders:
+            hw, zb, zt = L[4], L[5], L[6]
+            gl.glColor3f(0.45, 0.30, 0.15)          # wood rails
+            obox(L, -hw, -hw + 4, 0.5, 4.5, zb, zt + 8)
+            obox(L, hw - 4, hw, 0.5, 4.5, zb, zt + 8)
+            gl.glColor3f(0.62, 0.62, 0.66)          # metal rungs
+            z = zb + 10
+            while z < zt:
+                obox(L, -hw + 4, hw - 4, 0.5, 3.5, z, z + 3)
+                z += 14
+        gl.glColor3f(1, 1, 1)
 
     def draw(self):
         if self._list is None:
@@ -672,6 +733,18 @@ class FadMapWorld(World):
             if not self.spawns[team]:
                 top = max(self.B, key=lambda b: (b[3] - b[0]) * (b[4] - b[1]))
                 self.spawns[team].append([(top[0] + top[3]) / 2, (top[1] + top[4]) / 2, top[5] + 36.5, 0.0])
+        # ladders from the map builder: (fx, fy, nx, ny, half_width, bottom_z, top_z)
+        self.ladders = []
+        for row in d.get("ladders", []) or []:
+            try:
+                if len(row) >= 7:
+                    fx, fy, nx, ny, hw, z0, z1 = (float(x) for x in row[:7])
+                    ln = math.hypot(nx, ny) or 1.0
+                    nx, ny = nx / ln, ny / ln
+                    if z1 - z0 >= 8 and hw >= 4:
+                        self.ladders.append((fx, fy, nx, ny, hw, min(z0, z1), max(z0, z1)))
+            except Exception:
+                pass
         vz = d.get("void_z")
         self.void_z = float(vz) if vz is not None else min(b[2] for b in self.B) - 800.0
         # textures: decode now (pygame surfaces), upload to the GPU on first draw
@@ -978,6 +1051,7 @@ class FadMapWorld(World):
                     gl.glTexCoord2f(u, v)
                     gl.glVertex3f(*pt)
                 gl.glEnd()
+        # ladders are invisible climb volumes (Hammer func_ladder style) — no mesh drawn
         gl.glEndList()
 
     def _poly(self, ti, col, pts, sh, uv):
@@ -1366,6 +1440,7 @@ HEAD_MIN_R, HEAD_MAX_R = 4.5, 9.0   # head box half-width limits (units, before 
 HIT_HALF_H_LOW = 17.0 # half-height while sliding / crouching (was 21)
 BLAST_AIM_MIX = 0.75      # shotgun jump: 1.0 = launch exactly opposite your aim, 0.0 = old surface-position based direction
 BLAST_FLAT_BOOST = 0.5    # shotgun jump: extra sideways/forward push when you shoot at a shallow angle (0 = none)
+VM_EVENT_GAIN = 0.55          # volume of the weapon animation-event sounds (reload / pull-out / bolt ...)
 SHOTGUN_RELOAD_SCALE = 0.75   # shotgun reload time as a fraction of the AWP reload (1.0 = same as AWP, lower = faster)
 PLAYER_SCALE = 0.85   # visual + hitbox size of other players (1.0 = original); lower = smaller
 
@@ -3387,6 +3462,9 @@ def src_scan(arch):
         # L4D2 world models live under w_models/ — never use them as viewmodels
         if "/w_models/" in low or re.match(r"^w_", b) or re.match(r"^p_", b):
             continue
+        # decompile / source-asset copies (not loadable game models)
+        if re.search(r"(^|/)(source files|decompiled[^/]*|sources?)/", low):
+            continue
         if re.search(r"display|dropped|arms|sleeve|glove|hands|_zoom|_scope|ragdoll", low):
             continue
         # view-model naming: v_*.mdl (any folder)
@@ -3586,7 +3664,8 @@ class Broker:
             j = json.loads(msg.payload.decode("utf-8", "ignore")) if msg.payload else None
         except ValueError:
             return
-        self.q.put((msg.topic, j))
+        # retain=True: this is the broker's stored copy (delivered on subscribe), not a live announce
+        self.q.put((msg.topic, j, bool(getattr(msg, "retain", False))))
 
     def _live(self):
         return [self.clis[h] for h in list(self.okh) if h in self.clis]
@@ -3613,23 +3692,34 @@ class Broker:
         if not live:
             return False
         payload = b"" if obj is None else json.dumps(obj, separators=(",", ":"))
+        deleting = (obj is None and retain)
         sent = False
         infos = []
         for c in live:
             try:
-                infos.append(c.publish(topic, payload, qos=0, retain=retain))
+                # A retained delete must be confirmed by the broker (QoS 1), otherwise a broker
+                # that momentarily misses it keeps the closed room stored forever.
+                infos.append(c.publish(topic, payload, qos=1 if deleting else 0, retain=retain))
                 sent = True
             except Exception:
                 pass
-        if obj is None and retain:
-            # a room-closed delete must really leave the machine before we disconnect,
-            # otherwise the dead room stays on the broker and shows up for everyone
-            t_end = time.time() + 0.6
+        if deleting:
+            # Wait for every PUBACK, then say it a couple more times: any broker that was
+            # reconnecting when we first sent the delete would otherwise still show the room.
+            deadline = time.time() + 0.4
             for inf in infos:
                 try:
-                    inf.wait_for_publish(timeout=max(0.05, t_end - time.time()))
+                    inf.wait_for_publish(timeout=max(0.05, deadline - time.time()))
                 except Exception:
                     pass
+            time.sleep(0.05)
+            for _ in range(2):
+                for c in self._live():
+                    try:
+                        c.publish(topic, b"", qos=1, retain=True)
+                    except Exception:
+                        pass
+                time.sleep(0.08)
         return sent
 
     def pub_raw(self, topic, payload):
@@ -3784,6 +3874,7 @@ class Net:
     def __init__(self):
         self.mux = _Mux(self)
         self._rts = {}            # room id -> last announce timestamp seen (stale-room filter)
+        self._dead = {}           # room id -> wall-clock time we saw the host close it (ignore late copies)
         self.relayed = False      # joiner: this connection runs through the broker relay
         self._rly_n = 0
         self._rly_seen = set()
@@ -3905,7 +3996,7 @@ class Net:
                         pass
         for k in [k for k, r in self.lan_rooms.items() if now - r["seen"] > 4.0]:
             del self.lan_rooms[k]
-        for k in [k for k, r in self.net_rooms.items() if now - r["seen"] > 15.0]:
+        for k in [k for k, r in self.net_rooms.items() if now - r["seen"] > 7.0]:    # ~3 missed announces = gone
             del self.net_rooms[k]
         if len(self._rts) > 200:
             self._rts.clear()
@@ -3915,7 +4006,7 @@ class Net:
         b = self.broker
         for _ in range(200):
             try:
-                topic, j = b.q.get_nowait()
+                topic, j, retained = b.q.get_nowait()
             except queue.Empty:
                 break
             parts = topic.split("/")
@@ -3926,22 +4017,39 @@ class Net:
                 continue
             kind, rid = parts[1], parts[2]
             if kind == "rooms":
-                if j is None:
+                if j is None:                     # the host closed the room
                     self.net_rooms.pop(rid, None)
                     self._rts.pop(rid, None)
+                    self._dead[rid] = now
+                    if len(self._dead) > 200:
+                        self._dead.clear()
                     continue
                 if not isinstance(j, dict) or j.get("g") != NET_MAGIC or rid == self.rid:
                     continue
+                # A room we closed ourselves must never come back, whatever a broker still stores.
+                dead_at = self._dead.get(rid)
+                if dead_at is not None:
+                    if now - dead_at < 300.0:
+                        continue
+                    self._dead.pop(rid, None)
                 try:
                     ts = float(j.get("ts", 0))
-                    if abs(time.time() - ts) > 120:
-                        # Looks old: either a leftover of a closed room, or the host's PC clock
-                        # is off. A live host re-announces every few seconds with a new ts,
-                        # a dead room never does - so only show it once its ts changes.
-                        if self._rts.get(rid) is None or self._rts[rid] == ts:
-                            self._rts[rid] = ts
-                            continue
-                    self._rts[rid] = ts
+                except (TypeError, ValueError):
+                    continue
+                age = abs(time.time() - ts)
+                # A retained message is only the broker's stored copy of the last announcement.
+                # The host re-announces every 2 s, so an old retained copy means the host is gone.
+                if retained and age > 15.0:
+                    continue
+                if (not retained) and age > 15.0:
+                    # Looks old: either a leftover of a closed room, or the host's PC clock
+                    # is off. A live host re-announces every few seconds with a new ts,
+                    # a dead room never does - so only show it once its ts changes.
+                    if self._rts.get(rid) in (None, ts):
+                        self._rts[rid] = ts
+                        continue
+                self._rts[rid] = ts
+                try:
                     pub = j["pub"]
                     lan = j.get("lan")
                     self.net_rooms[rid] = {
@@ -4235,6 +4343,11 @@ class Net:
             self.broker.unsub(t)
         self._rly_topics = []
         if self.mode == "host" and self.rid:
+            # kill the retained announcement, and remember the room locally so a stored copy on
+            # any broker that missed the delete can never bring the closed room back
+            self._dead[self.rid] = time.time()
+            self.net_rooms.pop(self.rid, None)
+            self._rts.pop(self.rid, None)
             self.broker.pub("%s/rooms/%s" % (BROKER_ROOT, self.rid), None, retain=True)
             self.broker.unsub("%s/sig/%s" % (BROKER_ROOT, self.rid))
         for c in list(self.peers.values()):
@@ -4328,7 +4441,7 @@ class Net:
         return msgs
 
     def _poll_host(self, now, msgs):
-        if self.pub and now - self.t_ann >= (2.0 if self.punch or self.pending else 5.0):
+        if self.pub and now - self.t_ann >= 2.0:          # re-announce every 2s so a dead room is noticed fast
             self._announce(now)
         if not self.pub and not self.pub_warned and now - self.host_t0 > 6.0:
             self.pub_warned = True
@@ -4589,6 +4702,9 @@ class Ent:
         self.kills = 0
         self.deaths = 0
         self.walk = False  # standing on walkable ground
+        self.lad = None     # ladder we are holding (None = not on a ladder)
+        self.lcd = 0.0      # cooldown before we can grab a ladder again
+        self.onlad = False
         self.steep = False  # touching a too-steep slope (you just slide down it)
         self.shootT = 0.0
         self.reloadT = 0.0
@@ -5560,9 +5676,9 @@ class Game:
         e.steep = False
         if walk:
             e.jc_used = 0.0          # touched ground: jump-crouch lift is available again
-            if e.vz < 0:
+            if e.vz < 0 and not e.onlad:
                 e.vz = 0.0
-        else:
+        elif not e.onlad:
             e.vz -= 800 * dt
         ov = (e.vx, e.vy, e.vz)
         sp = math.sqrt(ov[0] * ov[0] + ov[1] * ov[1] + ov[2] * ov[2])
@@ -5703,8 +5819,91 @@ class Game:
         else:   # air control also while surfing a steep ramp (strafe keys steer you along it, like CS:GO)
             self.accel(e, wx, wy, MAXS, AIRACC, dt, AIRCAP)
 
+    # ----- ladders (CS:GO style) -----
+    def find_ladder(self, e):
+        """Ladder whose zone we stand in (a thin slab in front of the ladder), else None."""
+        lads = getattr(self.world, "ladders", None)
+        if not lads:
+            return None
+        feet = e.z - self.world.feet_offset
+        for L in lads:
+            fx, fy, nx, ny, hw, z0, z1 = L
+            dx, dy = e.x - fx, e.y - fy
+            d = dx * nx + dy * ny            # distance in front of the wall
+            lat = -dx * ny + dy * nx         # sideways offset on the ladder
+            if 8 < d < 30 and abs(lat) <= hw + 4 and z0 - 4 <= feet <= z1 + 6:
+                return L
+        return None
+
+    def ladder_tick(self, e, dt, f, s, wx, wy, c, sn, jump):
+        """Returns True when the player is on a ladder (and has been moved)."""
+        if e.lcd > 0:
+            e.lcd -= dt
+            e.lad = None
+            return False
+        L = self.find_ladder(e)
+        if L is None:
+            e.lad = None
+            return False
+        fx, fy, nx, ny, hw, z0, z1 = L
+        feet = e.z - self.world.feet_offset
+        if e.lad is not L:
+            # grab: press into the ladder, or step off a top edge while looking down
+            into = -(wx * nx + wy * ny)
+            grab = (f or s) and into > 0.3
+            if grab and e.pitch < LADDER_LOOK_DOWN and feet < z1 - 6 and self.world.solid(e.x, e.y, e.z - 1):
+                grab = False                      # standing at the bottom looking down: just walk, don't grab
+            if not grab and (f or s) and feet >= z1 - 6 and e.pitch < LADDER_LOOK_DOWN and -into > 0.3:
+                grab = True
+            if not grab:
+                return False
+            e.lad = L
+        e.onlad = True
+        e.walk = False
+        e.steep = False
+        if jump:                                  # jump off, away from the ladder
+            e.vx, e.vy, e.vz = nx * LADDER_JUMP, ny * LADDER_JUMP, 150.0
+            e.lad = None
+            e.lcd = 0.35
+            e.onlad = False
+            return 2
+        tx, ty = -ny, nx
+        # up / down: forward goes up, unless you look down (then it goes down). Backward is the reverse.
+        if LADDER_FAST:
+            # Source-engine LadderMove: build a 3D wish velocity from the view (pitch included) and the keys,
+            # then turn the part that pushes INTO the ladder into upward motion.
+            cp, sp = math.cos(e.pitch), math.sin(e.pitch)
+            fs, rs = f * LADDER_SPEED, s * LADDER_SPEED
+            wvx = c * cp * fs + sn * rs          # forward = (c*cp, sn*cp, sp), right = (sn, -c, 0)
+            wvy = sn * cp * fs - c * rs
+            wvz = sp * fs
+            into = wvx * nx + wvy * ny           # < 0 when you push into the ladder
+            vz = wvz - into                      # pushing into the ladder = climb
+            vz = max(-LADDER_MAX_SPEED, min(LADDER_MAX_SPEED, vz))
+            lat = (wvx * tx + wvy * ty) * LADDER_LATERAL
+        else:
+            up = 1.0 if e.pitch >= LADDER_LOOK_DOWN else -1.0
+            vz = f * up * LADDER_SPEED
+            lat = s * (sn * tx - c * ty) * LADDER_SIDE      # strafe along the ladder
+        d = (e.x - fx) * nx + (e.y - fy) * ny
+        pull = max(-60.0, min(60.0, (16.5 - d) * 8.0))   # keep hugging the wall
+        e.vx = tx * lat + nx * pull
+        e.vy = ty * lat + ny * pull
+        e.vz = vz
+        if vz > 0 and feet >= z1 - 1:                    # reached the top: hop onto the ledge
+            e.vx, e.vy, e.vz = -nx * 140.0, -ny * 140.0, 170.0
+            e.lad = None
+            e.lcd = 0.4
+            e.onlad = False
+        elif vz < 0 and self.world.solid(e.x, e.y, e.z - 1):   # reached the floor: let go
+            e.lad = None
+            e.lcd = 0.1
+            e.onlad = False
+        return True
+
     def ptick(self, e, dt, f, s, n, c, sn):
         world = self.world
+        e.onlad = False
         e.walk = self.walkable(e)
         jump = e.jreq
         e.jreq = 0
@@ -5728,6 +5927,13 @@ class Game:
         mv = f or s
         wx = (c * f + sn * s) / n if mv else 0
         wy = (sn * f - c * s) / n if mv else 0
+        lr = self.ladder_tick(e, dt, f, s, wx, wy, c, sn, jump)
+        if lr is True:
+            self.pm_move(e, dt)
+            e.onlad = False
+            return
+        if lr == 2:
+            jump = 0                      # jumped off a ladder: no wall kick on top of it
         jmp = jump
         if world.solid(e.x, e.y, e.z - 1):
             e.wj = 0
@@ -5897,6 +6103,14 @@ class Game:
             if w.pellets and int(w.pellets) > 1:
                 # shotgun: the whole reload takes as long as the AWP's, so the animation is slowed to fit
                 tgt = self.awp_reload_len() * SHOTGUN_RELOAD_SCALE
+                ch = self.vm_reload_chain(w.vm, min(8, max(1, int(w.mag or 1) - int(getattr(e, "rl_prev", 0) or 0)))) \
+                    if (e.isP and w.vm) else None
+                if ch:
+                    # play start -> insert(s) -> end so the reload (and the pump) actually completes
+                    self.vmA["s"], self.vmA["t"], self.vmA["loop"], self.vmA["kind"] = ch[0][0], 0.0, False, "reload"
+                    self.vmA["hold"] = False
+                    self.vmA["chain"] = [c_[0] for c_ in ch[1:]]
+                    dur = sum(c_[1] for c_ in ch)
                 if e.isP and w.vm and w.vm.find("reload") and dur > 0.3:
                     self.vmA["spd"] = dur / tgt
                 dur = tgt
@@ -6196,7 +6410,268 @@ class Game:
                     pass
         return 3.7
 
+    def vm_reload_chain(self, vm, n_ins):
+        """Shell-by-shell shotgun reloads are split into reload_start / reload_insert / reload_end sequences.
+        Returns [(seq, seconds), ...] to play back to back (start, insert x n_ins, end), or None for a one-clip reload."""
+        try:
+            S = vm.seqs
+            ok = [i for i in range(len(S)) if S[i].get("desc") is not None and not (S[i]["flags"] & 0x4)]
+
+            def get(rx):
+                return [i for i in ok if re.search(rx, S[i]["label"].lower())]
+            st = get(r"reload.*start|start.*reload|^(reload_)?begin")
+            ins = get(r"reload.*(insert|loop)|(insert|loop).*reload|^insert")
+            en = get(r"reload.*(end|finish|pump)|(end|finish|pump).*reload|^pump")
+            if not ins:
+                return None
+            ids = st[:1] + [ins[0]] * max(1, int(n_ins)) + en[:1]
+            return [(i, S[i]["n"] / max(1.0, S[i]["fps"])) for i in ids]
+        except Exception:
+            return None
+
+    # ----- weapon animation-event sounds: reload, pull-out (deploy), bolt, pump ... -----
+    # Source view-models carry sound events (AE_CL_PLAYSOUND) on their sequences, e.g. "Weapon_AWP.Clipout" at 12 %
+    # of the reload. L4D2 packs keep them on the matching "<seq>_layer" sequence. Each event name is turned into a
+    # sound file of the weapon pack (via its game_sounds script, else by file name) and played when the animation
+    # reaches that point. Models without usable events get the usual draw / clip-out / clip-in / bolt timing.
+    _EV_GROUPS = (
+        ("draw", "deploy", "pullout", "pullup", "ready", "select", "raise", "equip", "takeout", "pickup", "unholster"),
+        ("clipout", "magout", "magazineout", "magrelease", "clipoff", "magdrop", "clipeject", "ejectclip", "magremove"),
+        ("clipin", "magin", "magazinein", "magslap", "clipon", "clipinsert", "insertclip", "magload"),
+        ("boltforward", "boltrelease", "slideforward", "slidestop", "boltpush", "cockforward", "boltclose", "slidelock"),
+        ("bolt", "boltback", "boltpull", "slideback", "slidepull", "cock", "pullback", "cockback", "charge", "boltopen"),
+        ("pump", "pumpback", "pumpforward", "pumpend", "pumpaction"),
+        ("insert", "shellinsert", "shell", "loadshell", "bulletin", "bulletinsert"),
+    )
+
+    def _ev_canon(self, act):
+        k = re.sub(r"\d+$", "", key_norm(act))
+        for g in self._EV_GROUPS:
+            if k in g:
+                return g[0]
+        return k
+
+    def _game_sound_map(self, arch):
+        """{sound script name: wave path} from the scripts/game_sounds*.txt files inside a pack (cached)."""
+        cache = self.__dict__.setdefault("_gs_map", {})
+        k = id(arch)
+        if k not in cache:
+            m = {}
+            for n in list(getattr(arch, "files", {})):
+                low = n.replace("\\", "/").lower()
+                if "scripts/" in low and low.endswith(".txt") and "sound" in low.rsplit("/", 1)[-1]:
+                    try:
+                        kv = parse_kv(arch.read(n).decode("utf-8", "ignore"))
+                    except Exception:
+                        continue
+                    for name, ent in kv.items():
+                        if not isinstance(ent, dict):
+                            continue
+                        wv = ent.get("wave")
+                        if wv is None and isinstance(ent.get("rndwave"), dict):
+                            wv = ent["rndwave"].get("wave")
+                        if isinstance(wv, str) and wv:
+                            m[name.lower()] = re.sub(r"^[\)\(\^#\*<>@~\?\$`]+", "", wv).replace("\\", "/").lower()
+            cache[k] = m
+        return cache[k]
+
+    def _load_pack_snd(self, arch, n):
+        ck = self.__dict__.setdefault("_pack_snd_obj", {})
+        key = (id(arch), n)
+        if key not in ck:
+            try:
+                ck[key] = pygame.mixer.Sound(io.BytesIO(arch.read(n)))
+            except Exception as ex:
+                print("cannot load pack sound", n, ex)
+                ck[key] = None
+        return ck[key]
+
+    def wpn_ev_sound(self, w, evname):
+        """pygame Sound for a weapon animation event name ('Weapon_AWP.Clipout') or a bare action ('draw'), or None."""
+        spec = self.asset["mdl"].get(getattr(w, "_m", None))
+        arch = getattr(spec, "arch", None)
+        if arch is not None and not hasattr(arch, "read"):
+            arch = None
+        ck = self.__dict__.setdefault("_ev_snd", {})
+        key = (id(arch), str(w.n), str(evname).lower())
+        if key in ck:
+            return ck[key]
+        res = None
+        try:
+            res = self._resolve_ev_sound(w, arch, str(evname))
+        except Exception as ex:
+            print("weapon event sound failed:", evname, ex)
+        ck[key] = res
+        return res
+
+    def _resolve_ev_sound(self, w, arch, name):
+        files = self.pack_sound_files(arch) if arch is not None else []
+        # 1) the pack's own sound script (Weapon_AWP.Clipout -> weapons/awp/gunother/awp_clipout.wav)
+        if arch is not None:
+            wave = self._game_sound_map(arch).get(name.lower())
+            if wave:
+                low = {n.replace("\\", "/").lower(): n for n in files}
+                hit = low.get("sound/" + wave) or next((o for l, o in low.items() if l.endswith("/" + wave)), None)
+                if hit:
+                    return self._load_pack_snd(arch, hit)
+        # 2) by file name: weapon prefix + action ('awp' + 'clipout' -> awp_clipout.wav)
+        pre, _, act = name.rpartition(".")
+        pre = key_norm(re.sub(r"^weapon_?", "", pre.lower()))
+        ak = self._ev_canon(act or name)
+        ak_raw = re.sub(r"\d+$", "", key_norm(act or name))
+        if not ak:
+            return None
+        base = re.sub(r"\.mdl$", "", str(getattr(w, "_m", "") or "").lower())
+        base = re.sub(r"\s*\(.*\)", "", re.sub(r"^v_", "", base))
+        toks = {t for t in (pre, key_norm(base), key_norm(str(w.n or "")),
+                            key_norm(re.sub(r"^(rif|snip|smg|pist|shot|mach|pistol|rifle|sniper)_", "", base))) if len(t) >= 3}
+        mates = [m for m, sp in self.asset["mdl"].items()
+                 if arch is not None and getattr(sp, "arch", None) is arch and not _is_arms_mdl(m)]
+        cands = [(n.replace("\\", "/").lower(), (lambda n=n: self._load_pack_snd(arch, n))) for n in files]
+        cands += [(n.lower(), (lambda s=sn: s)) for n, sn in self.asset["wav"].items()]
+        best = None
+        for low, getter in cands:
+            stem = re.sub(r"\.\w+$", "", low.rsplit("/", 1)[-1])
+            sk = key_norm(stem)
+            pk = key_norm(low)
+            rest = sk
+            for t in sorted(toks, key=len, reverse=True):
+                if sk.startswith(t) and len(sk) > len(t):
+                    rest = sk[len(t):]
+                    break
+            rest_raw = re.sub(r"\d+$", "", rest)
+            rc = self._ev_canon(rest_raw)
+            if rest_raw == ak_raw:
+                sc = 100
+            elif rc == ak:
+                sc = 80
+            elif len(ak_raw) >= 4 and (ak_raw in rest_raw or (len(rest_raw) >= 4 and rest_raw in ak_raw)) and \
+                    self._ev_canon(rest_raw) == rest_raw:
+                sc = 30
+            else:
+                continue
+            if any(t in pk for t in toks):
+                sc += 10
+            elif len(mates) > 1:
+                continue            # several weapons in this pack: only take sounds that name this one
+            if re.search(r"incendiary|silenc|suppress|distant|/far|explo", low):
+                sc -= 8
+            if best is None or sc > best[0]:
+                best = (sc, getter)
+        return best[1]() if best else None
+
+    def _seq_events(self, vm, si):
+        """Sound events of a sequence: its own, plus those of its '<label>_layer' sequence (L4D2 packs)."""
+        S = vm.seqs
+        s = S[si]
+        ev = list(s.get("events") or [])
+        lab = s["label"].lower()
+        for t in S:
+            if t is not s and t["label"].lower() in (lab + "_layer", lab + "layer"):
+                ev += list(t.get("events") or [])
+        return sorted(set(ev))
+
+    def _default_sound_plan(self, kind, label):
+        lab = (label or "").lower()
+        if kind == "draw":
+            return [(0.0, "draw")]
+        if kind == "reload":
+            if re.search(r"insert|loop", lab):
+                return [(0.3, "insert")]
+            if re.search(r"end|finish|pump", lab):
+                return [(0.3, "pump")]
+            if re.search(r"start|begin", lab):
+                return []
+            return [(0.22, "clipout"), (0.58, "clipin"), (0.84, "boltforward")]
+        return []
+
+    def vm_seq_sounds(self, vm, w, si, kind):
+        """[(cycle, Sound, action), ...] for one view-model sequence, sorted by cycle."""
+        ck = self.__dict__.setdefault("_vm_evs", {})
+        key = (id(vm), id(w), si, kind)
+        if key in ck:
+            return ck[key]
+        out = []
+        try:
+            for cyc, nm in self._seq_events(vm, si):
+                snd = self.wpn_ev_sound(w, nm)
+                if snd is not None:
+                    out.append((float(cyc), snd, self._ev_canon(nm.rpartition(".")[2] or nm)))
+            have = {o[2] for o in out}
+            if kind == "draw" and "draw" not in have:       # the deploy sound is not always an event of the draw clip
+                sd = self.wpn_ev_sound(w, "draw")
+                if sd is not None:
+                    out.append((0.0, sd, "draw"))
+            elif kind == "reload" and not out:               # no usable events: spread the usual reload sounds out
+                for cyc, act in self._default_sound_plan(kind, vm.seqs[si]["label"]):
+                    sd = self.wpn_ev_sound(w, act)
+                    if sd is not None:
+                        out.append((cyc, sd, act))
+        except Exception as ex:
+            print("view-model sound events failed:", ex)
+        out.sort(key=lambda o: o[0])
+        ck[key] = out
+        return out
+
+    def vm_events_tick(self, vm, w, A, s):
+        """Play the sound events the current view-model animation passed since the last frame."""
+        if A.get("ev_pid") != A.get("pid"):
+            A["ev_pid"] = A.get("pid")
+            A["ev_c"] = -1.0
+        cur = min(1.0, A["t"] / max(1.0, float(s["n"])))
+        prev = A["ev_c"]
+        if cur <= prev:
+            return
+        for cyc, snd, _a in self.vm_seq_sounds(vm, w, A["s"], A.get("kind", "")):
+            if prev < cyc <= cur:
+                self.audio.play(VM_EVENT_GAIN, snd, 0.0)
+        A["ev_c"] = cur
+
+    def wpn_sound_plan(self, w, kind):
+        """[(cycle 0..1, Sound, action)] for another player's / bot's weapon (kind = 'reload' or 'draw')."""
+        vm = getattr(w, "vm", None)
+        try:
+            c = vm.find(kind) if vm else None
+            if c:
+                return self.vm_seq_sounds(vm, w, c[0], kind)
+        except Exception:
+            pass
+        out = []
+        for cyc, act in self._default_sound_plan(kind, ""):
+            sd = self.wpn_ev_sound(w, act)
+            if sd is not None:
+                out.append((cyc, sd, act))
+        return out
+
+    def remote_wpn_sounds(self, e, A, wpn, reload):
+        """Spatial pull-out / reload sounds for the other players and the bots."""
+        if e.isP or wpn is None or not e.alive:
+            return
+        try:
+            if A.get("snd_w") is not None and A.get("snd_w") != e.w:
+                sd = self.wpn_sound_plan(wpn, "draw")
+                for _c, snd, _a in sd[:1]:
+                    g, pan = self.spatial(e.x, e.y, e.z + 17, .4)
+                    if g > .004:
+                        self.audio.play(g, snd, pan)
+            A["snd_w"] = e.w
+            if reload is None:
+                A["snd_rl"] = -1.0
+                return
+            prev = A.get("snd_rl", -1.0)
+            if reload > prev:
+                for cyc, snd, _a in self.wpn_sound_plan(wpn, "reload"):
+                    if prev < cyc <= reload:
+                        g, pan = self.spatial(e.x, e.y, e.z + 17, .4)
+                        if g > .004:
+                            self.audio.play(g, snd, pan)
+                A["snd_rl"] = reload
+        except Exception as ex:
+            print("remote weapon sound failed:", ex)
+
     def vm_play(self, vm, kind):
+        self.vmA["chain"] = None
+        self.vmA["pid"] = self.vmA.get("pid", 0) + 1     # new playback: its sound events start over
         c = vm.find(kind)
         if kind == "shove" and not c:
             return 0.0
@@ -6249,11 +6724,24 @@ class Game:
             vm.pose(A["s"], 0.0, loop=True)
             return
         A["t"] += dt * s["fps"] * A.get("spd", 1.0)
+        if not A["loop"]:
+            try:
+                self.vm_events_tick(vm, CFG["weapons"][A["w"]], A, s)
+            except Exception as ex:
+                print("view-model sound event failed:", ex)
         f = A["t"]
         if f >= s["n"]:
             if A["loop"]:
                 A["t"] = f = f % s["n"]
             else:
+                nxt = A.get("chain")
+                if nxt:
+                    # next piece of a chained reload (start -> insert -> end), keeping the slowed-down speed
+                    A["s"] = nxt.pop(0)
+                    A["t"] = 0.0
+                    A["pid"] = A.get("pid", 0) + 1
+                    vm.begin_fade(0.03)
+                    return
                 self.vm_play(vm, "idle")
                 return
         # 1/8-frame steps; SrcInst.pose also rate-limits skinning to ~90 Hz
@@ -6336,6 +6824,7 @@ class Game:
         else:
             state = "idle"
         A["state"] = state
+        self.remote_wpn_sounds(e, A, wpn, reload)
         hold = None
         if HELD_WPN and wpn is not None and not melee:
             hp = held_points(wpn)
@@ -6533,43 +7022,53 @@ class Game:
                     return nxt
         return ""
 
-    def weapon_folder_aliases(self, w):
-        """Normalised folder names that belong to this weapon (mod/weapon/<name>/)."""
+    # mod/weapon/<folder>/ names that belong to each weapon (compared with key_norm, so "AK-47" == "ak47")
+    WEAPON_FOLDER_ALIASES = {
+        "ak47": {"ak47", "ak", "ak74", "akm", "kalash", "kalashnikov"},
+        "awp": {"awp", "snip", "sniper", "scout", "ssg08", "ssg", "g3sg1", "g3sg", "awm", "barrett", "m24"},
+        "knife": {"knife", "knives", "bayonet", "karambit", "melee", "blade", "dagger", "kunai"},
+        "shotgun": {"shotgun", "shotguns", "nova", "xm1014", "xm", "mag7", "sawedoff", "sawed", "m3", "pump", "shotty"},
+        "pistol": {"pistol", "pistols", "handgun", "glock", "usp", "p228", "p250", "fiveseven", "deagle",
+                   "desserteagle", "deserteagle", "elite", "tec9", "revolver", "magnum"},
+    }
+
+    def weapon_kind(self, w):
+        """Folder-group key for a weapon: 'ak47', 'awp', 'knife', 'shotgun', 'pistol' (or its own normalised name)."""
+        if getattr(w, "melee", 0):
+            return "knife"
         wn = key_norm(w.n or "")
-        out = {wn} if wn else set()
-        # per-weapon alias groups (folder key_norm must match one of these)
-        table = [
-            (("ak47", "ak", "kalash"), ("ak", "ak47", "ak74", "kalash")),
-            (("awp",), ("awp", "snip", "sniper", "scout", "ssg08", "ssg", "g3sg", "awm", "barrett", "ssg08")),
-            (("knife",), ("knife", "bayonet", "karambit", "melee", "blade", "dagger", "kunai")),
-            (("shotgun",), ("shotgun", "nova", "xm1014", "xm", "mag7", "sawed", "m3", "pump", "shotty")),
-        ]
-        for keys, aliases in table:
-            if any(k in wn or wn in k for k in keys) or (w.melee and "knife" in keys):
-                out.update(aliases)
-                break
-        # also accept anything the weapon's match regex would accept as a folder name
-        if w.match:
-            out.add(key_norm(w.n or ""))
-        return out
+        for kind, aliases in self.WEAPON_FOLDER_ALIASES.items():
+            if wn == kind or wn in aliases:
+                return kind
+        return wn
+
+    def folder_owner(self, folder):
+        """Which weapon group a mod/weapon/<folder>/ belongs to, or None if the folder name is not a known weapon."""
+        f = key_norm(folder or "")
+        if not f:
+            return None
+        groups = {k: set(v) | {k} for k, v in self.WEAPON_FOLDER_ALIASES.items()}
+        for w in CFG["weapons"]:           # custom / extra weapons: their own name is a folder name too
+            k = self.weapon_kind(w)
+            groups.setdefault(k, {k}).add(k)
+        for k, aliases in groups.items():  # exact match first ("ak-47", "AWP", "knife" ...)
+            if f in aliases:
+                return k
+        for k, aliases in groups.items():  # then "ak47 skins", "awp_dragonlore", "pistol-pack" ...
+            if any(len(a) >= 3 and (f.startswith(a) or f.endswith(a)) for a in aliases):
+                return k
+        return None
 
     def weapon_accepts_folder(self, w, folder):
-        """True if models from this mod/weapon/<folder>/ belong on weapon w."""
+        """True if models from this mod/weapon/<folder>/ belong on weapon w.
+        mod/weapon/ak-47/ -> only AK-47, mod/weapon/awp/ -> only AWP, and so on.
+        Loose files (no sub-folder) and sub-folders with an unrecognised name stay available to every weapon."""
         if not folder:
-            return True   # loose files (not in a sub-folder) stay available to every slot
-        f = key_norm(folder)
-        wn = key_norm(w.n or "")
-        if f == wn or f in wn or wn in f:
             return True
-        aliases = self.weapon_folder_aliases(w)
-        if f in aliases or any(a in f or f in a for a in aliases if len(a) >= 3):
+        owner = self.folder_owner(folder)
+        if owner is None:
             return True
-        # folder name matches the weapon's file-name pattern (e.g. "nova" for shotgun)
-        if w.match and re.search(w.match, folder, re.I):
-            return True
-        if w.melee and re.search(r"knife|bayonet|karambit|melee|blade", folder, re.I):
-            return True
-        return False
+        return owner == self.weapon_kind(w)
 
     def _recover_mdl_folder(self, name):
         """If mdl_folder was missing, try to recover it from the Source archive path."""
@@ -6604,7 +7103,10 @@ class Game:
         return folders.get(name, "")
 
     def mdl_ok_for_weapon(self, name, w):
-        folder = self._recover_mdl_folder(name)
+        """A model is usable on weapon w only if it sits in that weapon's mod/weapon/<folder>/."""
+        folder = self.asset.get("mdl_folder", {}).get(name, "")
+        if not folder:
+            folder = self._recover_mdl_folder(name)
         return self.weapon_accepts_folder(w, folder)
 
     def weapon_mods(self, slot=None):
@@ -7843,7 +8345,10 @@ class Menu:
 
     def _draw(self, W, H):
         g, gfx = self.g, self.gfx
-        s = max(.4, min(W / 1000, H / 600))      # fill the whole window: layout grows to LW x LH units
+        s_side = max(.4, min(W / 1000, H / 600))     # side menu scale (unchanged)
+        KC = max(.4, min(1.0, MENU_CONTENT_SCALE))
+        m = 1.0 / KC                                  # side-menu units -> content units
+        s = s_side * KC                               # content scale: pages are drawn smaller than the side menu
         LW, LH = W / s, H / s
         ox, oy = 0, 0
         self.xf = (ox, oy, s)
@@ -7858,7 +8363,13 @@ class Menu:
         gl.glScalef(s, s, 1)
 
         gfx.rect(0, 0, LW, LH, c255(10, 10, 10))          # content: #0a0a0a
-        gfx.rect(0, 0, 240, LH, c255(22, 22, 22))           # sidebar: #161616
+        # ---- side menu: drawn at its own (original) size, hit areas converted to content units ----
+        LHs = LH / m                                   # window height in side-menu units
+        smx, smy = mx / m, my / m                      # mouse in side-menu units
+        gl.glPushMatrix()
+        gl.glScalef(m, m, 1)
+        gfx.set_xf(ox, oy, s * m)
+        gfx.rect(0, 0, 240, LHs, c255(22, 22, 22))          # sidebar: #161616
         # profile block: avatar with green rim + username
         gfx.rect(18, 16, 40, 40, c255(157, 211, 103))
         if self.pfp_tex:
@@ -7876,15 +8387,15 @@ class Menu:
             gfx.text((self.name.strip() or "P")[0].upper(), 38, 24, 20, (150, 150, 150), bold=True, anchor="c")
         gfx.text((self.name.strip() or "Player")[:14], 70, 26, 15, (255, 255, 255), bold=True)
 
-        def hover(x, y, w, h):
-            return x <= mx <= x + w and y <= my <= y + h
+        def shover(x, y, w, h):
+            return x <= smx <= x + w and y <= smy <= y + h
 
         def nav(label, page, y):
             act = self.page == page
-            h = hover(0, y, 240, 44)
+            h = shover(0, y, 240, 44)
             gfx.rect(0, y, 240, 44, c255(42, 42, 42) if act else (c255(30, 30, 30) if h else (0, 0, 0, 0)))
             gfx.text(label, 20, y + 12, 14, (255, 255, 255) if act else (154, 154, 154), bold=True)
-            self.hot.append((0, y, 240, 44, lambda p=page: self.set_page(p), None))
+            self.hot.append((0, y * m, 240 * m, 44 * m, lambda p=page: self.set_page(p), None))
 
         nav("Play", "play", 80)
         nav("Profile", "profile", 124)
@@ -7892,8 +8403,19 @@ class Menu:
         nav("Skins", "skins", 212)
         nav("Settings", "settings", 256)
         if g.net.active:
-            gfx.text("ONLINE: " + g.net.room[:18], 20, LH - 48, 11, (104, 104, 104), mono=True)
-        gfx.text("FAD-MOD", 20, LH - 26, 12, (154, 154, 154), bold=True)
+            gfx.text("ONLINE: " + g.net.room[:18], 20, LHs - 48, 11, (104, 104, 104), mono=True)
+        gfx.text("FAD-MOD", 20, LHs - 26, 12, (154, 154, 154), bold=True)
+
+        qy = LHs - 100
+        qh = shover(20, qy, 200, 38)
+        gfx.rect(20, qy, 200, 38, c255(42, 42, 42) if qh else c255(24, 24, 24))
+        gfx.text("Quit", 120, qy + 19 - 9, 13, (229, 57, 53), bold=True, anchor="c")
+        self.hot.append((20 * m, qy * m, 200 * m, 38 * m, lambda: setattr(self, "quit_req", True), None))
+        gl.glPopMatrix()
+        gfx.set_xf(ox, oy, s)                           # back to the (smaller) content scale
+
+        def hover(x, y, w, h):
+            return x <= mx <= x + w and y <= my <= y + h
 
         def button(x, y, w, h, label, fn, primary=False):
             hv = hover(x, y, w, h)
@@ -7906,7 +8428,6 @@ class Menu:
             gfx.text(label, x + w / 2, y + h / 2 - 9, 13, col, bold=True, anchor="c")
             self.hot.append((x, y, w, h, fn, None))
 
-        button(20, LH - 100, 200, 38, "Quit", lambda: setattr(self, "quit_req", True))
 
         def panel(x, y, w, h, title, sub=None):
             gfx.rect(x, y, w, h, c255(17, 17, 17))
@@ -7926,7 +8447,8 @@ class Menu:
                 setter(lo + (hi - lo) * tt)
             self.hot.append((x - 8, y, w + 16, 20, None, drag))
 
-        cx, cw = 280, max(680, int(LW - 320))
+        cx = int(240 * m) + 40                      # sidebar width (content units) + gap
+        cw = max(680, int(LW - cx - 40))
         if self.page == "settings":
             for i, (sub, lab) in enumerate((("controls", "Controls"),
                                             ("viewmodel", "Viewmodel"), ("crosshair", "Crosshair"),
@@ -8193,6 +8715,7 @@ class Menu:
 
                 def do_refresh():
                     net.lan_rooms.clear()
+                    net.net_rooms.clear()
                     try:
                         t = "%s/rooms/+" % BROKER_ROOT
                         net.broker.unsub(t)
@@ -8300,15 +8823,16 @@ class Menu:
             gfx.text("+ " + str(wl[kn].n) + "  (key 2)", cx + cw - 16, 168, 12, (154, 154, 154), anchor="r")
 
             gap = 16
-            ncols = max(2, min(4, int((cw + gap) // 230)))
-            cwd = (cw - gap * (ncols - 1)) / ncols
-            pvh = 132
-            chd = pvh + 118
-            gy0 = 222
-            avail = max(chd, int(LH - gy0 - 24))
-            nrows = max(1, int((avail + gap) // (chd + gap)))
-            per_pg = ncols * nrows
             cards = [(i, False) for i in guns] + [(kn, True)]
+            gy0 = 222
+            avail = max(150, int(LH - gy0 - 24))
+            gap = 12
+            # Fixed 4-column x 2-row grid (8 slots per page); previews shrink to fit the window height.
+            ncols, nrows = 4, 2
+            pvh = max(60, min(132, int((avail - gap * (nrows - 1)) / nrows - 118)))
+            cwd = (cw - gap * (ncols - 1)) / ncols
+            chd = pvh + 118
+            per_pg = ncols * nrows
             npg = max(1, (len(cards) + per_pg - 1) // per_pg)
             self.lo_gpage = max(0, min(getattr(self, "lo_gpage", 0), npg - 1))
             if npg > 1:
@@ -8399,11 +8923,12 @@ class Menu:
                         gfx.box(bx_, 166, 150, 30, team_tint(TEAM_CT if ct_ else TEAM_T), None)
                     else:
                         gfx.rect(bx_, 166, 150, 30, c255(42, 42, 42) if hover(bx_, 166, 150, 30) else c255(24, 24, 24))
-                    draw_team_logo(bx_ + 6, 168, 26, 0 if ct_ else 1)
-                    gfx.text(TEAM_NAMES[0 if ct_ else 1], bx_ + 90, 166 + 30 / 2 - 9, 13,
-                             (TEAM_CT if ct_ else TEAM_T) if on_ else (154, 154, 154), bold=True, anchor="c")
+                    # logo only, centred in the button (name is just a fallback when no logo file exists)
+                    if not draw_team_logo(bx_ + (150 - 26) / 2, 168, 26, 0 if ct_ else 1):
+                        gfx.text(TEAM_NAMES[0 if ct_ else 1], bx_ + 75, 166 + 30 / 2 - 9, 13,
+                                 (TEAM_CT if ct_ else TEAM_T) if on_ else (154, 154, 154), bold=True, anchor="c")
                     self.hot.append((bx_, 166, 150, 30, lambda tk=tk: setattr(self, "lo_team", tk), None))
-                info = TEAM_NAMES[0 if self.lo_team == "CT" else 1] + " team: " + (g.pm_cfg[self.lo_team] or "none picked yet")
+                info = (g.pm_cfg[self.lo_team] or "none picked yet")
             gfx.text(info[:100], cx, 204, 12, (170, 170, 170))
 
             gy, cw2, ch2 = 226, 216, 170
@@ -8411,7 +8936,7 @@ class Menu:
                 if wp and ws:
                     wname = str(ws[self.lo_slot].n)
                     empty = f"No models for {wname}."
-                    hint = f"Put them in mod/weapon/{key_norm(wname)}/  (e.g. mod/weapon/ak-47/)."
+                    hint = f"Put them in mod/weapon/{wname.lower().replace(' ', '-')}/  (only that folder's models show here)."
                 else:
                     empty = ("No weapon mods loaded yet." if wp else
                              ("No arms models loaded yet." if ar else "No player models loaded yet."))
@@ -8457,6 +8982,13 @@ class Menu:
                             for tk in ("CT", "T") if g.pm_cfg[tk] == name]
                 bx = x + 10
                 for txt, bg, fg in tags:
+                    tm_ = TEAM_NAMES.index(txt) if (not wp and not ar and txt in TEAM_NAMES) else None
+                    if tm_ is not None and team_logo(tm_):
+                        # team tag = logo only
+                        gfx.rect(bx, y + 144, 30, 18, bg)
+                        draw_team_logo(bx + 7, y + 145, 16, tm_)
+                        bx += 30 + 6
+                        continue
                     tw2 = gfx.text_w(txt, 10, True) + 14
                     gfx.rect(bx, y + 144, tw2, 18, bg)
                     gfx.text(txt, bx + tw2 / 2, y + 147, 10, fg, bold=True, anchor="c")
@@ -9483,10 +10015,18 @@ def render_hud(game, gfx, W, H, menu_visible):
             gfx.rect(bar_x, bar_y, bar_w * hp_ratio, bar_h, hp_col)
     w = CFG["weapons"][P.w]
     # Weapon HUD: guns show only the ammo counter, the knife shows its name; both on a dark panel like the HP bar.
-    hud_txt = w.n if w.melee else f"{P.ammo[P.w]} / {w.mag}" + (" (reloading)" if P.cool > 1 else "")
+    hud_txt = w.n if w.melee else f"{P.ammo[P.w]} / {w.mag}"
     hud_w = gfx.text_w(hud_txt, 22, True, True)
     gfx.rect(W - 22 - hud_w - 12, H - 50 - 6, hud_w + 24, 22 + 12, (22 / 255, 22 / 255, 22 / 255, .94))  # same dark gray as HP background
     gfx.text(hud_txt, W - 22, H - 50, 22, (255, 255, 255), bold=True, anchor="r", mono=True)
+    # reload progress: thin white line right under the dark panel (fills left to right, replaces the "(reloading)" text)
+    if P.reloadT > 0 and not w.melee:
+        game._rl_hud_max = max(getattr(game, "_rl_hud_max", 0.0), P.reloadT)
+        prog = 1.0 - P.reloadT / max(game._rl_hud_max, 1e-3)
+        panel_w = hud_w + 24
+        gfx.rect(W - 22 - hud_w - 12, H - 50 - 6 + 22 + 12, panel_w * max(0.0, min(1.0, prog)), 3, (1, 1, 1, 1))
+    else:
+        game._rl_hud_max = 0.0
 
     # chat (bottom-left): jump stats show up here and fade out after a few seconds
     cy_ = H - 104
@@ -9556,8 +10096,7 @@ def render_hud(game, gfx, W, H, menu_visible):
         sp_ = math.hypot(P.vx, P.vy)                     # horizontal speed, units / second
         t_ = max(0.0, min(1.0, (sp_ - MAXS) / (MAXS * 0.6)))   # white at normal speed -> yellow when fast
         col_ = (255, int(255 - 62 * t_), int(255 - 248 * t_))
-        gfx.text(f"{int(round(sp_))}", W / 2, H - 92, 26, col_, bold=True, anchor="c", mono=True)
-        gfx.text("UNITS / SEC", W / 2, H - 62, 10, (154, 154, 154), bold=True, anchor="c")
+        gfx.text(f"{int(round(sp_))}", W / 2, H - 66, 26, col_, bold=True, anchor="c", mono=True)
 
     # CS:GO-style developer console
     if game.con_open:
