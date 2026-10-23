@@ -261,7 +261,7 @@ def make_texture(rgba, w, h, mip=True):
 
 
 # --------------------------------------------------------------------------
-# Silent Hill atmosphere: dense fog, dim ambient, flashlight, vignette
+# night light
 # --------------------------------------------------------------------------
 FOG_COLOR = (0.17, 0.175, 0.17)   # ashen grey (also the "sky" colour)
 FOG_DENSITY = 0.0011              # exp2 fog; lower = thinner, see further
@@ -462,7 +462,7 @@ def sky_sphere_list(R):
 
 
 # --------------------------------------------------------------------------
-# WAD / BSP
+# World / collision
 # --------------------------------------------------------------------------
 def _fib_dirs(n):
     out = []
@@ -620,7 +620,13 @@ class FadMapWorld(World):
         self.name = str(d.get("name", "map"))
         self.B, self.meta = [], []
         self.K, self.D, self.Y = [], [], []      # shape kind per box (0 box, 1 slope, 2 cylinder), slope uphill direction, spin (deg)
+        self.DEC = []                            # decals: flat pictures on walls, drawn only (no collision)
         for b in d.get("boxes", []):
+            if b.get("dc"):
+                self.DEC.append(([float(x) for x in b["b"]],
+                                 [int(v) for v in ((b.get("f") or []) + [-1] * 6)[:6]],
+                                 float(b.get("tile", 128) or 128), tuple(b.get("c") or (176, 160, 144))))
+                continue
             v = [float(x) for x in b["b"]]
             for i in range(3):
                 if v[i] > v[i + 3]:
@@ -965,6 +971,28 @@ class FadMapWorld(World):
                     gl.glTexCoord2f(u, v)
                     gl.glVertex3f(*pt)
                 gl.glEnd()
+        if self.DEC:                              # decals: only the picture face, pulled toward the viewer a bit
+            gl.glEnable(gl.GL_POLYGON_OFFSET_FILL)
+            gl.glPolygonOffset(-2.0, -2.0)
+            for b, fo, tile, col in self.DEC:
+                for fi, f in enumerate(self._faces(b)):
+                    if fo[fi] < 0:
+                        continue
+                    n = f[4]
+                    tid = self._tids[fo[fi]] if 0 <= fo[fi] < len(self._tids) else None
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, tid or self._white)
+                    sh = self._shade(n)
+                    if tid:
+                        gl.glColor3f(sh, sh, sh)
+                    else:
+                        gl.glColor3f(col[0] / 255 * sh, col[1] / 255 * sh, col[2] / 255 * sh)
+                    gl.glBegin(gl.GL_QUADS)
+                    for pt in f[:4]:
+                        u, v = self._uv(pt, n, tile)
+                        gl.glTexCoord2f(u, v)
+                        gl.glVertex3f(*pt)
+                    gl.glEnd()
+            gl.glDisable(gl.GL_POLYGON_OFFSET_FILL)
         gl.glEndList()
 
     def _poly(self, ti, col, pts, sh, uv):
@@ -1039,7 +1067,7 @@ class FadMapWorld(World):
 
 
 # --------------------------------------------------------------------------
-# Source engine (CS:GO) weapon mods: .vpk packages
+# Source engine (L4D2) weapon mods: .vpk packages
 #   VPK v1/v2 reader, MDL v44-49 + VVD + VTX model loader (with RLE animation),
 #   VTF textures (DXT1/3/5 + common uncompressed formats), KeyValues parser.
 # Pure python + numpy. No GL here: SrcModel only produces numpy arrays.
@@ -1456,7 +1484,7 @@ class SrcModel:
         self._cache = {}
 
     def attach_includes(self, vpk, mdl_name, _depth=0):
-        """L4D2 / CS:GO view-models keep their animations in another .mdl ($includemodel, e.g.
+        """L4D2 view-models keep their animations in another .mdl ($includemodel, e.g.
         v_knife_t.mdl -> v_knife_anim.mdl). Add those sequences to this model."""
         b = self.b
         try:
@@ -1779,7 +1807,7 @@ def _find_vpk_model(vpk, mdl_name):
 
 
 # --------------------------------------------------------------------------
-# Source engine (CS:GO) weapon mods: view-model + animation playback
+# Source engine (L4D2) weapon mods: view-model + animation playback
 #   SrcSpec  = lazy handle stored in game.asset["mdl"] (nothing is loaded until it is used)
 #   SrcData  = shared geometry + textures        SrcInst = per-weapon pose state (same API as MdlInst)
 # Only the model, its textures and its animations are used. Weapon stats (damage, rpm, ammo ...)
@@ -1811,7 +1839,7 @@ class LooseSrcFiles:
 
 
 class DirSrcFiles:
-    """A folder with CS:GO / CS:S files (models/..., materials/...). Also looks for materials in the
+    """A folder with Source files (models/..., materials/...). Also looks for materials in the
     folders above it, so variant folders like V_Models/CSS/models/... find the mod's materials."""
 
     def __init__(self, root):
@@ -1875,8 +1903,8 @@ def src_rel(p):
 def _is_arms_mdl(nm):
     """True for a separate arm / hand / glove / sleeve view-model in any Source pack.
 
-    Matches common naming from CS:GO, CS:S, L4D2, GMod, etc.:
-      v_arms_zoey.mdl, t_arms.mdl, c_arms_*.mdl, v_glove_*.mdl, arms.mdl, hands.mdl
+    Matches common L4D2 arms-pack naming:
+      v_arms_zoey.mdl, v_glove_*.mdl, arms.mdl, hands.mdl
       models/weapons/arms/..., models/.../hands/...
     Pure gun view-models (v_ak47, v_knife_..., w_*, ...) are rejected.
     """
@@ -2152,7 +2180,7 @@ class SrcInst:
         idle = self.find("idle")
         self.pose(idle[0] if idle else 0, 0)
 
-    # ---- sequence lookup (CS:GO v_ model names) ----
+    # ---- sequence lookup (L4D2 v_ model names) ----
     def find(self, kind):
         r = self._find_label(kind)
         if r or kind == "idle":
@@ -2467,7 +2495,7 @@ class SrcInst:
 
 
 # --------------------------------------------------------------------------
-# Source engine (CS:S / CS:GO) PLAYER models
+# Source engine (L4D2) PLAYER models
 #   These packs usually hold only the mesh + textures (the animations live in other game files),
 #   so the body is posed here in code: walk / run cycle, crouch, slide, jump, aim pitch, torso
 #   twist, two-handed weapon hold (arm IK), shooting kick, reload and a death fall.
@@ -3129,11 +3157,11 @@ class SrcPlayerInst:
 
 
 def make_vm(buf, pack=None, arms=None, css_hands=False):
-    """View-model from a Source Spec (CS:GO / L4D2 only).
+    """View-model from a Source Spec (L4D2 layout).
     arms: optional SrcSpec of an arms model, bone-merged onto the weapon skeleton.
     css_hands is ignored (CS:S fallback hands were removed)."""
     if not isinstance(buf, SrcSpec):
-        raise ValueError("Only Source (CS:GO / L4D2) view-models are supported — not CS 1.6 / GoldSrc")
+        raise ValueError("Only Source engine view-models are supported — not CS 1.6 / GoldSrc")
     a = None
     if arms is not None:
         try:
@@ -3221,10 +3249,9 @@ def is_src_player(rel):
     """True for a full-body Source character model usable as CT/T.
 
     Paths recognised:
-      models/player/...                 (CS:S / CS:GO)
       models/survivors/...              (L4D / L4D2 survivors)
       models/infected/...               (L4D / L4D2 specials & commons)
-      models/humans/...                 (HL2-style NPCs sometimes used as players)
+      models/player/..., models/humans/... (other Source characters in user mods)
     Skips arms/hands, view-models, world models, ragdoll helpers, and anim-only stubs.
     """
     rel = rel.replace("\\", "/").lower()
@@ -3246,7 +3273,7 @@ def is_src_player(rel):
 
 
 def src_players(arch):
-    """Character models (CS player, L4D2 survivor/infected, ...) inside a Source archive."""
+    """Character models (L4D2 survivor/infected, other Source characters) inside a Source archive."""
     out = []
     for nm in arch.files:
         if not is_src_player(nm):
@@ -3271,10 +3298,9 @@ def src_players(arch):
 
 
 def src_scan(arch):
-    """Weapon view-models inside a Source archive (CS:GO, CS:S, L4D2, GMod, ...).
+    """Weapon view-models inside a Source archive.
 
     Recognises:
-      models/weapons/v_*.mdl          (CS:GO / CS:S)
       models/v_models/v_*.mdl         (L4D / L4D2)
       models/v_models/weapons/v_*.mdl
       any other path ending in v_*.mdl that is not arms/hands/world/display
@@ -4541,11 +4567,11 @@ class Game:
     def __init__(self, audio):
         self.audio = audio
         self.texdb = {}
-        self.files = {"bsp": None, "wads": []}
+        self.files = {"map_raw": None}
         self.asset = {"mdl": {}, "pack": {}, "wav": {}, "player": {}, "mdl_folder": {}}
         self.src_loose = LooseSrcFiles()
         self.src_dirs = {}
-        self.src_arms = None      # SrcSpec of the arms model (hands holding the CS:GO weapon)
+        self.src_arms = None      # SrcSpec of the arms model (hands holding the weapon)
         self.arms_all = {}        # name -> SrcSpec of every arms model loaded
         self.arms_pick = None     # name of the equipped arms
         self.arms_want = None     # name remembered from settings
@@ -4971,7 +4997,7 @@ class Game:
     # ==========================================================================
 
     def map_sig(self):
-        b = self.files.get("bsp")
+        b = self.files.get("map_raw")
         return hashlib.sha1(b).hexdigest()[:10] if b else "arena"
 
     def mk_remote(self, pid, p):
@@ -6750,8 +6776,7 @@ class Game:
         return sorted(names)
 
     def load_src_vpk(self, path):
-        """Any Source .vpk (CS:GO, CS:S, L4D2, GMod): view-models, players, arms/hands.
-        L4D2 packs use models/v_models/v_*.mdl; CS packs use models/weapons/v_*.mdl.
+        """Any Source .vpk: view-models (L4D2 models/v_models/v_*.mdl), players, arms/hands.
         Only models, textures and animations are used - weapon stats stay the game's own.
         Incomplete downloads (.vpk.part) are accepted for whatever entries are fully present."""
         path = Path(path)
@@ -6811,7 +6836,7 @@ class Game:
         return msg
 
     def add_src_player(self, name, spec, tag=""):
-        """Register a Source (CS:S / CS:GO) player model in asset['player']; returns its key."""
+        """Register a Source (L4D2) player model in asset['player']; returns its key."""
         key = name
         old = self.asset["player"].get(key)
         if old is not None and not (isinstance(old, SrcSpec) and old.arch is spec.arch and old.mdl == spec.mdl):
@@ -6948,7 +6973,7 @@ class Game:
             self.bind_assets()
 
     def load_src_archive(self, path):
-        """.zip / .7z / .rar with CS:GO or CS:S weapon, arms or player model files (models, materials, or a .vpk inside).
+        """.zip / .7z / .rar with weapon, arms or player model files (models, materials, or a .vpk inside).
         Only the needed parts are unpacked (once) into the temp folder, then loaded like loose files."""
         import tempfile
         path = Path(path)
@@ -6987,7 +7012,7 @@ class Game:
         files = [f for f in out.rglob("*") if f.is_file() and f.suffix.lower() in (".mdl", ".vpk")
                  and f.name.lower().count(".mdl") <= 1]
         if not files:
-            return f"{path.name}: no CS:GO / CS:S weapon, arms or player model inside."
+            return f"{path.name}: no weapon, arms or player model inside."
         # keep the mod/weapon/<folder> tag from the archive's original path
         prev = getattr(self, "_load_folder_hint", None)
         folder = ""
@@ -7025,7 +7050,7 @@ class Game:
             if n.endswith(".fadmap"):
                 status = self.load_map(p)
                 continue
-            # CS:GO / L4D2 / GMod weapon packs (.vpk, or browser partial downloads .vpk.part)
+            # L4D2 weapon packs (.vpk, or browser partial downloads .vpk.part)
             if n.endswith(".vpk") or n.endswith(".vpk.part") or re.search(r"\.vpk\.(part|crdownload|tmp)$", n):
                 try:
                     st = self.load_src_vpk(p)
@@ -7036,7 +7061,7 @@ class Game:
                 except Exception as ex:
                     status = f"Cannot open {p.name}: {ex}"
                 continue
-            if n.endswith((".zip", ".7z", ".rar")):  # archive with CS:GO / CS:S weapons, arms and / or player models
+            if n.endswith((".zip", ".7z", ".rar")):  # archive with L4D2 weapons, arms and / or player models
                 try:
                     st = self.load_src_archive(p)
                     status = st or status
@@ -7051,10 +7076,7 @@ class Game:
                 data = p.read_bytes()
             except Exception as ex:
                 return f"Cannot read {p.name}: {ex}"
-            if n.endswith((".bsp", ".wad")):
-                status = f"{p.name}: GoldSrc maps (CS 1.6 .bsp/.wad) are not supported."
-                continue
-            elif n.endswith(".mdl"):
+            if n.endswith(".mdl"):
                 srcv = len(data) > 250 and data[:4] == b"IDST" and 44 <= struct.unpack_from("<i", data, 4)[0] <= 49
                 if mode == "player" or (srcv and is_src_player(src_rel(p))):
                     pm_chg = True
@@ -7082,7 +7104,7 @@ class Game:
                     pass
             elif n.endswith(".mdl"):
                 if len(data) > 250 and data[:4] == b"IDST" and 44 <= struct.unpack_from("<i", data, 4)[0] <= 49:
-                    # CS:GO / CS:S .mdl (its .vvd/.vtx/.vtf/.vmt are found in the same mod folder)
+                    # L4D2 .mdl (its .vvd/.vtx/.vtf/.vmt are found in the same mod folder)
                     root = src_root(p)
                     arch = self.src_dirs.get(root)
                     if arch is None:
@@ -7108,7 +7130,7 @@ class Game:
                         self.asset.setdefault("mdl_folder", {})[key] = self.weapon_mod_folder(p)
                     continue
                 # Reject GoldSrc / CS 1.6 (MDL v10) and unknown formats
-                status = f"{n}: only Source engine models (CS:GO / L4D2, MDL v44-49) are supported."
+                status = f"{n}: only Source engine models (MDL v44-49) are supported."
                 continue
         if pm_chg and not map_chg and not wpn_chg:
             self.reset_game()
@@ -7138,7 +7160,7 @@ class Game:
             world = FadMapWorld(json.loads(raw.decode("utf-8")))
         except Exception as ex:
             return f"Cannot load map {path.name}: {ex}"
-        self.files["bsp"] = raw          # used for the online map signature
+        self.files["map_raw"] = raw          # used for the online map signature
         self.set_world(world)
         self.remember_map(raw)
         return f"Map loaded: {world.name} ({len(world.B)} boxes)."
@@ -7195,7 +7217,7 @@ class Game:
         if self.net.active:
             self.net.leave()          # maps can only change while offline
         if sig == "arena":
-            self.files["bsp"] = None
+            self.files["map_raw"] = None
             self.set_world(ArenaWorld())
             return True, "Switched to the arena map to match the server."
         p = self.find_map_by_sig(sig)
@@ -9746,7 +9768,7 @@ def file_dialog(mode):
     ft = {
         "map": [("FAD-MOD map", "*.fadmap")],
         "arms": [("Arms / hands packs", "*.zip *.7z *.rar *.mdl *.vpk *.vpk.part *.vvd *.vtx *.vtf *.vmt")],
-        "weapon": [("Weapon mods (CS / L4D2)", "*.mdl *.wav *.json *.vpk *.vpk.part *.zip *.7z *.rar *.vvd *.vtx *.vtf *.vmt")],
+        "weapon": [("Weapon mods (L4D2)", "*.mdl *.wav *.json *.vpk *.vpk.part *.zip *.7z *.rar *.vvd *.vtx *.vtf *.vmt")],
         "player": [("Player models", "*.mdl *.zip *.7z *.rar *.vpk *.vpk.part")],
         "image": [("Images", "*.png *.jpg *.jpeg *.bmp *.gif")],
     }[mode]

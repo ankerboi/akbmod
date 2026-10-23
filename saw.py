@@ -32,6 +32,11 @@ Controls
   Stretch  press 6 (or X), click a box. Arrows appear on its faces: DRAG an arrow to push / pull that
            face (snaps to the grid, Shift = free). Works on slopes and circles too.
            F5 keeps spun objects spun: the game rotates them for real (look and collision).
+  Decal    press 7 (or L). Pick an image on the right (or "Add image"), then CLICK a wall or floor: it is stuck there.
+           (Or DRAG an image from the right panel, or from your PC, onto a wall.)  Click a decal to select it.
+           DRAG the decal = slide it on the wall.  DRAG a corner square = resize (same picture shape, Shift = stretch).
+           Mouse wheel or - / = = bigger / smaller    Ctrl+D = copy    Del = delete    click another image = swap it
+           F5 writes decals as flat pictures on the wall (no collision). Use the new fad-mod.py to see them.
   Skybox   "Set image" in the left panel (or drop an image on the empty sky) = skybox.
            Use a wide panorama (2:1) for best results.
            CUBEMAP: "Set cubemap" and pick 6 images named px nx py ny pz nz, OR ONE cross picture (4x3) with all faces (also posx/negx..., or
@@ -97,6 +102,13 @@ DEFAULT_COL = (176, 160, 144)
 HULL_R, HULL_H = 16.0, 72.0          # player: 32 wide, 72 tall (same as the game)
 SELECT, BOX, SPAWN0, SPAWN1, RAMP, CIRC, ROT = "select", "box", "spawn0", "spawn1", "ramp", "circle", "rotate"
 STRETCH = "stretch"
+DECAL = "decal"
+DECAL_THICK = 0.1                    # compiled decals are paper thin; the game draws them flush with no collision
+DEC_MIN = 8.0                        # smallest decal side
+# decal face number (same numbers as Box.f): 0 top, 2 -y, 3 +y, 4 -x, 5 +x
+# -> (axis of the normal, horizontal axis, vertical axis, +1 / -1 = which way the face looks)
+DEC_AXES = {0: (2, 0, 1, 1), 2: (1, 0, 2, -1), 3: (1, 0, 2, 1), 4: (0, 1, 2, -1), 5: (0, 1, 2, 1)}
+DEC_NORMAL = {0: (0, 0, 1), 2: (0, -1, 0), 3: (0, 1, 0), 4: (-1, 0, 0), 5: (1, 0, 0)}
 TURN_SNAPS = (5, 15, 30, 45, 90)     # degrees, for the spin / turn tool
 RAMP_DIRS = ("+X", "+Y", "-X", "-Y")
 
@@ -174,6 +186,45 @@ class Spawn:
 
     def copy(self):
         return Spawn(self.team, self.x, self.y, self.z, self.yaw)
+
+
+class Decal:
+    """A picture stuck flat on one face of a box (a wall side or a floor top).
+    F5 turns it into a very thin box, so the game needs no change.
+    fi = face number (see DEC_AXES), p = where the face is, c0..c1 = across, v0..v1 = up (floor: along y)."""
+    __slots__ = ("tex", "fi", "p", "c0", "c1", "v0", "v1", "col", "hb")
+
+    def __init__(self, tex, fi, p, c0, c1, v0, v1, col=DEFAULT_COL, hb=None):
+        self.tex, self.fi, self.p = int(tex), int(fi), float(p)
+        self.c0, self.c1, self.v0, self.v1 = float(c0), float(c1), float(v0), float(v1)
+        self.col = tuple(col)
+        self.hb = [float(v) for v in hb] if hb else None       # the face it was put on: [h0, h1, v0, v1]
+
+    def copy(self):
+        return Decal(self.tex, self.fi, self.p, self.c0, self.c1, self.v0, self.v1, self.col, self.hb)
+
+    def hv(self, s):
+        """Across-value at s (0 = left .. 1 = right, as seen from outside)."""
+        w = self.c1 - self.c0
+        return self.c0 + s * w if self.fi in (0, 2, 5) else self.c1 - s * w
+
+    def vv(self, t):
+        """Up-value at t (0 = bottom .. 1 = top)."""
+        return self.v0 + t * (self.v1 - self.v0)
+
+    def pt(self, hv, vv, off=0.0):
+        na, ha, va, sg = DEC_AXES[self.fi]
+        q = [0.0, 0.0, 0.0]
+        q[ha], q[va], q[na] = hv, vv, self.p + sg * off
+        return tuple(q)
+
+    def corner(self, s, t, off=0.0):
+        return self.pt(self.hv(s), self.vv(t), off)
+
+    def to_dict(self):
+        return {"tex": self.tex, "fi": self.fi, "p": round(self.p, 3),
+                "r": [round(v, 3) for v in (self.c0, self.c1, self.v0, self.v1)],
+                "c": list(self.col), "hb": self.hb}
 
 
 class Tex:
@@ -411,6 +462,35 @@ def decode_tex(d):
     return Tex(d.get("name", "texture"), s)
 
 
+def bake_decal(dc, tex):
+    """Decal -> (Tex, tile). The game maps textures world-aligned (face_uv), so the picture is put at the
+    right spot inside one texture tile: then a thin box with that tile shows it exactly on the decal."""
+    w, h = dc.c1 - dc.c0, dc.v1 - dc.v0
+    T = max(1.0, round(max(w, h), 2))
+    iw, ih = tex.surf.get_size()
+    S = int(max(32, min(512, round(max(iw * T / w, ih * T / h)))))
+    pw, ph = max(1, int(round(w / T * S))), max(1, int(round(h / T * S)))
+    img = pygame.transform.smoothscale(tex.surf, (pw, ph))
+    flipx, flipy = dc.fi in (3, 4), dc.fi == 0           # faces where the game's mapping runs backwards
+    if flipx or flipy:
+        img = pygame.transform.flip(img, flipx, flipy)
+
+    def fr(x):
+        return x - math.floor(x)
+    ox = int(round(fr(dc.c0 / T) * S))
+    oy = int(round(fr((dc.v0 if dc.fi == 0 else -dc.v1) / T) * S))
+    cell = pygame.Surface((S, S), pygame.SRCALPHA, 32)
+    try:
+        avg = tuple(pygame.transform.average_color(img))[:3]
+    except Exception:
+        avg = (128, 128, 128)
+    cell.fill((avg[0], avg[1], avg[2], 255))
+    for ddx in (0, -S):                                   # the picture may wrap around the tile edge
+        for ddy in (0, -S):
+            cell.blit(img, (ox + ddx, oy + ddy))
+    return Tex("decal_" + tex.name, cell), T
+
+
 CUBE_FACES = ("px", "nx", "py", "ny", "pz", "nz")
 CUBE_ALIASES = (("px", "posx", "right", "rt", "east"), ("nx", "negx", "left", "lf", "west"),
                 ("py", "posy", "up", "top", "bottom_"), ("ny", "negy", "down", "dn", "bottom"),
@@ -517,6 +597,7 @@ class MapDoc:
     def __init__(self):
         self.cube = [None] * 6            # sky as 6 faces (px nx py ny pz nz): Tex or None
         self.boxes = []
+        self.decals = []
         self.spawns = []
         self.tex = []
         self.sky = None
@@ -529,11 +610,12 @@ class MapDoc:
         self.spawns = []
 
     def snap(self):
-        return ([b.copy() for b in self.boxes], [s.copy() for s in self.spawns])
+        return ([b.copy() for b in self.boxes], [s.copy() for s in self.spawns], [d.copy() for d in self.decals])
 
     def restore(self, s):
         self.boxes = [b.copy() for b in s[0]]
         self.spawns = [x.copy() for x in s[1]]
+        self.decals = [d.copy() for d in s[2]] if len(s) > 2 else []
 
     def to_dict(self, compiled=False, cam=None, max_side=1024):
         boxes = self.boxes
@@ -553,6 +635,8 @@ class MapDoc:
             d["sky"] = encode_tex(self.sky, 2048)
         if all(self.cube) and not compiled:
             d["skycube"] = [encode_tex(t, 1024) for t in self.cube]
+        if self.decals and not compiled:
+            d["decals"] = [x.to_dict() for x in self.decals]
         if cam:
             d["cam"] = cam
         return d
@@ -570,6 +654,16 @@ class MapDoc:
             for s in lst:
                 p = s["p"]
                 self.spawns.append(Spawn(t, p[0], p[1], p[2], s.get("yaw", 0)))
+        self.decals = []
+        for e in d.get("decals", []):
+            try:
+                r = e["r"]
+                if int(e["fi"]) not in DEC_AXES:
+                    continue
+                self.decals.append(Decal(e["tex"], e["fi"], e["p"], r[0], r[1], r[2], r[3],
+                                         e.get("c", DEFAULT_COL), e.get("hb")))
+            except Exception:
+                continue
         self.sky = decode_tex(d["sky"]) if d.get("sky") else None
         sc = d.get("skycube")
         self.cube = [decode_tex(x) for x in sc] if sc and len(sc) == 6 else [None] * 6
@@ -694,19 +788,41 @@ def compile_doc(doc, out_path):
             spawns.append(Spawn(team, p[0], p[1], p[2], yaw))
         warns.append("no %s spawn points were placed: added %d automatically" % (TEAM_NAMES[team], len(picked)))
 
+    tex_all = list(doc.tex)                  # decals become thin boxes with their own baked texture
+    dec_boxes, dec_bad = [], 0
+    for i, dc in enumerate(doc.decals):
+        if not (0 <= dc.tex < len(doc.tex)) or dc.c1 - dc.c0 < 1 or dc.v1 - dc.v0 < 1:
+            dec_bad += 1
+            continue
+        bt, T = bake_decal(dc, doc.tex[dc.tex])
+        tex_all.append(bt)
+        na, ha, va, sg = DEC_AXES[dc.fi]
+        off = 0.05 * (i % 20)                # decals on top of each other do not fight
+        lo, hi = (dc.p + off, dc.p + off + DECAL_THICK) if sg > 0 else (dc.p - off - DECAL_THICK, dc.p - off)
+        bb = [0.0] * 6
+        bb[ha], bb[ha + 3] = dc.c0, dc.c1
+        bb[va], bb[va + 3] = dc.v0, dc.v1
+        bb[na], bb[na + 3] = lo, hi
+        f = [-1] * 6
+        f[dc.fi] = len(tex_all) - 1
+        dec_boxes.append(Box([round(v, 2) for v in bb], -1, -1, T, dc.col, f))
+    if dec_bad:
+        warns.append("skipped %d broken decal(s)" % dec_bad)
     tmp = MapDoc()
-    tmp.boxes, tmp.spawns, tmp.tex, tmp.name = boxes, spawns, doc.tex, doc.name
+    tmp.boxes, tmp.spawns, tmp.tex, tmp.name = boxes + dec_boxes, spawns, tex_all, doc.name
     tmp.sky = doc.sky
     if all(doc.cube):
         tmp.sky = Tex("sky_from_cubemap", cube_to_equirect(doc.cube))
     d = tmp.to_dict(compiled=True, max_side=512)
     d["void_z"] = round(min(b[2] for b in bl) - 800.0, 1)
     d["bounds"] = [round(min(b[i] for b in bl), 1) for i in range(3)] + [round(max(b[i + 3] for b in bl), 1) for i in range(3)]
+    for e in d["boxes"][len(boxes):]:         # the last ones are the decals: the game makes them non-solid
+        e["dc"] = 1
     raw = json.dumps(d, separators=(",", ":")).encode("utf-8")
     Path(out_path).write_bytes(raw)
     n0 = sum(1 for s in spawns if s.team == 0)
-    msgs.append("%d boxes, %d textures, spawns: %d BLACK / %d YELLOW, %.1f KB" % (
-        len(boxes), len(d["textures"]), n0, len(spawns) - n0, len(raw) / 1024.0))
+    msgs.append("%d boxes, %d decals, %d textures, spawns: %d BLACK / %d YELLOW, %.1f KB" % (
+        len(boxes), len(dec_boxes), len(d["textures"]), n0, len(spawns) - n0, len(raw) / 1024.0))
     return msgs, warns
 
 
@@ -1029,6 +1145,12 @@ class App:
         self.clip = None                 # copied objects: [("box", Box) / ("spawn", Spawn), ...]
         self.extra = []                  # more selected objects (Ctrl+click): [("box", i) / ("spawn", i), ...]
         self.sel = None                  # ("box", i) / ("spawn", i)
+        self.dsel = None                 # index of the selected decal (decal tool)
+        self.dec_hover = None            # decal under the mouse
+        self.dec_ghost = None            # preview of the decal a click would place
+        self.dec_hh = None               # (s, t) of the resize square under the mouse
+        self.dec_size = 128.0            # longest side of new decals (follows your last resize)
+        self._dscale_t = 0.0
         self.hover = None
         self.cam = np.array([0.0, -1100.0, 620.0])
         self.yaw, self.pitch = math.pi / 2, -0.52
@@ -1093,6 +1215,7 @@ class App:
             self.redo.append(self.doc.snap())
             self.doc.restore(self.undo.pop())
             self.sel = None
+            self.dsel = None
             self.dirty_list = True
             self.msg("Undo")
 
@@ -1101,6 +1224,7 @@ class App:
             self.undo.append(self.doc.snap())
             self.doc.restore(self.redo.pop())
             self.sel = None
+            self.dsel = None
             self.dirty_list = True
             self.msg("Redo")
 
@@ -1349,6 +1473,8 @@ class App:
     def apply_texture(self, ti, mods=0):
         """Make ti the current texture; if a box is selected, put it on that box (shift = top only, ctrl = sides only)."""
         self.cur_tex = ti
+        if self.tool == DECAL:                   # in the decal tool a picture never textures a box
+            return
         obj = self.sel_obj()
         if self.sel and self.sel[0] == "box" and obj is not None:
             self.push_undo()
@@ -1382,6 +1508,355 @@ class App:
         self.dirty_list = True
         self.msg("Textured the %s face of box %d" % (self.FACE_NAMES[fi], hit[2] + 1))
         return True
+
+    # ----- decals -----
+    def sel_decal(self):
+        i = self.dsel
+        return self.doc.decals[i] if (i is not None and 0 <= i < len(self.doc.decals)) else None
+
+    def decal_aspect(self, ti):
+        t = self.doc.tex[ti] if 0 <= ti < len(self.doc.tex) else None
+        if t is None:
+            return 1.0
+        w, h = t.surf.get_size()
+        return w / max(1, h)
+
+    def decal_step(self):
+        return max(2.0, self.grid / 4.0)
+
+    def clamp_decal(self, dc):
+        """Keep a decal inside the face it was put on (when it fits)."""
+        if not dc.hb:
+            return
+        h0, h1, g0, g1 = dc.hb
+        w, h = dc.c1 - dc.c0, dc.v1 - dc.v0
+        if w <= h1 - h0:
+            dc.c0 = min(max(dc.c0, h0), h1 - w)
+            dc.c1 = dc.c0 + w
+        if h <= g1 - g0:
+            dc.v0 = min(max(dc.v0, g0), g1 - h)
+            dc.v1 = dc.v0 + h
+
+    def make_decal(self, ti, hit, o, d):
+        """A new decal with picture ti on the face the ray hit -> (Decal or None, reason if None)."""
+        if ti < 0 or ti >= len(self.doc.tex):
+            return None, "Pick an image on the right first (or drag one onto a wall)"
+        if not hit or hit[1] != "box":
+            return None, "Click on a wall or a floor to put the decal there"
+        box = self.doc.boxes[hit[2]]
+        fi = self.FACE_OF.get(tuple(hit[3]))
+        if fi is None or fi == 1:
+            return None, "Decals go on walls and floors, not on the underside"
+        if box.k:
+            return None, "Decals go on plain boxes (not slopes or circles)"
+        if box.yaw:
+            return None, "Decals need a straight box: this one is spun"
+        na, ha, va, sg = DEC_AXES[fi]
+        b = box.b
+        p = b[na + 3] if sg > 0 else b[na]
+        asp = self.decal_aspect(ti)
+        size = max(DEC_MIN, self.dec_size)
+        w, h = (size, size / asp) if asp >= 1 else (size * asp, size)
+        w, h = max(DEC_MIN, w), max(DEC_MIN, h)
+        q = o + d * hit[0]
+        st = self.decal_step()
+        c0 = snap(float(q[ha]), st) - w / 2
+        v0 = snap(float(q[va]), st) - h / 2
+        dc = Decal(ti, fi, p, c0, c0 + w, v0, v0 + h, box.col, [b[ha], b[ha + 3], b[va], b[va + 3]])
+        self.clamp_decal(dc)
+        return dc, ""
+
+    def place_decal(self, ti, pos):
+        """Stick picture ti on the wall / floor under screen position pos. True if it was placed."""
+        if not self.in_view(pos):
+            return False
+        hit, o, d = self.pick_all(pos, False)
+        dc, why = self.make_decal(ti, hit, o, d)
+        if dc is None:
+            self.msg(why)
+            return False
+        self.push_undo()
+        self.doc.decals.append(dc)
+        self.dsel = len(self.doc.decals) - 1
+        self.cur_tex = ti
+        self.msg("Decal placed. Drag it to move it, drag a corner square to resize.", 5)
+        return True
+
+    def decal_set_tex(self, ti):
+        """Click on a picture in the right panel while a decal is selected: swap its picture."""
+        self.cur_tex = ti
+        dc = self.sel_decal()
+        if dc is None or ti < 0 or ti >= len(self.doc.tex) or ti == dc.tex:
+            return
+        self.push_undo()
+        cx, cy = (dc.c0 + dc.c1) / 2, (dc.v0 + dc.v1) / 2
+        size = max(dc.c1 - dc.c0, dc.v1 - dc.v0)
+        asp = self.decal_aspect(ti)
+        w, h = (size, size / asp) if asp >= 1 else (size * asp, size)
+        w, h = max(DEC_MIN, w), max(DEC_MIN, h)
+        dc.tex = ti
+        dc.c0, dc.c1, dc.v0, dc.v1 = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+        self.clamp_decal(dc)
+        self.msg("Picture swapped")
+
+    def decal_hit_plane(self, dc, o, d, off=0.0):
+        """Where a ray meets the decal's plane -> (t, across, up) or None."""
+        na, ha, va, sg = DEC_AXES[dc.fi]
+        if abs(d[na]) < 1e-6:
+            return None
+        t = (dc.p + sg * off - o[na]) / d[na]
+        if t <= 0:
+            return None
+        q = o + d * t
+        return float(t), float(q[ha]), float(q[va])
+
+    def decal_pick(self, pos):
+        """Nearest decal under the mouse -> (t, index) or None."""
+        o, d = self.ray(pos)
+        best = None
+        for i, dc in enumerate(self.doc.decals):
+            r = self.decal_hit_plane(dc, o, d, 0.3)
+            if r and dc.c0 <= r[1] <= dc.c1 and dc.v0 <= r[2] <= dc.v1 and (best is None or r[0] < best[0]):
+                best = (r[0], i)
+        return best
+
+    def decal_handles(self):
+        """The four resize squares on the corners of the selected decal."""
+        dc = self.sel_decal()
+        if dc is None or self.tool != DECAL:
+            return []
+        out = []
+        for s, t in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            P = np.array(dc.corner(s, t, 0.6), np.float64)
+            r = max(5.0, float(np.linalg.norm(self.cam - P)) * 0.018)
+            out.append({"s": s, "t": t, "P": P, "r": r})
+        return out
+
+    def decal_handle_pick(self, pos):
+        if not self.in_view(pos):
+            return None
+        o, d = self.ray(pos)
+        best = None
+        for h in self.decal_handles():
+            dist, _, t = ray_seg(o, d, h["P"], h["P"])
+            if dist <= h["r"] * 1.6 and (best is None or t < best[0]):
+                best = (t, h)
+        return best[1] if best else None
+
+    def decal_down(self, pos):
+        """Left click in the decal tool: grab a resize square, grab a decal, or place a new one."""
+        dc = self.sel_decal()
+        h = self.decal_handle_pick(pos) if dc is not None else None
+        o, d = self.ray(pos)
+        if h is not None:
+            fs, ft = 1 - h["s"], 1 - h["t"]
+            self.drag = {"kind": "dresize", "i": self.dsel, "z": 0.0, "pushed": False, "key": (h["s"], h["t"]),
+                         "b0": [dc.c0, dc.c1, dc.v0, dc.v1],
+                         "fh": dc.hv(fs), "fv": dc.vv(ft),
+                         "sh": 1.0 if dc.hv(h["s"]) > dc.hv(fs) else -1.0,
+                         "sv": 1.0 if h["t"] else -1.0,
+                         "asp": (dc.c1 - dc.c0) / max(1e-6, dc.v1 - dc.v0)}
+            return
+        hit = self.pick_all(pos, False)[0]
+        dp = self.decal_pick(pos)
+        if dp is not None and (hit is None or dp[0] <= hit[0] + 1.0):
+            self.dsel = dp[1]
+            dc = self.doc.decals[self.dsel]
+            r = self.decal_hit_plane(dc, o, d, 0.3)
+            if r:
+                self.drag = {"kind": "dmove", "i": self.dsel, "z": 0.0, "pushed": False,
+                             "b0": [dc.c0, dc.c1, dc.v0, dc.v1], "start": (r[1], r[2])}
+            return
+        if hit and hit[1] == "box":
+            if self.place_decal(self.cur_tex, pos):
+                dc = self.sel_decal()
+                r = self.decal_hit_plane(dc, o, d, 0.3)
+                if r:        # keep the button down and you can slide the new decal into place
+                    self.drag = {"kind": "dmove", "i": self.dsel, "z": 0.0, "pushed": True,
+                                 "b0": [dc.c0, dc.c1, dc.v0, dc.v1], "start": (r[1], r[2])}
+        else:
+            self.dsel = None
+            self.msg("Click on a wall or a floor to put the decal there")
+
+    def decal_motion(self, dr, o, d):
+        i = dr["i"]
+        if not (0 <= i < len(self.doc.decals)):
+            return
+        dc = self.doc.decals[i]
+        r = self.decal_hit_plane(dc, o, d, 0.3)
+        if r is None:
+            return
+        free = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+        st = self.decal_step()
+        b0 = dr["b0"]
+        if dr["kind"] == "dmove":
+            dh, dv = r[1] - dr["start"][0], r[2] - dr["start"][1]
+            if not free:
+                dh, dv = snap(dh, st), snap(dv, st)
+            nb = [b0[0] + dh, b0[1] + dh, b0[2] + dv, b0[3] + dv]
+        else:
+            nw = (r[1] - dr["fh"]) * dr["sh"]
+            nh = (r[2] - dr["fv"]) * dr["sv"]
+            if free:                                        # Shift: stretch the picture
+                w, h = max(DEC_MIN, nw), max(DEC_MIN, nh)
+            else:                                           # keep the picture shape
+                asp = dr["asp"]
+                w = max(nw, nh * asp)
+                w = max(DEC_MIN * max(1.0, asp), snap(w, st))
+                h = w / asp
+            c0, c1 = (dr["fh"], dr["fh"] + w) if dr["sh"] > 0 else (dr["fh"] - w, dr["fh"])
+            v0, v1 = (dr["fv"], dr["fv"] + h) if dr["sv"] > 0 else (dr["fv"] - h, dr["fv"])
+            nb = [c0, c1, v0, v1]
+        if not dr["pushed"]:
+            if max(abs(a - b) for a, b in zip(nb, b0)) < 1e-6:
+                return
+            dc.c0, dc.c1, dc.v0, dc.v1 = b0
+            self.push_undo()                                # the undo step keeps the original
+            dr["pushed"] = True
+        dc.c0, dc.c1, dc.v0, dc.v1 = nb
+        if dr["kind"] == "dmove":
+            self.clamp_decal(dc)
+        else:
+            self.dec_size = max(nb[1] - nb[0], nb[3] - nb[2])
+
+    def decal_scale(self, f):
+        dc = self.sel_decal()
+        if dc is None:
+            return
+        now = time.perf_counter()
+        if now - self._dscale_t > 0.8:
+            self.push_undo()                                # one undo step for a whole run of wheel clicks
+        self._dscale_t = now
+        cx, cy = (dc.c0 + dc.c1) / 2, (dc.v0 + dc.v1) / 2
+        w, h = (dc.c1 - dc.c0) * f, (dc.v1 - dc.v0) * f
+        k = max(1.0, DEC_MIN / max(1e-6, min(w, h)))
+        w, h = w * k, h * k
+        dc.c0, dc.c1, dc.v0, dc.v1 = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+        self.dec_size = max(w, h)
+        self.msg("Decal %d x %d" % (w, h), 1.5)
+
+    def decal_duplicate(self):
+        dc = self.sel_decal()
+        if dc is None:
+            return
+        self.push_undo()
+        c = dc.copy()
+        s = max(8.0, float(self.grid))
+        c.c0 += s
+        c.c1 += s
+        self.clamp_decal(c)
+        self.doc.decals.append(c)
+        self.dsel = len(self.doc.decals) - 1
+        self.msg("Decal copied")
+
+    def decal_key(self, k, mods, ctrl):
+        """Keys in the decal tool. True if the key was used."""
+        dc = self.sel_decal()
+        dr = self.drag
+        if k == pygame.K_ESCAPE:
+            if dr and dr.get("kind") in ("dmove", "dresize"):      # cancel a move / resize in progress
+                self.drag = None
+                if dr["pushed"]:
+                    if 0 <= dr["i"] < len(self.doc.decals):
+                        e = self.doc.decals[dr["i"]]
+                        e.c0, e.c1, e.v0, e.v1 = dr["b0"]
+                    if self.undo:
+                        self.undo.pop()
+                return True
+            if dc is not None:
+                self.dsel = None
+                return True
+            return False
+        if dc is None or (ctrl and k != pygame.K_d):
+            return False
+        if ctrl and k == pygame.K_d:
+            self.decal_duplicate()
+            return True
+        if k in (pygame.K_DELETE, pygame.K_BACKSPACE):
+            self.push_undo()
+            self.doc.decals.pop(self.dsel)
+            self.dsel = None
+            return True
+        if k in (pygame.K_MINUS, pygame.K_KP_MINUS):
+            self.decal_scale(1 / 1.1)
+            return True
+        if k in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+            self.decal_scale(1.1)
+            return True
+        return False
+
+    def draw_decal_quad(self, dc, off, alpha=1.0):
+        tex = self.doc.tex[dc.tex] if 0 <= dc.tex < len(self.doc.tex) else None
+        sh = shade(DEC_NORMAL[dc.fi])
+        gl.glBindTexture(gl.GL_TEXTURE_2D, tex.gid if tex else self.white)
+        if tex:
+            gl.glColor4f(sh, sh, sh, alpha)
+        else:
+            gl.glColor4f(dc.col[0] / 255 * sh, dc.col[1] / 255 * sh, dc.col[2] / 255 * sh, alpha)
+        gl.glBegin(gl.GL_QUADS)
+        for s, t in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            gl.glTexCoord2f(s, 1 - t)
+            gl.glVertex3f(*dc.corner(s, t, off))
+        gl.glEnd()
+
+    def draw_decals(self):
+        if not self.doc.decals:
+            return
+        gl.glEnable(gl.GL_TEXTURE_2D)
+        gl.glEnable(gl.GL_POLYGON_OFFSET_FILL)
+        gl.glPolygonOffset(-2.0, -2.0)
+        for i, dc in enumerate(self.doc.decals):
+            self.draw_decal_quad(dc, 0.3 + 0.02 * (i % 20))
+        gl.glDisable(gl.GL_POLYGON_OFFSET_FILL)
+
+    def decal_outline(self, dc, col, lw, off=0.7):
+        gl.glLineWidth(lw)
+        gl.glColor4f(*col)
+        gl.glBegin(gl.GL_LINE_LOOP)
+        for s, t in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            gl.glVertex3f(*dc.corner(s, t, off))
+        gl.glEnd()
+        gl.glLineWidth(1.0)
+
+    def draw_decal_overlay(self):
+        gl.glDisable(gl.GL_TEXTURE_2D)
+        act = self.drag if (self.drag and self.drag.get("kind") in ("dmove", "dresize")) else None
+        if self.dec_ghost is not None and not self.drag:
+            gl.glEnable(gl.GL_TEXTURE_2D)
+            self.draw_decal_quad(self.dec_ghost, 0.5, 0.6)
+            gl.glDisable(gl.GL_TEXTURE_2D)
+            self.decal_outline(self.dec_ghost, (0.4, 0.9, 1.0, 1.0), 2.0, 0.6)
+        hv = self.dec_hover
+        if hv is not None and hv != self.dsel and 0 <= hv < len(self.doc.decals):
+            self.decal_outline(self.doc.decals[hv], (1.0, 1.0, 1.0, 0.9), 2.0)
+        dc = self.sel_decal()
+        if dc is None:
+            return
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        self.decal_outline(dc, (1.0, 0.85, 0.1, 1.0), 3.0, 0.8)
+        na, ha, va, sg = DEC_AXES[dc.fi]
+        ex, ey = np.zeros(3), np.zeros(3)
+        ex[ha] = 1.0
+        ey[va] = 1.0
+        for h in self.decal_handles():
+            key = (h["s"], h["t"])
+            hot = (act is not None and act.get("key") == key) or (act is None and self.dec_hh == key)
+            r = h["r"] * (1.3 if hot else 1.0)
+            P = h["P"]
+            pts = [P + ex * a * r + ey * b * r for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+            gl.glColor4f(*((1.0, 0.9, 0.2, 1.0) if hot else (1.0, 1.0, 1.0, 1.0)))
+            gl.glBegin(gl.GL_QUADS)
+            for p in pts:
+                gl.glVertex3f(*p)
+            gl.glEnd()
+            gl.glLineWidth(2.0)
+            gl.glColor4f(0.0, 0.0, 0.0, 1.0)
+            gl.glBegin(gl.GL_LINE_LOOP)
+            for p in pts:
+                gl.glVertex3f(*p)
+            gl.glEnd()
+            gl.glLineWidth(1.0)
+        gl.glEnable(gl.GL_DEPTH_TEST)
 
     # ----- editing -----
     def new_box(self, b):
@@ -1429,7 +1904,10 @@ class App:
 
     def set_tool(self, t):
         self.tool = t
-        if t == ROT:
+        if t == DECAL:
+            self.sel = None
+            self.msg("Decal: pick an image on the right, then CLICK a wall or floor. Drag the corner squares to resize.", 8)
+        elif t == ROT:
             self.msg("Spin / turn: select something, then DRAG the arrow or the ring. Shift = free angle.", 7)
         elif t == STRETCH:
             self.msg("Stretch: select a box, then DRAG an arrow on one of its faces. Shift = free size.", 7)
@@ -1787,6 +2265,7 @@ class App:
         self.doc.new_default()
         self.reset_cube_gl()
         self.undo, self.redo, self.sel, self.cur_tex = [], [], None, -1
+        self.dsel = None
         self.dirty_list = True
         self.msg("New map")
 
@@ -1830,6 +2309,7 @@ class App:
         self.doc = doc
         self.reset_cube_gl()
         self.undo, self.redo, self.sel, self.cur_tex = [], [], None, -1
+        self.dsel = None
         if cam and len(cam) == 5:
             self.cam = np.array(cam[:3], np.float64)
             self.yaw, self.pitch = cam[3], cam[4]
@@ -1885,6 +2365,9 @@ class App:
                     self.set_sky(p)          # dropped on the empty sky
                     return
                 ti = self.add_texture(p, apply=False)
+                if ti >= 0 and self.tool == DECAL and self.in_view(pos):
+                    self.place_decal(ti, pos)        # dropped on a wall in the decal tool: a decal
+                    return
                 if ti >= 0 and not self.texture_face_at(ti, pos):
                     self.msg("Added %s. Drop an image right on a box face to texture just that face." % self.doc.tex[ti].name, 6)
         elif t == pygame.KEYDOWN:
@@ -1901,6 +2384,8 @@ class App:
     def on_key(self, ev):
         k, mods = ev.key, pygame.key.get_mods()
         ctrl = bool(mods & pygame.KMOD_CTRL)
+        if self.tool == DECAL and self.decal_key(k, mods, ctrl):
+            return
         if ctrl and k == pygame.K_s:
             self.save(bool(mods & pygame.KMOD_SHIFT))
         elif ctrl and k == pygame.K_o:
@@ -1954,6 +2439,8 @@ class App:
             self.set_tool(ROT)
         elif k == pygame.K_6 or k == pygame.K_x:
             self.set_tool(STRETCH)
+        elif k == pygame.K_7 or k == pygame.K_l:
+            self.set_tool(DECAL)
         elif k == pygame.K_u:
             self.cycle_turn_snap()
         elif k == pygame.K_COMMA or k == pygame.K_PERIOD:
@@ -1992,6 +2479,8 @@ class App:
             self.tex_scroll = max(0, self.tex_scroll - ev.y * 40)
         elif self.drag and self.drag.get("kind") == "box":
             self.height = max(self.grid, self.height + ev.y * self.grid)
+        elif self.tool == DECAL and not self.look and self.sel_decal() is not None and self.in_view(self.mouse):
+            self.decal_scale(1.1 ** ev.y)
         else:
             self.speed = max(80.0, min(6000.0, self.speed * (1.2 ** ev.y)))
             self.msg("Camera speed %d" % self.speed, 1.5)
@@ -2061,6 +2550,8 @@ class App:
                 return
             hit, o, d = self.pick_all(ev.pos, False)
             self.sel = ("box", hit[2]) if (hit and hit[1] == "box") else None
+        elif self.tool == DECAL:
+            self.decal_down(ev.pos)
         elif self.tool in (BOX, RAMP, CIRC):
             z = self.place_plane(ev.pos)
             if z is None:
@@ -2115,7 +2606,12 @@ class App:
             ti, mods = self.texdrag
             self.texdrag = None
             if self.in_view(ev.pos):
-                self.texture_face_at(ti, ev.pos)       # dragged onto a face
+                if self.tool == DECAL:
+                    self.place_decal(ti, ev.pos)       # dragged onto a wall: a decal
+                else:
+                    self.texture_face_at(ti, ev.pos)   # dragged onto a face
+            elif self.tool == DECAL:
+                self.decal_set_tex(ti)                 # plain click on the thumbnail: swap the selected decal's picture
             else:
                 self.apply_texture(ti, mods)           # plain click on the thumbnail
             return
@@ -2160,6 +2656,9 @@ class App:
         o, d = self.ray(ev.pos)
         if dr["kind"] == "stretch":
             self.stretch_motion(dr, o, d)
+            return
+        if dr["kind"] in ("dmove", "dresize"):
+            self.decal_motion(dr, o, d)
             return
         p = self.plane_point(o, d, dr["z"])
         if p is None:
@@ -2232,6 +2731,7 @@ class App:
         self.cursor3d = None
         self.gz_hover = False
         self.st_hover = None
+        self.dec_hover, self.dec_ghost, self.dec_hh = None, None, None
         if not self.look and not self.drag and self.in_view(self.mouse):
             hit, o, d = self.pick_all(self.mouse, self.tool in (SELECT, ROT))
             if self.tool in (SELECT, ROT, STRETCH):
@@ -2242,6 +2742,16 @@ class App:
                 if self.tool == STRETCH:
                     hh = self.stretch_pick(self.mouse)
                     self.st_hover = (hh["ax"], hh["hi"]) if hh else None
+            elif self.tool == DECAL:
+                hh = self.decal_handle_pick(self.mouse)
+                if hh is not None:
+                    self.dec_hh = (hh["s"], hh["t"])
+                else:
+                    dp = self.decal_pick(self.mouse)
+                    if dp is not None and (hit is None or dp[0] <= hit[0] + 1.0):
+                        self.dec_hover = dp[1]
+                    elif hit and hit[1] == "box":
+                        self.dec_ghost = self.make_decal(self.cur_tex, hit, o, d)[0]
             elif hit:
                 self.cursor3d = o + d * hit[0]
                 self.cursor_n = hit[3]
@@ -2525,6 +3035,7 @@ class App:
             self.build_list()
         gl.glEnable(gl.GL_TEXTURE_2D)
         gl.glCallList(self.list_id)
+        self.draw_decals()
         self.draw_grid()
         gl.glDisable(gl.GL_TEXTURE_2D)
         for i, s in enumerate(self.doc.spawns):
@@ -2542,6 +3053,8 @@ class App:
             self.draw_gizmo()
         elif self.tool == STRETCH:
             self.draw_stretch()
+        elif self.tool == DECAL:
+            self.draw_decal_overlay()
         dr = self.drag
         if dr and dr["kind"] == "box" and dr.get("tool") in (RAMP, CIRC):
             lst = [self.shape_bounds(dr)]
@@ -2711,7 +3224,7 @@ class App:
         y += 18
         for tool, label in ((SELECT, "Select / move  (V)"), (BOX, "Build box  (B)"),
                             (RAMP, "Build slope  (3)"), (CIRC, "Build circle  (4)"),
-                            (ROT, "Spin / turn  (5)"), (STRETCH, "Stretch  (6)"),
+                            (ROT, "Spin / turn  (5)"), (STRETCH, "Stretch  (6)"), (DECAL, "Decal  (7)"),
                             (SPAWN0, "Spawn BLACK  (1)"), (SPAWN1, "Spawn YELLOW  (2)")):
             self.button(x, y, LW - 24, 28, label, lambda t=tool: self.set_tool(t), self.tool == tool)
             if tool in (SPAWN0, SPAWN1):
@@ -2795,7 +3308,23 @@ class App:
         self.text("SELECTED" + (" (%d)" % (1 + len(self.extra)) if self.extra else ""), rx, py, 11, (130, 140, 155))
         py += 20
         obj = self.sel_obj()
-        if obj is None:
+        dec = self.sel_decal() if self.tool == DECAL else None
+        if dec is not None:
+            tn_ = self.doc.tex[dec.tex].name[:16] if 0 <= dec.tex < len(self.doc.tex) else "?"
+            self.text("Decal %d" % (self.dsel + 1), rx, py, 14, (255, 255, 255))
+            self.text("size  %d x %d" % (dec.c1 - dec.c0, dec.v1 - dec.v0), rx, py + 22, 13)
+            self.text("on     " + ("floor" if dec.fi == 0 else "wall"), rx, py + 40, 13)
+            self.text("image  " + tn_, rx, py + 58, 12, (190, 198, 210))
+            self.text("Drag a corner = resize", rx, py + 82, 11, (120, 128, 140))
+            self.text("Shift = stretch free", rx, py + 97, 11, (120, 128, 140))
+            self.text("Wheel or - / = = size", rx, py + 112, 11, (120, 128, 140))
+            self.text("Ctrl+D copy,  Del = delete", rx, py + 127, 11, (120, 128, 140))
+        elif self.tool == DECAL:
+            self.text("No decal selected", rx, py, 13, (160, 168, 180))
+            self.text("Pick an image above, then", rx, py + 20, 12, (120, 128, 140))
+            self.text("click a wall or a floor.", rx, py + 36, 12, (120, 128, 140))
+            self.text("Click a decal to select it.", rx, py + 52, 12, (120, 128, 140))
+        elif obj is None:
             self.text("Nothing selected", rx, py, 13, (160, 168, 180))
             self.text("Click a box or spawn", rx, py + 20, 12, (120, 128, 140))
             self.text("with the Select tool (V).", rx, py + 36, 12, (120, 128, 140))
@@ -2821,7 +3350,7 @@ class App:
         n0 = sum(1 for s in self.doc.spawns if s.team == 0)
         n1 = len(self.doc.spawns) - n0
         info = "%d boxes   spawns: %d black / %d yellow   grid %d   %s" % (
-            len(self.doc.boxes), n0, n1, self.grid, {SELECT: "select", BOX: "build box", RAMP: "build slope", CIRC: "build circle", ROT: "spin / turn", STRETCH: "stretch", SPAWN0: "spawn black", SPAWN1: "spawn yellow"}[self.tool])
+            len(self.doc.boxes), n0, n1, self.grid, {SELECT: "select", BOX: "build box", RAMP: "build slope", CIRC: "build circle", ROT: "spin / turn", STRETCH: "stretch", DECAL: "decal", SPAWN0: "spawn black", SPAWN1: "spawn yellow"}[self.tool])
         if self.tool == RAMP:
             info += "   uphill %s (R = turn it)" % RAMP_DIRS[self.ramp_dir]
         elif self.tool == ROT:
@@ -2857,12 +3386,14 @@ class App:
 
     def draw_help(self):
         lines = (__doc__ or "").strip("\n").split("\n")
-        w, h = 860, 20 * len(lines) + 30
+        lh = 20.0 if 20 * len(lines) + 30 <= self.H - 20 else max(12.0, (self.H - 50.0) / len(lines))
+        w, h = 860, lh * len(lines) + 30
         x, y = (self.W - w) / 2, max(10, (self.H - h) / 2)
         self.rect(x, y, w, h, (0.05, 0.06, 0.08, 0.97))
         self.outline(x, y, w, h, (0.4, 0.5, 0.7, 1), 2)
         for i, l in enumerate(lines):
-            self.text(l, x + 18, y + 14 + i * 20, 13, (235, 238, 245) if (l and not l.startswith(" ")) else (190, 198, 212))
+            self.text(l, x + 18, y + 14 + i * lh, 13 if lh >= 17 else 11,
+                      (235, 238, 245) if (l and not l.startswith(" ")) else (190, 198, 212))
 
     def pick_images(self):
         paths = ask_open_many(IMG_KINDS)
