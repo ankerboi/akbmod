@@ -63,7 +63,12 @@ from OpenGL import GLU as glu
 # --------------------------------------------------------------------------
 # Config / constants
 # --------------------------------------------------------------------------
-SETTINGS_FILE = Path(__file__).with_name("settings.json")
+if getattr(sys, 'frozen', False):
+    # If running as a compiled .exe, save next to the executable
+    SETTINGS_FILE = Path(sys.executable).with_name("settings.json")
+else:
+    # If running as a normal python script, save next to the script
+    SETTINGS_FILE = Path(__file__).with_name("settings.json")
 
 
 def _find_sub(parent, names):
@@ -974,6 +979,12 @@ class FadMapWorld(World):
         if self.DEC:                              # decals: only the picture face, pulled toward the viewer a bit
             gl.glEnable(gl.GL_POLYGON_OFFSET_FILL)
             gl.glPolygonOffset(-2.0, -2.0)
+            # decals carry their own alpha (PNG see-through parts + the builder's Opacity slider):
+            # blend it, and drop fully clear pixels so they never hide what is behind them
+            gl.glEnable(gl.GL_BLEND)
+            gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+            gl.glEnable(gl.GL_ALPHA_TEST)
+            gl.glAlphaFunc(gl.GL_GREATER, 0.01)
             for b, fo, tile, col in self.DEC:
                 for fi, f in enumerate(self._faces(b)):
                     if fo[fi] < 0:
@@ -992,6 +1003,8 @@ class FadMapWorld(World):
                         gl.glTexCoord2f(u, v)
                         gl.glVertex3f(*pt)
                     gl.glEnd()
+            gl.glDisable(gl.GL_ALPHA_TEST)
+            gl.glDisable(gl.GL_BLEND)
             gl.glDisable(gl.GL_POLYGON_OFFSET_FILL)
         gl.glEndList()
 
