@@ -337,6 +337,11 @@ class SrcData:
         return info
 
 
+# viewmodel (weapon + arms) is re-skinned on the CPU at most this many times per second; lower = more fps while
+# walking / animating, higher = smoother weapon motion
+VM_SKIN_HZ = 100.0
+
+
 class SrcInst:
     """Per-weapon pose state. Same interface the game uses for GoldSrc models (MdlInst)."""
     is_source = True
@@ -364,6 +369,12 @@ class SrcInst:
         self._wk = [np.ascontiguousarray(w_ / tot, dtype=np.float32) for w_ in ws]
         # pre-split rest positions for faster skinning (xyz only; w=1 applied as translation)
         self._Px = np.ascontiguousarray(mm.v_pos, dtype=np.float32)
+        self._splan = self._make_skin_plan(self._Px, self._bi, self._wk)
+        depth = np.zeros(nbn, dtype=np.int32)
+        for b_ in range(nbn):
+            p_ = int(self._par[b_])
+            depth[b_] = depth[p_] + 1 if 0 <= p_ < b_ else 0
+        self._levels = [np.where(depth == d_)[0] for d_ in range(1, int(depth.max()) + 1)]   # depth 0 = roots (W = L)
         self.base_seq = 0
         self.want_empty = False
         self.avtx = None
@@ -379,6 +390,7 @@ class SrcInst:
             aw = [np.where(am.v_nb > k, am.v_w[:, k], 0.0).astype(np.float32) for k in range(3)]
             at = np.maximum(aw[0] + aw[1] + aw[2], 1e-6)
             self._awk = [np.ascontiguousarray(x / at, dtype=np.float32) for x in aw]
+            self._asplan = self._make_skin_plan(self._aPx, self._abi, self._awk)
             self._albind = []
             for b in am.bones:
                 Lb = np.eye(4, dtype=np.float32)
@@ -582,7 +594,7 @@ class SrcInst:
             return
         now = time.perf_counter()
         if (not force and self.last is not None and self.last[0] == si and self.bt <= 0
-                and (now - getattr(self, "_pose_t", 0.0)) < (1.0 / 120.0)):
+                and (now - getattr(self, "_pose_t", 0.0)) < (1.0 / VM_SKIN_HZ)):
             return  # keep previous mesh; self.last stays so a newer frame retries next tick
         self.last = key
         self._pose_t = now
@@ -607,6 +619,54 @@ class SrcInst:
             print("Pose build failed, hiding arms and retrying:", ex)
             self.a, self.avtx = None, None
             self._build(pos, quat)
+
+    @staticmethod
+    def _make_skin_plan(Px, bi, wk):
+        """Split the vertices into rigid ones (one bone: most of a gun) and blended ones (2-3 bones) once,
+        and lay the data out as contiguous rows so every frame is a few big vector operations."""
+        nv = len(Px)
+        Pt = np.ascontiguousarray(np.concatenate([Px, np.ones((nv, 1), np.float32)], 1).astype(np.float32).T)  # (4, nv)
+        rigid = (wk[1] + wk[2]) < 1e-4
+        ri = np.where(rigid)[0]
+        si = np.where(~rigid)[0]
+        return {
+            "nv": nv, "ri": ri, "si": si,
+            "rb": bi[0][ri], "rP": np.ascontiguousarray(Pt[:, ri]),
+            "sb": [b[si] for b in bi], "sw": [np.ascontiguousarray(w[si]) for w in wk],
+            "sP": np.ascontiguousarray(Pt[:, si]),
+        }
+
+    @staticmethod
+    def _apply_rows(B, P):
+        """B=(12,n) blended bone matrices (row-major 3x4), P=(4,n) rest positions -> (3,n) skinned positions."""
+        out = np.empty((3, P.shape[1]), np.float32)
+        for i in range(3):
+            c = i * 4
+            o = out[i]
+            np.multiply(B[c], P[0], out=o)
+            o += B[c + 1] * P[1]
+            o += B[c + 2] * P[2]
+            o += B[c + 3]
+        return out
+
+    @staticmethod
+    def _skin_fast(M, pl):
+        """Same result as _skin_verts, about 2-3x cheaper: M=(nb,3,4)."""
+        Mt = np.ascontiguousarray(np.asarray(M, np.float32).reshape(len(M), 12).T)      # (12, nb)
+        out = np.empty((pl["nv"], 3), np.float32)
+        if len(pl["ri"]):
+            out[pl["ri"]] = SrcInst._apply_rows(np.take(Mt, pl["rb"], axis=1), pl["rP"]).T
+        if len(pl["si"]):
+            B = np.take(Mt, pl["sb"][0], axis=1)
+            B *= pl["sw"][0]
+            tmp = np.take(Mt, pl["sb"][1], axis=1)
+            tmp *= pl["sw"][1]
+            B += tmp
+            np.take(Mt, pl["sb"][2], axis=1, out=tmp)
+            tmp *= pl["sw"][2]
+            B += tmp
+            out[pl["si"]] = SrcInst._apply_rows(B, pl["sP"]).T
+        return out
 
     @staticmethod
     def _skin_verts(M, Px, bi, wk):
@@ -635,12 +695,10 @@ class SrcInst:
         L[:, 3, 3] = 1
         W = L.copy()
         par = self._par
-        for b in range(nb):
-            p = int(par[b])
-            if 0 <= p < b:
-                W[b] = W[p] @ L[b]
+        for lv in self._levels:                  # all bones of one depth at once (a few steps, not one per bone)
+            W[lv] = np.matmul(W[par[lv]], L[lv])
         M = np.matmul(W, self._p2b)[:, :3, :]                      # (nb,3,4) float32
-        self.vtx = self._skin_verts(M, self._Px, self._bi, self._wk)
+        self.vtx = self._skin_fast(M, self._splan)
         if self.a is not None:
             try:
                 self._build_arms(W)
@@ -760,7 +818,7 @@ class SrcInst:
                     par = am.bones[b]["par"]
                     WA[b] = WA[par] @ self._albind[b] if 0 <= par < b else self._albind[b]
             MA = np.matmul(WA, self._ap2b)[:, :3, :]
-            av = self._skin_verts(MA, self._aPx, self._abi, self._awk)
+            av = self._skin_fast(MA, self._asplan)
             if not np.isfinite(av).all() or np.abs(av).max() > 1e4:
                 # a retargeted hand went bad on this frame (reload poses bend the wrists a lot): keep the
                 # last good arms mesh instead of feeding NaN / huge vertices to OpenGL

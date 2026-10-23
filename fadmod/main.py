@@ -196,14 +196,18 @@ def main():
                 save_settings(game, menu)
             elif ev.type == pygame.KEYDOWN:
                 # toggle console with the bound key (default ` / tilde)
-                _ck = (game.binds.get("console") or "`").lower().strip()
                 _kn = pygame.key.name(ev.key).lower()
                 _uni = (ev.unicode or "").lower()
-                if _ck in ("`", "~", "tilde", "backquote"):
-                    _is_con = (ev.key == pygame.K_BACKQUOTE or _kn in ("`", "~", "tilde", "backquote")
-                               or _uni in ("`", "~"))
-                else:
-                    _is_con = (_kn == _ck or _uni == _ck)
+                _is_con = False
+                for _ck in ((game.binds.get("console") or "`").lower().strip(),
+                            (game.binds2.get("console") or "").lower().strip()):
+                    if not _ck:
+                        continue
+                    if _ck in ("`", "~", "tilde", "backquote"):
+                        _is_con = _is_con or (ev.key == pygame.K_BACKQUOTE or _kn in ("`", "~", "tilde", "backquote")
+                                              or _uni in ("`", "~"))
+                    else:
+                        _is_con = _is_con or (_kn == _ck or _uni == _ck)
                 if _is_con:
                     game.con_toggle()
                     continue
@@ -258,26 +262,31 @@ def main():
                     if ev.key == pygame.K_ESCAPE:
                         set_lock(False)
                         continue
-                    name = pygame.key.name(ev.key)
-                    game.keys[name] = True
-                    b = game.binds
-                    if name == b["jump"]:
-                        game.P.jreq = 1
-                    if name == b["reload"]:
-                        game.reload_pressed()
-                    for i in range(2):
-                        if name == b[f"weapon{i + 1}"]:
-                            game.select_weapon(i)
-                    if name == b["swaphand"]:
-                        game.hand_swap = not game.hand_swap
-                    if name == b["melee"]:
-                        game.melee_pressed()
-                    if name == "f":
-                        FX.flash = not FX.flash
+                    raw = pygame.key.name(ev.key)
+                    game.held_raw.add(raw)
+                    for name in game.key_aliases(raw):       # the key itself + whatever it is a 2nd bind for
+                        game.keys[name] = True
+                        b = game.binds
+                        if name == b["jump"]:
+                            game.P.jreq = 1
+                        if name == b["reload"]:
+                            game.reload_pressed()
+                        for i in range(2):
+                            if name == b[f"weapon{i + 1}"]:
+                                game.select_weapon(i)
+                        if name == b["swaphand"]:
+                            game.hand_swap = not game.hand_swap
+                        if name == b["melee"]:
+                            game.melee_pressed()
+                        if name == "f":
+                            FX.flash = not FX.flash
                 else:
                     menu.key_down(ev)
             elif ev.type == pygame.KEYUP:
-                game.keys[pygame.key.name(ev.key)] = False       # always: keys held when the console opened must not get stuck
+                _raw = pygame.key.name(ev.key)       # always: keys held when the console opened must not get stuck
+                game.held_raw.discard(_raw)
+                for _n in game.key_aliases(_raw):
+                    game.keys[_n] = game.key_held(_n)
             elif ev.type == pygame.MOUSEMOTION:
                 if game.con_open:
                     pass
@@ -297,20 +306,22 @@ def main():
                     if btn in (4, 5):
                         continue  # wheel handled by MOUSEWHEEL
                     if btn in (6, 7):
-                        code = "Mouse" + str(btn - 2)
-                        game.keys[code] = True
-                        b = game.binds
-                        if code == b["jump"]:
-                            game.P.jreq = 1
-                        if code == b["reload"]:
-                            game.reload_pressed()
-                        for i in range(2):
-                            if code == b[f"weapon{i + 1}"]:
-                                game.select_weapon(i)
-                        if code == b["swaphand"]:
-                            game.hand_swap = not game.hand_swap
-                        if code == b["melee"]:
-                            game.melee_pressed()
+                        raw = "Mouse" + str(btn - 2)
+                        game.held_raw.add(raw)
+                        for code in game.key_aliases(raw):
+                            game.keys[code] = True
+                            b = game.binds
+                            if code == b["jump"]:
+                                game.P.jreq = 1
+                            if code == b["reload"]:
+                                game.reload_pressed()
+                            for i in range(2):
+                                if code == b[f"weapon{i + 1}"]:
+                                    game.select_weapon(i)
+                            if code == b["swaphand"]:
+                                game.hand_swap = not game.hand_swap
+                            if code == b["melee"]:
+                                game.melee_pressed()
                     elif btn == 1:
                         game.keys["mouse1"] = True
                     elif btn == 3:
@@ -330,7 +341,10 @@ def main():
                     game.keys["mouse1"] = False
                     menu.mouse_up()
                 elif ev.button in (6, 7):
-                    game.keys["Mouse" + str(ev.button - 2)] = False
+                    _raw = "Mouse" + str(ev.button - 2)
+                    game.held_raw.discard(_raw)
+                    for _n in game.key_aliases(_raw):
+                        game.keys[_n] = game.key_held(_n)
             elif ev.type == pygame.MOUSEWHEEL:
                 if game.lock:
                     game.P.jreq = 1

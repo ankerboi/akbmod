@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 
+import pygame
+
 from .config import *
 from .glutil import FX
 
@@ -12,6 +14,8 @@ def load_settings(game, menu):
         for k in DEFAULT_BINDS:
             if isinstance(b.get(k), str):
                 game.binds[k] = b[k]
+        b2 = j.get("binds2", {})
+        game.binds2 = {k: b2[k] for k in DEFAULT_BINDS if isinstance(b2.get(k), str) and b2[k]}
         game.sens = float(j.get("sens", BASE_SENS))
         game.xp = max(0, int(j.get("xp", 0) or 0))
         game.hand_swap = bool(j.get("hand_swap", False))
@@ -116,7 +120,7 @@ def set_fullscreen(game, on):
 def save_settings(game, menu):
     try:
         SETTINGS_FILE.write_text(json.dumps({
-            "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "hand_swap": game.hand_swap, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "primary": game.primary, "day": bool(FX.day), "res": list(game.res), "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "show_speed": bool(game.show_speed), "show_jstats": bool(game.show_jstats), "fov": game.fov_cfg, "vm_offset": game.vm_adj,
+            "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "binds2": game.binds2, "hand_swap": game.hand_swap, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "primary": game.primary, "day": bool(FX.day), "res": list(game.res), "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "show_speed": bool(game.show_speed), "show_jstats": bool(game.show_jstats), "fov": game.fov_cfg, "vm_offset": game.vm_adj,
             "sens": game.sens, "xp": int(game.xp), "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh, "viewbob": float(game.viewbob),
         }, indent=2))
     except Exception:

@@ -612,9 +612,7 @@ def render_hud(game, gfx, W, H, menu_visible):
         gfx.text(f"{int(round(game.fps_val))} FPS", 12, 10, 14, (255, 255, 255), bold=True, mono=True)
     if game.show_speed and P.alive and not game.over:
         sp_ = math.hypot(P.vx, P.vy)                     # horizontal speed, units / second
-        t_ = max(0.0, min(1.0, (sp_ - MAXS) / (MAXS * 0.6)))   # white at normal speed -> yellow when fast
-        col_ = (255, int(255 - 62 * t_), int(255 - 248 * t_))
-        gfx.text(f"{int(round(sp_))}", W / 2, H - 66, 26, col_, bold=True, anchor="c", mono=True)
+        gfx.text(f"{int(round(sp_))}", W / 2, H - 66, 26, (255, 255, 255), bold=True, anchor="c", mono=True)
 
     # CS:GO-style developer console
     if game.con_open:

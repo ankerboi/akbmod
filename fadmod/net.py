@@ -1,5 +1,6 @@
 """LAN discovery, MQTT broker room browser, UDP peer networking."""
 import json
+import os
 import queue
 import random
 import socket
@@ -7,6 +8,9 @@ import struct
 import threading
 import time
 from pathlib import Path
+
+from .config import CFG
+from .glutil import FX
 
 
 NET_DISC_PORT = 27777          # LAN broadcast

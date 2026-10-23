@@ -47,6 +47,8 @@ Texture  DRAG an image file from your PC and DROP it on the face you want (that 
            Or "Add image", then click it in the right panel (whole selected box),
            Shift+click = top only, Ctrl+click = sides only, or DRAG it from the panel onto a face.
            [ and ] = texture size
+  PixelZone press 8 (or Z), drag a block like a box. It is INVISIBLE in the game and not solid: wherever you stand inside it
+           you can pixel surf. Outside every zone, pixel surf does nothing. Select / move / stretch / spin / copy it like a box.
   Files    Ctrl+S save project   Ctrl+O open   F5 compile   Ctrl+Z undo   Ctrl+Y redo
            G = next grid size    F = look at selection     F1 = help
 """
@@ -103,6 +105,7 @@ DEFAULT_COL = (176, 160, 144)
 HULL_R, HULL_H = 16.0, 72.0          # player: 32 wide, 72 tall (same as the game)
 SELECT, BOX, SPAWN0, SPAWN1, RAMP, CIRC, ROT = "select", "box", "spawn0", "spawn1", "ramp", "circle", "rotate"
 STRETCH = "stretch"
+PXZ = "pxzone"                        # builds an invisible pixel surf zone
 DECAL = "decal"
 DECAL_THICK = 0.1                    # compiled decals are paper thin; the game draws them flush with no collision
 DEC_MIN = 8.0                        # smallest decal side
@@ -154,10 +157,11 @@ LW, RW, SB = 196, 236, 26           # left panel, right panel, status bar sizes
 # Map data
 # --------------------------------------------------------------------------
 class Box:
-    __slots__ = ("b", "t", "tt", "tile", "col", "f", "k", "d", "yaw")
+    __slots__ = ("b", "t", "tt", "tile", "col", "f", "k", "d", "yaw", "px")
 
-    def __init__(self, b, t=-1, tt=None, tile=128.0, col=DEFAULT_COL, f=None, k=0, d=0, yaw=0.0):
+    def __init__(self, b, t=-1, tt=None, tile=128.0, col=DEFAULT_COL, f=None, k=0, d=0, yaw=0.0, px=0):
         self.b = [float(v) for v in b]
+        self.px = 1 if px else 0                 # 1 = PIXEL SURF ZONE: an invisible block, no collision; inside it you can pixel surf
         self.yaw = float(yaw)                    # spin around the box centre, degrees (counter-clockwise from above)
         self.k = int(k)                          # 0 box, 1 slope, 2 cylinder
         self.d = int(d)                          # slope uphill direction: 0 +x, 1 +y, 2 -x, 3 -y
@@ -170,7 +174,7 @@ class Box:
         self.f = [int(v) for v in (f + [-1] * 6)[:6]]
 
     def copy(self):
-        return Box(list(self.b), self.t, self.tt, self.tile, self.col, self.f, self.k, self.d, self.yaw)
+        return Box(list(self.b), self.t, self.tt, self.tile, self.col, self.f, self.k, self.d, self.yaw, self.px)
 
     def fix(self):
         b = self.b
@@ -623,7 +627,8 @@ class MapDoc:
             "boxes": [dict({"b": [round(v, 3) for v in b.b], "t": remap.get(b.t, -1), "tt": remap.get(b.tt, -1),
                             "tile": b.tile, "c": list(b.col), "k": b.k, "d": b.d,
                             "f": [remap.get(v, -1) for v in b.f]},
-                           **({"yaw": round(b.yaw, 3)} if b.yaw else {})) for b in boxes],
+                           **({"yaw": round(b.yaw, 3)} if b.yaw else {}),
+                           **({"px": 1} if b.px else {})) for b in boxes],
             "spawns": [[{"p": [round(s.x, 2), round(s.y, 2), round(s.z, 2)], "yaw": round(s.yaw, 1)}
                         for s in self.spawns if s.team == t] for t in (0, 1)],
         }
@@ -641,7 +646,7 @@ class MapDoc:
         if d.get("format") != MAP_FORMAT:
             raise ValueError("not a FAD-MOD map file")
         self.tex = [decode_tex(t) for t in d.get("textures", [])]
-        self.boxes = [Box(b["b"], b.get("t", -1), b.get("tt"), b.get("tile", 128), b.get("c", DEFAULT_COL), b.get("f"), b.get("k", 0), b.get("d", 0), b.get("yaw", 0.0))
+        self.boxes = [Box(b["b"], b.get("t", -1), b.get("tt"), b.get("tile", 128), b.get("c", DEFAULT_COL), b.get("f"), b.get("k", 0), b.get("d", 0), b.get("yaw", 0.0), b.get("px", 0))
                       for b in d.get("boxes", [])]
         for b in self.boxes:
             b.fix()
@@ -705,7 +710,10 @@ def compile_doc(doc, out_path):
     msgs, warns = [], []
     boxes, seen, dropped, dups = [], set(), 0, 0
     flat = []
+    zones = [z.copy() for z in doc.boxes if z.px and z.b[3] - z.b[0] >= 1 and z.b[4] - z.b[1] >= 1 and z.b[5] - z.b[2] >= 1]
     for src in doc.boxes:                    # the game turns spun objects itself: keep their spin
+        if src.px:                           # pixel surf zones are invisible and not solid: they go in their own list
+            continue
         nb = src.copy()
         nb.yaw = src.yaw % 360.0
         if nb.yaw < 1e-4 or nb.yaw > 360.0 - 1e-4:
@@ -811,6 +819,11 @@ def compile_doc(doc, out_path):
     if all(doc.cube):
         tmp.sky = Tex("sky_from_cubemap", cube_to_equirect(doc.cube))
     d = tmp.to_dict(compiled=True, max_side=512)
+    if zones:
+        d["pxz"] = [dict({"b": [round(v, 2) for v in z.b]}, **({"yaw": round(z.yaw % 360.0, 3)} if z.yaw else {})) for z in zones]
+        msgs.append("%d pixel surf zone(s)" % len(zones))
+    else:
+        warns.append("no pixel surf zones: nobody can pixel surf on this map (tool 8 builds one)")
     d["void_z"] = round(min(b[2] for b in bl) - 800.0, 1)
     d["bounds"] = [round(min(b[i] for b in bl), 1) for i in range(3)] + [round(max(b[i + 3] for b in bl), 1) for i in range(3)]
     for e in d["boxes"][len(boxes):]:         # the last ones are the decals: the game makes them non-solid
@@ -1265,7 +1278,10 @@ class App:
         """Nearest thing under the mouse: (t, kind, index, normal). Ground plane z=0 is ("ground", -1)."""
         o, d = self.ray(pos)
         best = None
+        zone_ok = self.tool in (SELECT, ROT, STRETCH)      # zones are invisible blocks: only the editing tools can grab them
         for i, b in enumerate(self.doc.boxes):
+            if b.px and not zone_ok:
+                continue
             h = ray_box(rot_point(b, o, True), rot_vec(b, d, True), b.b)     # spun boxes: ray in the box's own frame
             if h and (best is None or h[0] < best[0]):
                 best = (h[0], "box", i, h[1])
@@ -1892,6 +1908,8 @@ class App:
     def new_box(self, b):
         self.push_undo()
         nb = Box(b, self.cur_tex, self.cur_tex, self.tile)
+        if self.tool == PXZ:
+            nb.px = 1
         nb.fix()
         self.doc.boxes.append(nb)
         self.sel = ("box", len(self.doc.boxes) - 1)
@@ -1934,6 +1952,8 @@ class App:
 
     def set_tool(self, t):
         self.tool = t
+        if t == PXZ:
+            self.msg("Pixel surf zone: drag a box like a normal box. It is invisible in the game; inside it you can pixel surf. Wheel / - = = height.", 8)
         if t == DECAL:
             self.sel = None
             self.msg("Decal: pick an image on the right, then CLICK a wall or floor. Drag the corner squares to resize.", 8)
@@ -2559,6 +2579,8 @@ class App:
             self.tool = SELECT
         elif k == pygame.K_b:
             self.tool = BOX
+        elif k == pygame.K_8 or k == pygame.K_z:
+            self.set_tool(PXZ)
         elif k == pygame.K_1:
             self.tool = SPAWN0
         elif k == pygame.K_2:
@@ -2694,7 +2716,7 @@ class App:
             self.sel = ("box", hit[2]) if (hit and hit[1] == "box") else None
         elif self.tool == DECAL:
             self.decal_down(ev.pos)
-        elif self.tool in (BOX, RAMP, CIRC):
+        elif self.tool in (BOX, PXZ, RAMP, CIRC):
             z = self.place_plane(ev.pos)
             if z is None:
                 self.msg("Click on the floor or on top of a box to start a box")
@@ -2922,6 +2944,8 @@ class App:
         gl.glNewList(self.list_id, gl.GL_COMPILE)
         gl.glEnable(gl.GL_TEXTURE_2D)
         for b in self.doc.boxes:
+            if b.px:
+                continue                     # zones are drawn translucent in draw_world
             if b.k:
                 self.draw_shape(b)
                 continue
@@ -3189,6 +3213,19 @@ class App:
         gl.glDisable(gl.GL_TEXTURE_2D)
         for i, s in enumerate(self.doc.spawns):
             self.draw_spawn(s, self.sel == ("spawn", i) or ("spawn", i) in self.extra)
+        zl = [zb for zb in self.doc.boxes if zb.px]
+        if zl:                                   # pixel surf zones: see-through cyan blocks
+            gl.glDepthMask(gl.GL_FALSE)
+            gl.glColor4f(0.1, 0.95, 0.85, 0.16)
+            gl.glBegin(gl.GL_QUADS)
+            for zb in zl:
+                for f in box_faces(zb.b):
+                    for p in f[:4]:
+                        gl.glVertex3f(*rot_point(zb, p))
+            gl.glEnd()
+            gl.glDepthMask(gl.GL_TRUE)
+            for zb in zl:
+                self.wire_box(zb.b, (0.1, 1.0, 0.85, 1.0), 2.0, 0.4, zb.yaw)
         if self.hover and self.hover[0] == "box":
             hb = self.doc.boxes[self.hover[1]]
             self.wire_box(hb.b, (1, 1, 1, 0.8), 2.0, 0.4, hb.yaw)
@@ -3240,13 +3277,13 @@ class App:
             gl.glEnd()
             gl.glDepthMask(gl.GL_TRUE)
             self.wire_box(b, (0.4, 0.9, 1.0, 1.0), 2.5, 0)
-        elif self.cursor3d is not None and self.tool in (BOX, RAMP, CIRC, SPAWN0, SPAWN1):
+        elif self.cursor3d is not None and self.tool in (BOX, PXZ, RAMP, CIRC, SPAWN0, SPAWN1):
             p = self.cursor3d
             g = self.grid
             x, y = snap(p[0], g), snap(p[1], g)
             z = p[2]
             n = getattr(self, "cursor_n", (0, 0, 1))
-            if self.tool in (BOX, RAMP, CIRC) and n == (0, 0, 1):
+            if self.tool in (BOX, PXZ, RAMP, CIRC) and n == (0, 0, 1):
                 gl.glDepthMask(gl.GL_FALSE)
                 gl.glColor4f(0.3, 0.8, 1.0, 0.35)
                 gl.glBegin(gl.GL_QUADS)
@@ -3388,6 +3425,7 @@ class App:
         for tool, label in ((SELECT, "Select / move  (V)"), (BOX, "Build box  (B)"),
                             (RAMP, "Build slope  (3)"), (CIRC, "Build circle  (4)"),
                             (ROT, "Spin / turn  (5)"), (STRETCH, "Stretch  (6)"), (DECAL, "Decal  (7)"),
+                            (PXZ, "Pixel surf zone  (8)"),
                             (SPAWN0, "Spawn BLACK  (1)"), (SPAWN1, "Spawn YELLOW  (2)")):
             sp_ = tool in (SPAWN0, SPAWN1)
             self.button(0, y, LW - 1, 29, label, lambda t=tool: self.set_tool(t), self.tool == tool,
@@ -3501,8 +3539,8 @@ class App:
             self.text("with the Select tool (V).", rx, py + 36, 12, (120, 128, 140))
         elif self.sel[0] == "box":
             b = obj.b
-            self.text("BOX", rx, py + 1, 12, (230, 160, 50))
-            self.text("%d" % (self.sel[1] + 1), rx + 52, py, 14, (255, 255, 255))
+            self.text("PIXEL ZONE" if obj.px else "BOX", rx, py + 1, 12, (60, 230, 205) if obj.px else (230, 160, 50))
+            self.text("%d" % (self.sel[1] + 1), rx + 98 if obj.px else rx + 52, py, 14, (255, 255, 255))
             self.text("size  %d x %d x %d" % (b[3] - b[0], b[4] - b[1], b[5] - b[2]), rx, py + 22, 13)
             self.text("at    %d, %d, %d" % (b[0], b[1], b[2]), rx, py + 40, 13)
 
@@ -3511,8 +3549,12 @@ class App:
             self.text("sides  " + tn(obj.t), rx, py + 62, 12, (190, 198, 210))
             self.text("top    " + tn(obj.tt), rx, py + 80, 12, (190, 198, 210))
             self.text("tile   %d     turn  %d deg" % (obj.tile, round(obj.yaw)), rx, py + 98, 12, (190, 198, 210))
-            self.text("Drop / drag an image on a face", rx, py + 120, 11, (120, 128, 140))
-            self.text("= texture just that face", rx, py + 135, 11, (120, 128, 140))
+            if obj.px:
+                self.text("Invisible in the game. Inside", rx, py + 120, 11, (120, 128, 140))
+                self.text("this block you can pixel surf.", rx, py + 135, 11, (120, 128, 140))
+            else:
+                self.text("Drop / drag an image on a face", rx, py + 120, 11, (120, 128, 140))
+                self.text("= texture just that face", rx, py + 135, 11, (120, 128, 140))
         else:
             self.text("SPAWN", rx, py + 1, 12, (80, 200, 170))
             self.text(TEAM_NAMES[obj.team], rx + 52, py, 14, (*[int(c * 255) for c in TEAM_COL[obj.team]],))
@@ -3523,7 +3565,7 @@ class App:
         n0 = sum(1 for s in self.doc.spawns if s.team == 0)
         n1 = len(self.doc.spawns) - n0
         info = "%d boxes   spawns: %d black / %d yellow   grid %d   %s" % (
-            len(self.doc.boxes), n0, n1, self.grid, {SELECT: "select", BOX: "build box", RAMP: "build slope", CIRC: "build circle", ROT: "spin / turn", STRETCH: "stretch", DECAL: "decal", SPAWN0: "spawn black", SPAWN1: "spawn yellow"}[self.tool])
+            len(self.doc.boxes), n0, n1, self.grid, {SELECT: "select", BOX: "build box", RAMP: "build slope", CIRC: "build circle", ROT: "spin / turn", STRETCH: "stretch", DECAL: "decal", PXZ: "pixel surf zone", SPAWN0: "spawn black", SPAWN1: "spawn yellow"}[self.tool])
         if self.tool == RAMP:
             info += "   uphill %s (R = turn it)" % RAMP_DIRS[self.ramp_dir]
         elif self.tool == ROT:

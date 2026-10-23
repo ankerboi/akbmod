@@ -11,6 +11,7 @@ from OpenGL import GLU as glu
 
 from .config import *
 from .glutil import make_texture, FX
+from .net import NET_MAX_PLAYERS, BROKER_ROOT
 from .gfx import Gfx, c255, team_tint, team_logo, draw_team_logo, draw_mod_image, mod_image
 from .source.loaders import make_vm, SrcInst, SrcPlayerInst, SrcSpec
 from .settings import save_settings, set_fullscreen
@@ -107,17 +108,24 @@ class Menu:
         if not self.waiting:
             return False
         action = self.waiting
-        binds = self.g.binds
-        clash = next((i for i, _ in BIND_META if i != action and binds[i] == code), None)
-        if clash:
-            binds[clash] = binds[action]
-        binds[action] = code
+        binds, binds2 = self.g.binds, self.g.binds2
         self.waiting = None
+        if action.endswith("#2"):                       # second key for the action
+            aid = action[:-2]
+            if code != binds.get(aid):
+                binds2[aid] = code                      # the same key may serve several actions
+        else:
+            binds[action] = code
+            if binds2.get(action) == code:
+                del binds2[action]
         return True
 
     def key_down(self, event):
         if self.waiting:
             if event.key == pygame.K_ESCAPE:
+                self.waiting = None
+            elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE) and self.waiting.endswith("#2"):
+                self.g.binds2.pop(self.waiting[:-2], None)      # clear the second key
                 self.waiting = None
             else:
                 self.bind_press(pygame.key.name(event.key))
@@ -814,22 +822,25 @@ class Menu:
             slider(cx + 20, 204 + 40, cw - 40, g.audio.volume, 0, 1, lambda v: setattr(g.audio, "volume", v))
 
             panel(cx, 282, cw, 312, "Key bindings")
-            gfx.text("Mouse 4 / Mouse 5 can be bound too. Esc cancels.", cx + cw - 20, 284 + 14, 11, (119, 119, 119), anchor="r")
+            gfx.text("Two keys per action (left = main, right = second). The same key can be used for several actions. Backspace clears the second.", cx + cw - 20, 284 + 14, 11, (119, 119, 119), anchor="r")
             for i, (aid, label) in enumerate(BIND_META):
                 col, row = divmod(i, 7)
                 rx = cx + 20 + col * 330
                 ry = 282 + 44 + row * 38
                 gfx.box(rx, ry, 320, 32, c255(17, 17, 17), c255(24, 24, 24))
-                gfx.text(label, rx + 12, ry + 8, 12, (230, 230, 230))
-                waiting = self.waiting == aid
-                bw = 124
-                hv = hover(rx + 320 - bw - 6, ry + 3, bw, 26)
-                gfx.box(rx + 320 - bw - 6, ry + 3, bw, 26,
-                        c255(52, 52, 52) if waiting else (c255(42, 42, 42) if hv else c255(24, 24, 24)),
-                        c255(200, 200, 200) if waiting else c255(42, 42, 42))
-                gfx.text("Press a key..." if waiting else key_label(g.binds[aid]), rx + 320 - bw / 2 - 6, ry + 8, 12,
-                         (255, 255, 255), anchor="c")
-                self.hot.append((rx + 320 - bw - 6, ry + 3, bw, 26, lambda a=aid: setattr(self, "waiting", a), None))
+                gfx.text(label, rx + 10, ry + 9, 11, (230, 230, 230))
+                bw = 76
+                for slot, sid in enumerate((aid, aid + "#2")):      # main key, second key
+                    bx = rx + 320 - (2 - slot) * (bw + 4) - 2
+                    waiting = self.waiting == sid
+                    hv = hover(bx, ry + 3, bw, 26)
+                    gfx.box(bx, ry + 3, bw, 26,
+                            c255(52, 52, 52) if waiting else (c255(42, 42, 42) if hv else c255(24, 24, 24)),
+                            c255(200, 200, 200) if waiting else c255(42, 42, 42))
+                    val = g.binds[aid] if slot == 0 else g.binds2.get(aid, "")
+                    txt = "Press..." if waiting else (key_label(val).replace("Mouse ", "M").replace(" / Back", "").replace(" / Forward", "") if val else "-")
+                    gfx.text(txt, bx + bw / 2, ry + 9, 11, (255, 255, 255) if val or waiting else (110, 110, 110), anchor="c")
+                    self.hot.append((bx, ry + 3, bw, 26, lambda a=sid: setattr(self, "waiting", a), None))
             button(cx + 350, 282 + 44 + 6 * 38, 150, 32, "Reset defaults", self.reset_keys)
             button(cx + 512, 282 + 44 + 6 * 38, 150, 32, "Back to play", lambda: self.set_page("play"), True)
         elif self.page == "settings" and self.set_sub == "viewmodel":
@@ -1005,6 +1016,7 @@ class Menu:
     def reset_keys(self):
         self.g.binds.clear()
         self.g.binds.update(DEFAULT_BINDS)
+        self.g.binds2.clear()
         self.waiting = None
 
     def set_sub_tab(self, sub):

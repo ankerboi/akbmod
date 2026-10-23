@@ -53,14 +53,14 @@ void main(){
     float wide = smoothstep(0.30, 1.0, ca);                  // soft spill around it
     float att = 1.0 / (1.0 + pow(dist / 650.0, 2.0));        // light dies with distance
     float on = uFlash * uFlick;
-    vec3 beam = vec3(1.0, 0.92, 0.74) * (spot * 1.35 + wide * 0.10) * att * on * (1.0 - uDay);
+    vec3 beam = vec3(1.0, 0.97, 0.92) * (spot * 1.35 + wide * 0.10) * att * on * (1.0 - uDay);
     vec3 amb = (uMode > 0.5) ? vec3(0.50, 0.50, 0.52) : vec3(0.15, 0.16, 0.17);
     amb = mix(amb, vec3(1.0, 0.98, 0.93), uDay);             // day: full sunlight
     vec3 lit = base.rgb * (amb + beam);
     float l = dot(lit, vec3(0.299, 0.587, 0.114));
-    vec3 night = mix(vec3(l), lit, 0.72) * vec3(1.04, 1.0, 0.90);   // drained, slightly sickly tint
+    vec3 night = mix(vec3(l), lit, 0.72) * vec3(0.98, 1.0, 1.0);   // drained, neutral tint
     lit = mix(night, lit, uDay);
-    vec3 fogc = uFog + vec3(0.95, 0.88, 0.7) * wide * 0.07 * on * (1.0 - att * 0.5) * (1.0 - uDay);
+    vec3 fogc = uFog + vec3(0.95, 0.94, 0.90) * wide * 0.07 * on * (1.0 - att * 0.5) * (1.0 - uDay);
     float f = (uMode > 0.5) ? 1.0 : exp(-pow(dist * uDensity, 2.0));
     gl_FragColor = vec4(mix(fogc, lit, f), base.a);
 }

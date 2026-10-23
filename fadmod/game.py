@@ -23,14 +23,14 @@ from .glutil import FX, make_texture
 from .world import World, ArenaWorld, FadMapWorld
 from .audio import Audio
 from .entity import Ent
-from .net import NET, Net  # NET is the global instance
+from .net import NET, Net, NET_STATE_HZ  # NET is the global instance
 from .source.vpk import VpkArchive
 from .source.loaders import (
     LooseSrcFiles, DirSrcFiles, src_root, src_rel, _is_arms_mdl, _mdl_looks_like_arms,
     src_arms, src_arms_all, SrcSpec, SrcData, SrcInst, SrcPlayerInst, make_vm,
     extract_rar, is_src_player, src_players, src_scan,
 )
-from .source.model import VM_EVENT_GAIN, SHOTGUN_RELOAD_SCALE, PLAYER_SCALE, HIT_HALF_W, HIT_HALF_H, HIT_HALF_H_LOW, HEAD_FRAC
+from .source.model import VM_EVENT_GAIN, SHOTGUN_RELOAD_SCALE, PLAYER_SCALE, HIT_HALF_W, HIT_HALF_H, HIT_HALF_H_LOW, HEAD_FRAC, HEAD_MIN_R, HEAD_MAX_R
 from .source.vtf import parse_kv
 from .render import spray_pattern, xp_info, XP_KILL, XP_KNIFE, HM_TIME, held_points
 
@@ -71,6 +71,8 @@ class Game:
         self.over = 0.0
         self.keys = {}
         self.binds = dict(DEFAULT_BINDS)
+        self.binds2 = {}          # second key for any action (action -> key name); either key triggers the action
+        self.held_raw = set()       # physical keys / buttons currently held
         self.hand_swap = False
         self.net = NET
         self.net.score_cb = lambda: self.score
@@ -1244,11 +1246,17 @@ class Game:
         want_eb = bool(e.isP and K.get(B["edgebug"]))
         # sMove tech only runs while its key is held (like +smPX / +smJB / +smEB)
         if want_px and self.smove_pixelsurf(e, e.yaw, (wx, wy) if mv else None):
-            pass
+            # pixelsurf: the hit sound repeats for as long as you keep surfing
+            self._px_snd = getattr(self, "_px_snd", 0.0) - dt
+            if self._px_snd <= 0:
+                self._px_snd = self.move_hit_interval()
+                self.play_move_hit()
         else:
-            if not (want_jb and self.smove_jumpbug(e, want_jb)):
-                if want_eb:
-                    self.smove_edgebug(e)
+            self._px_snd = 0.0
+            if want_jb and self.smove_jumpbug(e, want_jb):
+                self.play_move_hit()
+            elif want_eb and self.smove_edgebug(e):
+                self.play_move_hit()
 
         # --- CS:GO fall damage ---
         # Landing faster than 580 u/s hurts: (speed - 580) * 100 / (1024 - 580), so 1024 u/s kills.
@@ -2193,6 +2201,48 @@ class Game:
     # ==========================================================================
     # mods: weapons, arms, player models, archives
     # ==========================================================================
+
+    def _move_hit_sound(self):
+        """mod/sound/movehit.(mp3|wav|ogg): played on every jumpbug / edgebug and repeated while pixelsurfing."""
+        if not hasattr(self, "_mh_snd"):
+            self._mh_snd = None
+            try:
+                for d in mod_folders("sound", "sounds"):
+                    f = next((f for f in sorted(d.rglob("*")) if f.is_file() and f.stem.lower() == "movehit"
+                              and f.suffix.lower() in (".mp3", ".wav", ".ogg")), None)
+                    if f is not None:
+                        self._mh_snd = pygame.mixer.Sound(str(f))
+                        break
+                else:
+                    print("movehit sound not found: put movehit.mp3 in mod/sound")
+            except Exception as ex:
+                print("movehit sound failed:", ex)
+        return self._mh_snd
+
+    def play_move_hit(self):
+        snd = self._move_hit_sound()
+        if snd is not None:
+            self.audio.play(1.0, snd, 0.0)
+
+    def move_hit_interval(self):
+        snd = self._move_hit_sound()
+        try:
+            return max(0.08, snd.get_length()) if snd is not None else 0.2
+        except Exception:
+            return 0.2
+
+    def key_aliases(self, raw):
+        """The key itself plus the primary key of every action this key is a second bind for."""
+        out = [raw]
+        for a, k in self.binds2.items():
+            p = self.binds.get(a)
+            if k == raw and p and p not in out:
+                out.append(p)
+        return out
+
+    def key_held(self, name):
+        """True while `name` or a second key bound to the same action is physically held."""
+        return any(name in self.key_aliases(p) for p in self.held_raw)
 
     def bind_assets(self):
         asset = self.asset
