@@ -290,15 +290,6 @@ def render_scene(game, W, H):
     if abs(_lag_y) > 0.01 or abs(_lag_p) > 0.01:
         gl.glRotatef(-_lag_y * 0.9, 0, 0, 1)   # yaw lag
         gl.glRotatef(_lag_p * 1.1, 0, 1, 0)    # pitch lag
-    if P.alive and P.shoveT > 0 and not game.shove_seq:
-        # L4D2 style shove: pull back, thrust forward and sweep across, then recover
-        sf, sl, su, syaw, spit, sroll = shove_pose(1.0 - P.shoveT / max(1e-3, P.shoveD))
-        if game.hand_swap:
-            sl, syaw, sroll = -sl, -syaw, -sroll
-        gl.glTranslatef(sf, sl, su)
-        gl.glRotatef(syaw * SHOVE_ROT, 0, 0, 1)
-        gl.glRotatef(-spit * SHOVE_ROT, 0, 1, 0)
-        gl.glRotatef(sroll * SHOVE_ROT, 1, 0, 0)
     if not hide and P.alive:
         if w.vm:
             gl.glPushMatrix()

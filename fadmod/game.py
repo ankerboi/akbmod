@@ -25,6 +25,7 @@ from .audio import Audio
 from .entity import Ent
 from .net import NET, Net, NET_STATE_HZ  # NET is the global instance
 from .source.vpk import VpkArchive
+from .source.gma import GmaArchive, is_gma_path
 from .source.loaders import (
     LooseSrcFiles, DirSrcFiles, src_root, src_rel, _is_arms_mdl, _mdl_looks_like_arms,
     src_arms, src_arms_all, SrcSpec, SrcData, SrcInst, SrcPlayerInst, make_vm,
@@ -61,7 +62,6 @@ class Game:
         self.pm_cache = {}
         self._new_pl = 0
         self.vm_msg = ""
-        self.shove_seq = False   # True when the weapon model has its own shove / melee sequence
         self.world = None
         self.ents = []
         self.P = None
@@ -193,14 +193,13 @@ class Game:
         e.anim = fresh_anim()
         e.shootT = 0.0
         e.reloadT = 0.0
-        e.shoveT = 0.0
-        e.shoveHit = True
         e.edgebug = False
         e.jumpbug = False
         e.was_walk = False
         e.land_ticks = 99
         e.jc_used = 0.0
         e.pxsurf = False
+        e.ladder = None
         e.jb_tick = -999
         e.eb_cd = 0.0
         e._tick = 0
@@ -614,12 +613,6 @@ class Game:
                 snd = w.snd
                 if g > .004:
                     self.audio.play(g, snd, pan)
-        elif t == "shove":
-            e = self.remotes.get(f)
-            if e and e.alive:
-                e.shoveD = max(0.2, min(1.5, float(m.get("d", SHOVE_TIME))))
-                e.shoveT = e.shoveD
-                e.shoveHit = True            # the damage is sent by the shover; this is only the look
         elif t == "team":
             try:
                 pid, tm = int(f), int(m.get("tm", 0)) & 1
@@ -932,6 +925,53 @@ class Game:
     def _near_wall(self, e, dist=None):
         return self._wall_dir(e, dist) is not None
 
+    def ladder_tick(self, e, f, s, jump, wx, wy):
+        """Source / CS:GO ladder movement (CGameMovement::LadderMove).
+        Grab: moving toward a ladder (hull moved 2 units along the wish direction touches it) while holding a move key.
+        On it: no gravity, no friction; the keys give +-156 u/s each in the VIEW direction, split along the ladder:
+        the part going into the ladder turns into climbing (so W looks-up = climb, W looking steeply down = descend),
+        the rest slides you sideways along it. Jump = leap off at 270 u/s along the ladder normal.
+        Leaving the top / bottom of the zone just drops you back into normal movement with the speed you had.
+        Returns 0 = not on a ladder, 1 = climbing (velocity set), 2 = jumped off (velocity set)"""
+        world = self.world
+        if not getattr(world, "LAD", None):
+            e.ladder = None
+            return 0
+        lad = e.ladder
+        if lad is not None:                          # already on it: keep using the ladder's own direction
+            n = world.ladder_at(e.x, e.y, e.z, -lad[0], -lad[1], LADDER_REACH)
+        elif f or s:                                 # otherwise: the direction we are trying to move
+            n = world.ladder_at(e.x, e.y, e.z, wx, wy, LADDER_REACH)
+        else:
+            return 0                                 # not trying to move: no ladder behaviour
+        if n is None:
+            e.ladder = None
+            return 0
+        e.ladder = n
+        if jump:                                     # leap off: velocity = normal * 270, gravity back on
+            e.ladder = None
+            e.vx, e.vy, e.vz = n[0] * LADDER_JUMP, n[1] * LADDER_JUMP, 0.0
+            return 2
+        sp = LADDER_SPEED * LADDER_SCALE
+        if f or s:
+            c, sn = math.cos(e.yaw), math.sin(e.yaw)
+            cp, sp_ = math.cos(e.pitch), math.sin(e.pitch)
+            fw, rt = f * sp, s * sp                  # forward / right speed from the keys (not normalised, like Source)
+            vx = c * cp * fw + sn * rt               # velocity wanted, along the full 3D view direction
+            vy = sn * cp * fw - c * rt
+            vz = sp_ * fw
+            nrm = vx * n[0] + vy * n[1]              # part pushing into (-) / away from (+) the ladder
+            vx -= n[0] * nrm                         # lateral: what is left in the ladder plane ...
+            vy -= n[1] * nrm
+            vz -= nrm                                # ... plus the push into the ladder turned into "up"
+            if nrm > 0 and world.solid(e.x, e.y, e.z - 1):
+                vx += n[0] * sp                      # on the floor and walking away from it: step off
+                vy += n[1] * sp
+            e.vx, e.vy, e.vz = vx, vy, vz
+        else:
+            e.vx = e.vy = e.vz = 0.0                 # hang on the ladder
+        return 1
+
     def smove_jumpbug(self, e, jump):
         """smFakeJB: airborne, near ground (10u), jump held -> vz = 300."""
         if not jump:
@@ -1022,7 +1062,7 @@ class Game:
                 e.vz = 0.0
         else:
             e.land_ticks = min(999, getattr(e, "land_ticks", 99) + 1)
-            if not getattr(e, "pxsurf", False):   # pixel surfing: no gravity
+            if not getattr(e, "pxsurf", False) and not getattr(e, "ladder", None):   # pixel surfing / ladder: no gravity
                 e.vz -= SV_GRAVITY * dt
         ov = (e.vx, e.vy, e.vz)
         sp = math.sqrt(ov[0] * ov[0] + ov[1] * ov[1] + ov[2] * ov[2])
@@ -1197,6 +1237,15 @@ class Game:
         mv = f or s
         wx = (c * f + sn * s) / n if mv else 0
         wy = (sn * f - c * s) / n if mv else 0
+        # ladders first (Source: MOVETYPE_LADDER replaces the walk move: no friction, no acceleration, no gravity)
+        lad = self.ladder_tick(e, f, s, jump, wx, wy)
+        if lad:
+            e.walk = False
+            e.jumpbug = e.edgebug = e.pxsurf = False
+            self._px_snd = 0.0
+            self.pm_move(e, dt)
+            e._tick = getattr(e, "_tick", 0) + 1
+            return
         jmp = jump
         # sMove autohop: while holding jump, only apply jump impulse on ground
         # (jump button is cleared mid-air so the next land can re-trigger)
@@ -1276,6 +1325,9 @@ class Game:
     def js_tick(self, e, s, g0, v0, dt):
         """Measure every jump: takeoff speed, distance, max speed, height, strafes and sync.
         g0 / v0 = on walkable ground / horizontal speed BEFORE this physics tick."""
+        if getattr(e, "ladder", None):                       # climbing: not a jump, nothing to measure
+            e.js = None
+            return
         g1 = self.walkable(e)
         v1 = math.hypot(e.vx, e.vy)
         js = e.js
@@ -1401,7 +1453,7 @@ class Game:
 
     def fire(self, e, extra=0.0):
         w = CFG["weapons"][e.w]
-        if e.cool > 0 or not e.alive or e.shoveT > 0:
+        if e.cool > 0 or not e.alive:
             return
         if not w.melee and e.ammo[e.w] <= 0:
             if not getattr(self, "_manual_reload", False):
@@ -1443,6 +1495,8 @@ class Game:
             self.shake = min(1.0, self.shake + (0.9 if _snip else 0.28))
         if e.isP and w.vm:
             self.vm_play(w.vm, "slash" if w.melee else "shoot")
+            if not w.melee:
+                self._vm_fit_cycle(e, w, w.vm)
         pp = e.pitch + e.pun_p      # aim + current recoil punch: bullets (and tracers) follow the recoil
         yy = e.yaw + e.pun_y
         cp = math.cos(pp)
@@ -1589,67 +1643,6 @@ class Game:
         if abs(e.vy) < 8:
             e.vy = 0.0
         self.phys(e, dt, e.vx, e.vy, False)
-
-    def melee_pressed(self):
-        """E: L4D2 style shove. Works with every weapon and cancels a reload in progress; can't be used mid-shove."""
-        P = self.P
-        if not (P and P.alive and not self.over) or P.shoveT > 0:
-            return
-        P.zoom = 0
-        cvm = CFG["weapons"][P.w].vm
-        if P.reloadT > 0:
-            # melee cancels a reload in progress: you keep the rounds you had before reloading
-            if not CFG["weapons"][P.w].melee:
-                P.ammo[P.w] = int(getattr(P, "rl_prev", 0))
-            P.reloadT = 0.0
-            P.cool = 0.0
-            if cvm:
-                self.vm_play(cvm, "idle")       # drop the reload animation (the shove below replaces it if the model has one)
-        dur = SHOVE_TIME
-        self.shove_seq = False
-        if cvm:
-            d = self.vm_play(cvm, "shove")      # the model's own shove animation, if it has one
-            if d > 0.2:
-                self.shove_seq = True
-                dur = min(d, 1.5)
-        P.shoveD = dur
-        P.shoveT = dur
-        P.shoveHit = False
-        P.cool = max(P.cool, dur)               # can't shoot until the shove is over
-        if self.net.active:
-            self.net.send({"t": "shove", "d": round(dur, 2)}, droppable=True)
-
-    def shove_strike(self):
-        """The moment of impact: everything enemy inside the cone in front of you is hit."""
-        P = self.P
-        hit_any = False
-        killed_any = False
-        for v in self.ents:
-            if v is P or not v.alive or v.team == P.team:
-                continue
-            dx, dy, dz = v.x - P.x, v.y - P.y, v.z - P.z
-            dist = math.hypot(dx, dy)
-            if dist > SHOVE_RANGE or abs(dz) > 52:
-                continue
-            if dist > 18:
-                da = math.atan2(dy, dx) - P.yaw
-                da = math.atan2(math.sin(da), math.cos(da))
-                if abs(da) > math.radians(SHOVE_ARC):
-                    continue
-            if not self.los(P, v):
-                continue
-            hit_any = True
-            if v.remote:
-                self.net.send({"t": "hit", "to": v.nid, "d": SHOVE_DMG, "w": P.w})
-            else:
-                if not getattr(v, "god", False):
-                    v.hp -= SHOVE_DMG
-                if v.hp <= 0:
-                    killed_any = True
-                    self.kill(v, P)
-        if hit_any:
-            self.hm, self.hm_kill = HM_TIME, killed_any
-        self.shake = min(1.0, self.shake + (SHOVE_SHAKE if hit_any else SHOVE_SHAKE * .35))
 
     def target_shape(self, v):
         """Hitboxes of a player / bot that follow its real (posed, shrunk) model:
@@ -1831,6 +1824,12 @@ class Game:
                             wv = ent["rndwave"].get("wave")
                         if isinstance(wv, str) and wv:
                             m[name.lower()] = re.sub(r"^[\)\(\^#\*<>@~\?\$`]+", "", wv).replace("\\", "/").lower()
+            if getattr(arch, "is_gma", False):         # Garry's Mod: sound.Add{ name = "...", sound = "..." } in lua
+                try:
+                    for nm_, wv_ in arch.lua_sound_defs().items():
+                        m.setdefault(nm_, wv_)
+                except Exception as ex:
+                    print("gma sound.Add scan failed:", ex)
             cache[k] = m
         return cache[k]
 
@@ -1900,10 +1899,15 @@ class Game:
                     break
             rest_raw = re.sub(r"\d+$", "", rest)
             rc = self._ev_canon(rest_raw)
+            toks_ = [x for x in re.split(r"[^a-z0-9]+", stem) if x and x not in ("reload", "weapon", "wpn", "sfx", "snd")]
+            joined_ = {"".join(toks_[i:i + n_]) for n_ in (1, 2) for i in range(len(toks_))}
+            joined_ = {re.sub(r"\d+$", "", j_) for j_ in joined_}
             if rest_raw == ak_raw:
                 sc = 100
             elif rc == ak:
                 sc = 80
+            elif any(self._ev_canon(j_) == ak and j_ for j_ in joined_ if len(j_) >= 3):
+                sc = 60
             elif len(ak_raw) >= 4 and (ak_raw in rest_raw or (len(rest_raw) >= 4 and rest_raw in ak_raw)) and \
                     self._ev_canon(rest_raw) == rest_raw:
                 sc = 30
@@ -1944,6 +1948,43 @@ class Game:
             return [(0.22, "clipout"), (0.58, "clipin"), (0.84, "boltforward")]
         return []
 
+    _LUA_KIND = {
+        "draw": re.compile(r"draw|deploy|equip|takeout|pullout|ready|raise|unholster"),
+        "reload": re.compile(r"reload|mag|clip|insert|chamber"),
+        "cycle": re.compile(r"bolt|cock|cycle|pump|rechamber|charge|pullback|slide"),
+    }
+
+    def _lua_sound_plan(self, vm, w, si, kind):
+        """Garry's Mod weapons start their sounds from lua (TFA EventTable, ArcCW SoundTable, CW2 Sounds ...), at times
+        in seconds, not from events inside the model. Read those tables of the addon: [(cycle, Sound, action)]."""
+        rx = self._LUA_KIND.get(kind)
+        spec = self.asset["mdl"].get(getattr(w, "_m", None))
+        arch = getattr(spec, "arch", None)
+        if rx is None or arch is None or not getattr(arch, "is_gma", False):
+            return []
+        try:
+            tl = arch.swep_sound_timeline(spec.mdl)
+        except Exception as ex:
+            print("gma sound tables failed:", ex)
+            return []
+        sq = vm.seqs[si]
+        dur = max(0.05, float(sq["n"]) / max(1.0, float(sq["fps"])))
+        lab = sq["label"].lower()
+        hits = [(k, t, p) for k, t, p in tl if rx.search(k)]
+        if kind == "reload" and hits:
+            emp = [h for h in hits if "empty" in h[0] or "dry" in h[0] or "empty" in h[2]]
+            full = [h for h in hits if h not in emp]
+            hits = (emp if (re.search(r"empty|dry", lab) or getattr(vm, "want_empty", False)) and emp else full) or hits
+        # tables named after the sequence ("animations.reload_empty") belong to that sequence only
+        named = [h for h in hits if lab and re.search(r"(^|[.\[_])" + re.escape(lab) + r"($|[.\]_])", h[0])]
+        hits = named or hits
+        out = []
+        for k, t, p in sorted(hits, key=lambda h: h[1]):
+            snd = self._load_pack_snd(arch, p)
+            if snd is not None:
+                out.append((min(1.0, t / dur), snd, self._ev_canon(re.sub(r"\.\w+$", "", p.rsplit("/", 1)[-1]))))
+        return out
+
     def vm_seq_sounds(self, vm, w, si, kind):
         """[(cycle, Sound, action), ...] for one view-model sequence, sorted by cycle."""
         ck = self.__dict__.setdefault("_vm_evs", {})
@@ -1956,6 +1997,8 @@ class Game:
                 snd = self.wpn_ev_sound(w, nm)
                 if snd is not None:
                     out.append((float(cyc), snd, self._ev_canon(nm.rpartition(".")[2] or nm)))
+            if not out:
+                out += self._lua_sound_plan(vm, w, si, kind)
             have = {o[2] for o in out}
             if kind == "draw" and "draw" not in have:       # the deploy sound is not always an event of the draw clip
                 sd = self.wpn_ev_sound(w, "draw")
@@ -2030,10 +2073,9 @@ class Game:
 
     def vm_play(self, vm, kind):
         self.vmA["chain"] = None
+        self.vmA["cut"] = None
         self.vmA["pid"] = self.vmA.get("pid", 0) + 1     # new playback: its sound events start over
         c = vm.find(kind)
-        if kind == "shove" and not c:
-            return 0.0
         if not c and kind == "slash":
             kind = "shoot"
             c = vm.find("shoot")
@@ -2052,6 +2094,64 @@ class Game:
             sq = vm.seqs[self.vmA["s"]]
             return sq["n"] / max(1.0, sq["fps"])   # how long the chosen animation takes (seconds)
         return 0.0
+
+    VM_CYCLE_MAX_COOL = 1.6     # seconds: longest the shot + bolt-cycle may keep a bolt-action GMod weapon busy
+    VM_SHOT_PART = 0.25         # seconds of the shot clip (the recoil kick) played before the cock-back starts
+
+    @staticmethod
+    def _vm_is_bolt_gma(vm):
+        """Garry's Mod view-model of a bolt-action weapon (decided by the addon's own weapon script)."""
+        try:
+            d = vm.d
+            arch = getattr(d, "arch", None)
+            return bool(getattr(arch, "is_gma", False) and arch.is_bolt_action(getattr(d, "name", "")))
+        except Exception:
+            return False
+
+    def _vm_fit_cycle(self, e, w, vm):
+        """GMod bolt-action / pump weapons: the shot clip AND the cock-back clip that follows it have to fit between
+        two shots. Without this the next shot (after 60 / rpm seconds) restarted the shot clip before it ended, so the
+        cock-back never got its turn. The cooldown is stretched to the two clips (capped at VM_CYCLE_MAX_COOL) and, when
+        even that is shorter, both clips are sped up to fit."""
+        A = self.vmA
+        A["cspd"] = 1.0
+        try:
+            if w.auto or e.ammo[e.w] <= 0:
+                return
+            if not self._vm_is_bolt_gma(vm):
+                return
+            c = vm.find("cycle")
+            if not c or not (0 <= A["s"] < len(vm.seqs)) or not (0 <= c[0] < len(vm.seqs)):
+                return
+            sh, cy = vm.seqs[A["s"]], vm.seqs[c[0]]
+            t_shot = min(self.VM_SHOT_PART, sh["n"] / max(1.0, sh["fps"]))
+            t_cyc = cy["n"] / max(1.0, cy["fps"])
+            want = min(max(e.cool, t_shot + t_cyc), self.VM_CYCLE_MAX_COOL)
+            e.cool = want
+            A["cut"] = t_shot * sh["fps"]                       # frame where the cock-back takes over
+            A["cspd"] = max(1.0, t_cyc / max(0.2, want - t_shot))   # cock-back clip speed
+        except Exception as ex:
+            print("bolt-cycle timing skipped:", ex)
+
+    def _vm_cycle_after_shot(self, vm, A):
+        """Garry's Mod bolt-action / pump / manual weapons keep the 'cock back' as its own sequence after the shot
+        (bolt, cock, cycle, pump ...). Play it once after the shot clip, as long as there is a round left."""
+        try:
+            if not self._vm_is_bolt_gma(vm):
+                return False
+            w = CFG["weapons"][A["w"]]
+            if w.melee or w.auto or self.P.ammo[A["w"]] <= 0:
+                return False
+            c = vm.find("cycle")
+            if not c:
+                return False
+            A["s"], A["t"], A["loop"], A["kind"], A["hold"], A["spd"] = c[0], 0.0, False, "cycle", False, A.get("cspd", 1.0)
+            A["pid"] = A.get("pid", 0) + 1
+            vm.begin_fade(0.03)
+            return True
+        except Exception as ex:
+            print("cycle animation skipped:", ex)
+            return False
 
     def vm_tick(self, vm, dt):
         A = self.vmA
@@ -2089,6 +2189,10 @@ class Game:
             except Exception as ex:
                 print("view-model sound event failed:", ex)
         f = A["t"]
+        if A.get("cut") and A.get("kind") == "shoot" and not A["loop"] and f >= A["cut"]:
+            A["cut"] = None
+            if self._vm_cycle_after_shot(vm, A):
+                return
         if f >= s["n"]:
             if A["loop"]:
                 A["t"] = f = f % s["n"]
@@ -2100,6 +2204,8 @@ class Game:
                     A["t"] = 0.0
                     A["pid"] = A.get("pid", 0) + 1
                     vm.begin_fade(0.03)
+                    return
+                if A.get("kind") == "shoot" and self._vm_cycle_after_shot(vm, A):
                     return
                 self.vm_play(vm, "idle")
                 return
@@ -2191,12 +2297,7 @@ class Game:
             if hp is not None:
                 d_ = hp[1] - hp[0]
                 hold = (float(d_[0]), float(d_[2]))     # how far forward / up the left hand is from the right hand
-        shove = None
-        if SHOVE_BODY and e.shoveT > 0:
-            shove = 1.0 - e.shoveT / max(1e-3, e.shoveD)
-            if not e.isP:                    # your own timer already runs in Game.update
-                e.shoveT = max(0.0, e.shoveT - dt)
-        pm.animate(dt, state, spd, e.pitch, kick, float(e.vz), melee, reload, hold, shove)
+        pm.animate(dt, state, spd, e.pitch, kick, float(e.vz), melee, reload, hold)
 
     # ==========================================================================
     # mods: weapons, arms, player models, archives
@@ -2413,7 +2514,7 @@ class Game:
         for i, part in enumerate(parts):
             if part == "weapon" and i + 1 < len(parts):
                 nxt = parts[i + 1]
-                if nxt and not nxt.endswith((".mdl", ".vpk", ".zip", ".7z", ".rar", ".part")):
+                if nxt and not nxt.endswith((".mdl", ".vpk", ".gma", ".bin", ".zip", ".7z", ".rar", ".part")):
                     return nxt
         return ""
 
@@ -2515,11 +2616,13 @@ class Game:
         return sorted(names)
 
     def load_src_vpk(self, path):
-        """Any Source .vpk: view-models (L4D2 models/v_models/v_*.mdl), players, arms/hands.
+        """Any Source .vpk or Garry's Mod .gma: view-models (L4D2 models/v_models/v_*.mdl, GMod v_* / c_* and the
+        SWEP.ViewModel of the addon's weapon scripts), players, arms/hands.
         Only models, textures and animations are used - weapon stats stay the game's own.
         Incomplete downloads (.vpk.part) are accepted for whatever entries are fully present."""
         path = Path(path)
-        arch = VpkArchive(path)
+        gma = is_gma_path(path)
+        arch = GmaArchive(path) if gma else VpkArchive(path)
         names = src_scan(arch)
         pls = src_players(arch)
         arms = src_arms_all(arch)
@@ -2527,6 +2630,8 @@ class Game:
             hint = ""
             if getattr(arch, "incomplete", False):
                 hint = " VPK looks truncated (re-download the full file)."
+            elif gma and arch.has_maps():
+                hint = " This addon is a map - open it in saw_map_editor.py instead."
             elif any(n.endswith(".mdl") for n in arch.files):
                 hint = " Found .mdl files but none are usable view-models (need matching .vvd/.vtx)."
             return f"{path.name}: no weapon, player or arms/hands model inside.{hint}"
@@ -2534,8 +2639,13 @@ class Game:
         # strip browser temp suffixes from the display tag
         tag = re.sub(r"\.(part|crdownload|tmp)$", "", tag, flags=re.I)[:18]
         folder = self.weapon_mod_folder(path)
+        bases = {}
+        for nm in names:
+            bases[nm.rsplit("/", 1)[-1]] = bases.get(nm.rsplit("/", 1)[-1], 0) + 1
         for nm in names:
             key = nm.rsplit("/", 1)[-1]
+            if gma and bases[key] > 1 and "/" in nm:      # same file name in two folders of one addon: keep both
+                key = nm.rsplit("/", 2)[-2] + "_" + key
             old = self.asset["mdl"].get(key)
             if old is not None and not (isinstance(old, SrcSpec) and old.arch is arch and old.mdl == nm):
                 key = re.sub(r"\.mdl$", "", key) + " (" + tag + ").mdl"
@@ -2572,6 +2682,8 @@ class Game:
         msg = f"{path.name}: {' + '.join(parts)} - pick them in Skins."
         if getattr(arch, "incomplete", False):
             msg += " (package incomplete — re-download the full .vpk for missing models/textures)"
+        if gma:
+            msg = msg.replace(" - pick them in Skins.", " (Garry's Mod addon) - pick them in Skins.")
         return msg
 
     def add_src_player(self, name, spec, tag=""):
@@ -2611,13 +2723,15 @@ class Game:
         if not uniq_roots:
             return "No mod/arms folder found."
 
-        exts = (".vpk", ".zip", ".7z", ".rar", ".mdl")
+        exts = (".vpk", ".gma", ".bin", ".zip", ".7z", ".rar", ".mdl")
         files = []
         for root in uniq_roots:
             for f in sorted(root.rglob("*")):
                 if not f.is_file():
                     continue
                 n = f.name.lower()
+                if f.suffix.lower() == ".bin" and not is_gma_path(f):
+                    continue
                 if f.suffix.lower() in exts or n.endswith(".vpk.part"):
                     files.append(f)
 
@@ -2721,7 +2835,7 @@ class Game:
         def want(nm):
             nm = nm.replace("\\", "/").lower()
             parts = nm.split("/")
-            return nm.endswith(".vpk") or (not nm.endswith("/") and ("models" in parts[:-1] or "materials" in parts[:-1] or "sound" in parts[:-1]))
+            return nm.endswith((".vpk", ".gma", ".bin")) or (not nm.endswith("/") and ("models" in parts[:-1] or "materials" in parts[:-1] or "sound" in parts[:-1]))
         if not (out / ".done").exists():
             out.mkdir(parents=True, exist_ok=True)
             if path.suffix.lower() == ".rar":
@@ -2748,8 +2862,8 @@ class Game:
                         if not i.is_dir() and want(i.filename):
                             z.extract(i, str(out))
             (out / ".done").write_text("ok")
-        files = [f for f in out.rglob("*") if f.is_file() and f.suffix.lower() in (".mdl", ".vpk")
-                 and f.name.lower().count(".mdl") <= 1]
+        files = [f for f in out.rglob("*") if f.is_file() and f.suffix.lower() in (".mdl", ".vpk", ".gma", ".bin")
+                 and f.name.lower().count(".mdl") <= 1 and (f.suffix.lower() != ".bin" or is_gma_path(f))]
         if not files:
             return f"{path.name}: no weapon, arms or player model inside."
         # keep the mod/weapon/<folder> tag from the archive's original path
@@ -2790,7 +2904,7 @@ class Game:
                 status = self.load_map(p)
                 continue
             # L4D2 weapon packs (.vpk, or browser partial downloads .vpk.part)
-            if n.endswith(".vpk") or n.endswith(".vpk.part") or re.search(r"\.vpk\.(part|crdownload|tmp)$", n):
+            if n.endswith((".vpk", ".gma")) or (n.endswith(".bin") and is_gma_path(p)) or n.endswith(".vpk.part") or re.search(r"\.vpk\.(part|crdownload|tmp)$", n):
                 try:
                     st = self.load_src_vpk(p)
                     status = st or status
@@ -2902,7 +3016,8 @@ class Game:
         self.files["map_raw"] = raw          # used for the online map signature
         self.set_world(world)
         self.remember_map(raw)
-        return f"Map loaded: {world.name} ({len(world.B)} boxes)."
+        extra = ", Source map" if getattr(world, "_bsp", None) else ""
+        return f"Map loaded: {world.name} ({len(world.B)} boxes{extra})."
 
     # --- online: find a map by its signature so joining a custom-map server just works ---
     @staticmethod
@@ -3020,6 +3135,7 @@ class Game:
                         e.y += ((sn * cp) * f - c * s) / n * spd * dt if (f or s) else 0
                         e.z += (sp_ * f / n * spd + up * spd) * dt
                         e.vx = e.vy = e.vz = 0.0
+                        e.ladder = None
                         e.walk = True
                         e.so = 0.0
                         if K.get("mouse1") and (CFG["weapons"][e.w].auto or not e.held):
@@ -3055,11 +3171,6 @@ class Game:
                             e.held = 1
                         if not K.get("mouse1"):
                             e.held = 0
-                        if e.shoveT > 0:
-                            e.shoveT = max(0.0, e.shoveT - dt)
-                            if not e.shoveHit and (1.0 - e.shoveT / max(1e-3, e.shoveD)) >= SHOVE_HIT_AT:
-                                e.shoveHit = True
-                                self.shove_strike()
                 else:
                     self.dummy_tick(e, dt)
             # CS-style player/bot solid hulls + run-into toss

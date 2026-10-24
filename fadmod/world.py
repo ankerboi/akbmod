@@ -33,6 +33,10 @@ class World:
         """Pixel surf zones (map builder) - none by default, so pixel surf only works on maps that have one."""
         return False
 
+    def ladder_at(self, x, y, z, dx=0.0, dy=0.0, reach=0.0):
+        """Ladders (map builder tool 9): outward normal (nx, ny) of a ladder the player hull touches - none by default."""
+        return None
+
     def draw(self):
         raise NotImplementedError
 
@@ -194,8 +198,14 @@ class FadMapWorld(World):
             self.meta.append((int(b.get("t", -1)), int(b.get("tt", b.get("t", -1)) if b.get("tt") is not None else b.get("t", -1)),
                               float(b.get("tile", 128) or 128), tuple(col),
                               [int(v) for v in ((b.get("f") or []) + [-1] * 6)[:6]]))
-        if not self.B:
+        bsp = d.get("bsp")
+        if not self.B and not bsp:
             raise ValueError("the map has no boxes")
+        self._bsp = None
+        self._BG = self._BS = None               # Source map brushes: grid of cells -> player hull / bullet tests
+        self._bsp_list = None
+        if bsp:
+            self._bsp_init(bsp)
         # plain boxes are tested the fast way; slopes / cylinders have their own tests
         self._bx = [b for b, k, y in zip(self.B, self.K, self.Y) if k == 0 and not y]
         self._sp = [(b, k, dd) for b, k, dd, y in zip(self.B, self.K, self.D, self.Y) if k and not y]
@@ -216,6 +226,22 @@ class FadMapWorld(World):
                 self.PXZ.append((zb, float(z.get("yaw", 0) or 0)))
             except Exception:
                 continue
+        # ladders (map builder tool 9): invisible, not solid. n = unit vector from the ladder toward the climber (spun with the zone)
+        self.LAD = []
+        for z in d.get("lad") or []:
+            try:
+                zb = [float(v) for v in z["b"]]
+                for i in range(3):
+                    if zb[i] > zb[i + 3]:
+                        zb[i], zb[i + 3] = zb[i + 3], zb[i]
+                dd = int(z.get("d", 0) or 0) % 4
+                yaw = float(z.get("yaw", 0) or 0)
+                nl = ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0))[dd]
+                a = math.radians(yaw)
+                ca, sa = math.cos(a), math.sin(a)
+                self.LAD.append((zb, yaw, dd, (nl[0] * ca - nl[1] * sa, nl[0] * sa + nl[1] * ca)))
+            except Exception:
+                continue
         self.spawns = [[], []]
         for team, lst in enumerate((d.get("spawns") or [[], []])[:2]):
             for sp in lst:
@@ -224,10 +250,19 @@ class FadMapWorld(World):
                 self.spawns[team].append([float(p[0]), float(p[1]), float(p[2]) + 36.5, float(sp.get("yaw", 0))])
         for team in (0, 1):
             if not self.spawns[team]:
-                top = max(self.B, key=lambda b: (b[3] - b[0]) * (b[4] - b[1]))
-                self.spawns[team].append([(top[0] + top[3]) / 2, (top[1] + top[4]) / 2, top[5] + 36.5, 0.0])
+                if self.B:
+                    top = max(self.B, key=lambda b: (b[3] - b[0]) * (b[4] - b[1]))
+                    self.spawns[team].append([(top[0] + top[3]) / 2, (top[1] + top[4]) / 2, top[5] + 36.5, 0.0])
+                else:
+                    bb = self._bsp["bounds"]
+                    self.spawns[team].append([(bb[0] + bb[3]) / 2, (bb[1] + bb[4]) / 2, bb[5] + 36.5, 0.0])
         vz = d.get("void_z")
-        self.void_z = float(vz) if vz is not None else min(b[2] for b in self.B) - 800.0
+        if vz is not None:
+            self.void_z = float(vz)
+        elif self.B:
+            self.void_z = min(b[2] for b in self.B) - 800.0
+        else:
+            self.void_z = float(self._bsp["bounds"][2]) - 800.0
         # textures: decode now (pygame surfaces), upload to the GPU on first draw
         self._tex_raw = []
         for t in d.get("textures", []):
@@ -314,6 +349,148 @@ class FadMapWorld(World):
         l = math.sqrt(H * H + L * L) or 1.0
         return (-sx * H / l, -sy * H / l, L / l)
 
+    # ---- Source maps (.gma / .bsp made in the map builder): triangle mesh + convex brushes ----
+    _CELL = 256.0
+
+    def _bsp_init(self, b):
+        def u(k, dt, shape):
+            return np.frombuffer(zlib.decompress(base64.b64decode(b[k])), dt).reshape(shape)
+        n, nb, npl = int(b["n"]), int(b["nb"]), int(b["np"])
+        self._bsp = {"n": n, "bounds": [float(v) for v in b.get("bounds", [0] * 6)], "d": b,
+                     "pos": u("pos", np.float32, (n, 3)), "uv": u("uv", np.float32, (n, 2)),
+                     "col": u("col", np.uint8, (n, 4)), "idx": u("idx", np.uint32, (-1,))}
+        planes = u("planes", np.float32, (npl, 4)).astype(np.float64)
+        first, cnt = u("first", np.int32, (nb,)), u("cnt", np.int32, (nb,))
+        flags, bbox = u("flags", np.uint8, (nb,)), u("bbox", np.float32, (nb, 6)).astype(np.float64)
+        cell = self._CELL
+        gp, gs = {}, {}
+        for i in range(nb):
+            f, c, fl = int(first[i]), int(cnt[i]), int(flags[i])
+            pl = planes[f:f + c]
+            bb = bbox[i]
+            nx, ny, nz, dd = pl[:, 0].tolist(), pl[:, 1].tolist(), pl[:, 2].tolist(), pl[:, 3]
+            for grid, hull in ((gp, fl & 1), (gs, fl & 2)):
+                if not hull:
+                    continue
+                if grid is gp:                      # the player is a 32 x 32 x 72 box: push every plane out by its reach
+                    de = (dd + 16.0 * np.abs(pl[:, 0]) + 16.0 * np.abs(pl[:, 1]) + 36.0 * np.abs(pl[:, 2])).tolist()
+                    ex = (16.0, 16.0, 36.0)
+                else:
+                    de = dd.tolist()
+                    ex = (0.0, 0.0, 0.0)
+                ent = (bb[0] - ex[0], bb[1] - ex[1], bb[2] - ex[2], bb[3] + ex[0], bb[4] + ex[1], bb[5] + ex[2],
+                       tuple(zip(nx, ny, nz, de)))
+                for cx in range(int(math.floor(ent[0] / cell)), int(math.floor(ent[3] / cell)) + 1):
+                    for cy in range(int(math.floor(ent[1] / cell)), int(math.floor(ent[4] / cell)) + 1):
+                        grid.setdefault((cx, cy), []).append(ent)
+        self._BG = gp if gp else None
+        self._BS = gs if gs else None
+
+    def _bsp_hit(self, grid, x, y, z):
+        lst = grid.get((int(x // 256.0), int(y // 256.0)))
+        if lst:
+            for x0, y0, z0, x1, y1, z1, pl in lst:
+                if x0 < x < x1 and y0 < y < y1 and z0 < z < z1:
+                    for nx, ny, nz, d in pl:
+                        if nx * x + ny * y + nz * z >= d:
+                            break
+                    else:
+                        return True
+        return False
+
+    def _bsp_normal(self, x, y, z, want_up, move):
+        """Normal of the Source-map surface touching the (empty) point, or None."""
+        lst = self._BG.get((int(x // 256.0), int(y // 256.0)))
+        if not lst:
+            return None
+        best, bd = None, 1e30
+        for x0, y0, z0, x1, y1, z1, pl in lst:
+            if not (x0 - 3 < x < x1 + 3 and y0 - 3 < y < y1 + 3 and z0 - 3 < z < z1 + 3):
+                continue
+            sv = [nx * x + ny * y + nz * z - d for nx, ny, nz, d in pl]
+            m = max(sv)
+            if m > 1.5:
+                continue                                   # not touching this brush
+            for (nx, ny, nz, d), s in zip(pl, sv):
+                if want_up:
+                    if nz < 0.05 or s < m - 6.0:
+                        continue
+                elif s < m - 0.5:
+                    continue
+                if move is not None and nx * move[0] + ny * move[1] + nz * move[2] > -1e-4:
+                    continue
+                if abs(s) < bd:
+                    bd = abs(s)
+                    best = (nx, ny, nz)
+        return best
+
+    def _bsp_build(self):
+        b = self._bsp
+        tids = []
+        for t in b["d"].get("tex", []):
+            if not t.get("img"):
+                tids.append(None)
+                continue
+            try:
+                raw = base64.b64decode(t["img"])
+                s = pygame.image.load(io.BytesIO(raw), "x.jpg" if raw[:2] == b"\xff\xd8" else "x.png").convert_alpha()
+                w, h = s.get_size()
+                tids.append(make_texture(np.frombuffer(pygame.image.tostring(s, "RGBA", False), np.uint8).reshape(h, w, 4), w, h))
+            except Exception as ex:
+                print("map texture failed:", ex)
+                tids.append(None)
+        pos, uv, col, idx = b["pos"], b["uv"], b["col"], b["idx"]
+        self._bsp_keep = (pos, uv, col, idx, tids)
+        self._bsp_list = gl.glGenLists(1)
+        gl.glNewList(self._bsp_list, gl.GL_COMPILE)
+        gl.glEnableClientState(gl.GL_VERTEX_ARRAY)
+        gl.glEnableClientState(gl.GL_TEXTURE_COORD_ARRAY)
+        gl.glEnableClientState(gl.GL_COLOR_ARRAY)
+        gl.glVertexPointer(3, gl.GL_FLOAT, 0, pos)
+        gl.glTexCoordPointer(2, gl.GL_FLOAT, 0, uv)
+        gl.glColorPointer(4, gl.GL_UNSIGNED_BYTE, 0, col)
+        batches = b["d"].get("batches", [])
+        for mode in (0, 1, 2):
+            if mode == 1:
+                gl.glEnable(gl.GL_ALPHA_TEST)
+                gl.glAlphaFunc(gl.GL_GREATER, 0.5)
+            elif mode == 2:
+                gl.glDisable(gl.GL_ALPHA_TEST)
+                gl.glEnable(gl.GL_BLEND)
+                gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+                gl.glDepthMask(gl.GL_FALSE)
+            for ti, md, first, cnt in batches:
+                if md != mode:
+                    continue
+                tid = tids[ti] if 0 <= ti < len(tids) else None
+                gl.glBindTexture(gl.GL_TEXTURE_2D, tid or self._white)
+                gl.glDrawElements(gl.GL_TRIANGLES, int(cnt), gl.GL_UNSIGNED_INT, idx[int(first):int(first) + int(cnt)])
+        gl.glDepthMask(gl.GL_TRUE)
+        gl.glDisable(gl.GL_ALPHA_TEST)
+        gl.glDisable(gl.GL_BLEND)
+        gl.glDisableClientState(gl.GL_COLOR_ARRAY)
+        gl.glDisableClientState(gl.GL_TEXTURE_COORD_ARRAY)
+        gl.glDisableClientState(gl.GL_VERTEX_ARRAY)
+        gl.glEndList()
+
+    def ladder_at(self, x, y, z, dx=0.0, dy=0.0, reach=0.0):
+        """Normal (nx, ny) of a ladder the player hull (x, y = centre, z = body centre) touches after moving `reach`
+        units along the unit direction (dx, dy). Only ladders that direction heads INTO count (like the Source trace)."""
+        for b, yaw, _d, n in self.LAD:
+            if dx * n[0] + dy * n[1] > LADDER_MOUNT_DOT:
+                continue
+            px, py = x + dx * reach, y + dy * reach
+            if yaw:
+                a = math.radians(yaw)
+                c, s = math.cos(a), math.sin(a)
+                cx, cy = (b[0] + b[3]) * .5, (b[1] + b[4]) * .5
+                ex, ey = px - cx, py - cy
+                px, py = cx + ex * c + ey * s, cy - ex * s + ey * c
+            if (b[0] - 16 < px < b[3] + 16 and b[1] - 16 < py < b[4] + 16
+                    and z - 36 < b[5] and z + 36 > b[2]):
+                return n
+        return None
+
     def in_px_zone(self, x, y, z):
         """True while any part of the player (x, y = centre, z = body centre) is inside a pixel surf zone."""
         for b, yaw in self.PXZ:
@@ -329,6 +506,8 @@ class FadMapWorld(World):
         return False
 
     def solid(self, x, y, z):
+        if self._BG is not None and self._bsp_hit(self._BG, x, y, z):
+            return True
         for b in self._bx:
             if (b[0] - 16 < x < b[3] + 16 and b[1] - 16 < y < b[4] + 16
                     and b[2] - 36 < z < b[5] + 36):
@@ -360,6 +539,8 @@ class FadMapWorld(World):
         return False
 
     def bullet_solid(self, x, y, z):
+        if self._BS is not None and self._bsp_hit(self._BS, x, y, z):
+            return True
         for b in self._bx:
             if b[0] < x < b[3] and b[1] < y < b[4] and b[2] < z < b[5]:
                 return True
@@ -426,6 +607,10 @@ class FadMapWorld(World):
                 ((0.0, 0.0, -1.0), tn, sides[0][1], sides[1][1], back[1]))
 
     def normal_at(self, x, y, z, want_up=False, move=None):
+        if self._BG is not None:
+            r = self._bsp_normal(x, y, z, want_up, move)
+            if r is not None:
+                return r
         if want_up:
             # standing on a slope: its slanted surface normal (steep ones are surfed, like in CS)
             for b, k, d in self._sp:
@@ -577,6 +762,53 @@ class FadMapWorld(World):
             gl.glDisable(gl.GL_BLEND)
             gl.glDisable(gl.GL_POLYGON_OFFSET_FILL)
         gl.glEndList()
+        if self._bsp:
+            self._bsp_build()
+
+    def _draw_ladder(self, b, yaw, d):
+        """Two rails and a rung every 12 units, lying on the wall side of the ladder zone."""
+        x0, y0, z0, x1, y1, z1 = b
+        cx, cy = (x0 + x1) * .5, (y0 + y1) * .5
+        if d in (0, 2):
+            W, T = y1 - y0, x1 - x0
+        else:
+            W, T = x1 - x0, y1 - y0
+        off = min(3.0, T / 2)                     # how far the ladder sits in front of the wall
+        half = max(2.0, W / 2 - min(5.0, W / 4))  # rail centre line, from the middle of the ladder
+
+        def box(n0, n1, t0, t1, za, zb_):         # n = distance from the wall, t = across the ladder
+            if d == 0:
+                return [x0 + n0, cy + t0, za, x0 + n1, cy + t1, zb_]
+            if d == 2:
+                return [x1 - n1, cy + t0, za, x1 - n0, cy + t1, zb_]
+            if d == 1:
+                return [cx + t0, y0 + n0, za, cx + t1, y0 + n1, zb_]
+            return [cx + t0, y1 - n1, za, cx + t1, y1 - n0, zb_]
+        parts = []
+        for sg in (-1, 1):
+            parts.append((box(off - 1.2, off + 1.2, sg * half - 1.5, sg * half + 1.5, z0, z1), (0.62, 0.45, 0.28)))
+        n = int(max(1, min(400, (z1 - z0) / 12.0)))
+        for i in range(n):
+            z = z0 + 6.0 + i * 12.0
+            if z + 1.0 > z1:
+                break
+            parts.append((box(off - 1.0, off + 1.0, -half, half, z - 1.0, z + 1.0), (0.72, 0.72, 0.76)))
+        if yaw:
+            a = math.radians(yaw)
+            c, s = math.cos(a), math.sin(a)
+            R = lambda p: (cx + (p[0] - cx) * c - (p[1] - cy) * s, cy + (p[0] - cx) * s + (p[1] - cy) * c, p[2])
+            RV = lambda v: (v[0] * c - v[1] * s, v[0] * s + v[1] * c, v[2])
+        else:
+            R = RV = (lambda p: p)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._white)
+        gl.glBegin(gl.GL_QUADS)
+        for bb, col in parts:
+            for f in self._faces(bb):
+                sh = self._shade(RV(f[4]))
+                gl.glColor3f(col[0] * sh, col[1] * sh, col[2] * sh)
+                for pt in f[:4]:
+                    gl.glVertex3f(*R(pt))
+        gl.glEnd()
 
     def _poly(self, ti, col, pts, sh, uv):
         tid = self._tids[ti] if 0 <= ti < len(self._tids) else None
@@ -646,5 +878,6 @@ class FadMapWorld(World):
             self._build()
         gl.glEnable(gl.GL_TEXTURE_2D)
         gl.glCallList(self._list)
+        if self._bsp_list is not None:
+            gl.glCallList(self._bsp_list)
         gl.glColor4f(1, 1, 1, 1)
-

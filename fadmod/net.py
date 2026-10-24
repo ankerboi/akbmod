@@ -19,7 +19,7 @@ NET_MAGIC = "AKBARENA2"
 NET_PROTO = 2
 NET_MAX_PLAYERS = 6
 NET_STATE_HZ = 40      # how often your position is sent online (was 25)
-NET_DROPPABLE = ("st", "shot", "shove")  # sent without resend, newest state wins
+NET_DROPPABLE = ("st", "shot")  # sent without resend, newest state wins
 
 BROKER_ROOT = "akbarena-v2"
 BROKER_HOSTS = ("broker.hivemq.com", "broker.emqx.io", "test.mosquitto.org")   # free, no account, tried in order

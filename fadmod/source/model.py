@@ -76,6 +76,7 @@ class SrcModel:
         # ---- meshes (VTX strips via _build_parts)
         nbody, bpo = I(232), I(236)
         self.parts = self._build_parts(vtx, nbody, bpo)
+        self._pt = (vtx, nbody, bpo)
         self._parse_seqs()
         self.includes = []
 
@@ -125,8 +126,20 @@ class SrcModel:
             evs = []
             for e in range(I(p + 24)):
                 q = p + I(p + 28) + e * 80
-                if I(q + 4) in (5004, 5005) and I(q + 8) == 0:
-                    evs.append((F(q), b[q + 12:q + 76].split(b"\0")[0].decode("latin1")))
+                ev_id, ev_type = I(q + 4), I(q + 8)
+                # old style events carry a number (5004 / 5005 = play sound); new style events (type bit 0x400,
+                # what GMod / Source 2013 models usually have) carry the event NAME at szeventindex instead
+                ev_name = ""
+                if ev_type & 0x400:
+                    try:
+                        so_ = I(q + 76)
+                        ev_name = cs(q + so_) if so_ else ""
+                    except Exception:
+                        ev_name = ""
+                if ev_id in (5004, 5005) or ev_name.upper().startswith(("AE_CL_PLAYSOUND", "AE_CL_PLAY_SOUND", "CL_EVENT_SOUND")):
+                    opt = b[q + 12:q + 76].split(b"\0")[0].decode("latin1").strip()
+                    if opt:
+                        evs.append((F(q), opt))
             try:
                 _ao = I(p + 8)
                 _act = cs(p + _ao) if _ao else ""
@@ -198,7 +211,36 @@ class SrcModel:
                 self.seqs.append(sq2)
             self.includes.append(am)
 
-    def _build_parts(self, vtx, nbody, bpo):
+    def body_info(self):
+        """[(bodygroup name, number of choices)] - choice 0 is what the game shows by default."""
+        b = self.b
+        _vtx, nbody, bpo = self._pt
+        out = []
+        for bi in range(nbody):
+            p = bpo + bi * 16
+            sn, nmod = struct.unpack_from("<ii", b, p)
+            try:
+                nm = b[p + sn:b.index(b"\0", p + sn)].decode("latin1")
+            except Exception:
+                nm = ""
+            out.append((nm.lower(), nmod))
+        return out
+
+    def parts_for(self, sel):
+        """Mesh parts with other bodygroup choices: sel = {bodygroup name: choice} (clamped to the last choice)."""
+        vtx, nbody, bpo = self._pt
+        by = {}
+        for bi, (nm, nmod) in enumerate(self.body_info()):
+            if nm in sel and nmod > 0:
+                c = int(sel[nm])
+                if c < 0:      # "hide it": the choice of this bodygroup that draws the fewest triangles
+                    sizes = [sum(len(x["tri"]) for x in self._build_parts(vtx, nbody, bpo, {**by, bi: k}))
+                             for k in range(nmod)]
+                    c = sizes.index(min(sizes))
+                by[bi] = max(0, min(c, nmod - 1))
+        return self._build_parts(vtx, nbody, bpo, by)
+
+    def _build_parts(self, vtx, nbody, bpo, sel=None):
         b = self.b
         I = lambda o: struct.unpack_from("<i", b, o)[0]
         sv = struct.unpack_from
@@ -209,14 +251,17 @@ class SrcModel:
             nmod, mi = I(p + 4), I(p + 12)
             if nmod <= 0:
                 continue
-            mp = p + mi
+            km = (sel or {}).get(bi, 0)
+            if not 0 <= km < nmod:
+                km = 0
+            mp = p + mi + km * 148            # mstudiomodel_t is 148 bytes
             nmesh, mo, nvert, vidx = I(mp + 72), I(mp + 76), I(mp + 80), I(mp + 84)
             if nmesh <= 0 or nvert <= 0:
                 continue
             vstart = vidx // 48
             vbp = vh_bpo + bi * 8
             vnm, vmo = sv("<ii", vtx, vbp)
-            vm = vbp + vmo
+            vm = vbp + vmo + km * 8           # one 8-byte VTX model header per choice
             vnl, vlo = sv("<ii", vtx, vm)
             vl = vm + vlo
             vnmesh, vmeo = sv("<ii", vtx, vl)

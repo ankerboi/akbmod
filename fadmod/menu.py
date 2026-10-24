@@ -684,8 +684,10 @@ class Menu:
             gfx.text("YOUR KIT", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Skins.", cx, 48, 34, (255, 255, 255), bold=True)
             _lx = cx
-            if draw_mod_image("l4d2", cx, 93, 20):
-                _lx = cx + 26
+            _has_l4d2 = draw_mod_image("l4d2", cx, 93, 20)
+            _has_gmod = draw_mod_image("gmod", cx + (26 if _has_l4d2 else 0), 93, 20)
+            if _has_l4d2 or _has_gmod:
+                _lx = cx + (26 if _has_l4d2 else 0) + (26 if _has_gmod else 0)
             gfx.text("Mod support", _lx, 96, 13, (154, 154, 154))
             wp = self.lo_tab == "weapons"
             ar = self.lo_tab == "arms"
@@ -752,7 +754,7 @@ class Menu:
                     empty = ("No weapon mods loaded yet." if wp else
                              ("No arms models loaded yet." if ar else "No player models loaded yet."))
                     hint = "Use Add files, drop files on the window, or put them in the " + (
-                        "weapons" if wp else ("arms (or drop a .vpk)" if ar else "player")) + " folder."
+                        "weapons" if wp else ("arms (or drop a .vpk / .gma)" if ar else "player")) + " folder."
                 gfx.text(empty, cx + cw / 2, gy + 120, 15, (200, 200, 200), bold=True, anchor="c")
                 gfx.text(hint, cx + cw / 2, gy + 146, 12, (130, 130, 130), anchor="c")
             for idx, name in enumerate(items[self.lo_page * per:(self.lo_page + 1) * per]):

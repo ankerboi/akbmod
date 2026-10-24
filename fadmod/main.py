@@ -53,6 +53,7 @@ from fadmod.world import ArenaWorld, FadMapWorld
 from fadmod.audio import Audio
 from fadmod.net import NET
 from fadmod.game import Game
+from fadmod.source.gma import is_gma_path
 from fadmod.gfx import Gfx, RenderTarget
 from fadmod.menu import Menu
 from fadmod.render import render_scene, render_hud
@@ -128,8 +129,8 @@ def main():
     # Weapon mods (.mdl / .wav / .json) from mod/weapon (never created).
     try:
         wfiles = sorted(f for wdir in mod_folders("weapon") for f in wdir.rglob("*")
-                        if f.is_file() and (f.suffix.lower() in (".mdl", ".wav", ".json", ".vpk", ".zip", ".7z", ".rar", ".vvd", ".vtx", ".vtf", ".vmt")
-                                            or f.name.lower().endswith(".vpk.part")))
+                        if f.is_file() and (f.suffix.lower() in (".mdl", ".wav", ".json", ".vpk", ".gma", ".zip", ".7z", ".rar", ".vvd", ".vtx", ".vtf", ".vmt")
+                                            or f.name.lower().endswith(".vpk.part") or is_gma_path(f)))
         if wfiles:
             st = game.load_files(wfiles, "weapon")
             if st:
@@ -141,7 +142,7 @@ def main():
     # The CT / T choice you make in the Play menu is remembered between runs.
     try:
         pfiles = sorted(f for pdir in mod_folders("player") for f in pdir.rglob("*") if f.is_file() and (
-            f.suffix.lower() in (".mdl", ".zip", ".7z", ".rar", ".vpk") or f.name.lower().endswith(".vpk.part")))
+            f.suffix.lower() in (".mdl", ".zip", ".7z", ".rar", ".vpk", ".gma") or f.name.lower().endswith(".vpk.part") or is_gma_path(f)))
         if pfiles:
             game.load_files(pfiles, "player")
             menu.status = (menu.status + f" Players: {len(game.asset['player'])} model(s).").strip()
@@ -276,8 +277,6 @@ def main():
                                 game.select_weapon(i)
                         if name == b["swaphand"]:
                             game.hand_swap = not game.hand_swap
-                        if name == b["melee"]:
-                            game.melee_pressed()
                         if name == "f":
                             FX.flash = not FX.flash
                 else:
@@ -320,8 +319,6 @@ def main():
                                     game.select_weapon(i)
                             if code == b["swaphand"]:
                                 game.hand_swap = not game.hand_swap
-                            if code == b["melee"]:
-                                game.melee_pressed()
                     elif btn == 1:
                         game.keys["mouse1"] = True
                     elif btn == 3:

@@ -141,9 +141,9 @@ def file_dialog(mode):
         pass
     ft = {
         "map": [("FAD-MOD map", "*.fadmap")],
-        "arms": [("Arms / hands packs", "*.zip *.7z *.rar *.mdl *.vpk *.vpk.part *.vvd *.vtx *.vtf *.vmt")],
-        "weapon": [("Weapon mods (L4D2)", "*.mdl *.wav *.json *.vpk *.vpk.part *.zip *.7z *.rar *.vvd *.vtx *.vtf *.vmt")],
-        "player": [("Player models", "*.mdl *.zip *.7z *.rar *.vpk *.vpk.part")],
+        "arms": [("Arms / hands packs", "*.zip *.7z *.rar *.mdl *.vpk *.gma *.bin *.vpk.part *.vvd *.vtx *.vtf *.vmt")],
+        "weapon": [("Weapon mods (L4D2 / Garry's Mod)", "*.mdl *.wav *.json *.vpk *.gma *.bin *.vpk.part *.zip *.7z *.rar *.vvd *.vtx *.vtf *.vmt")],
+        "player": [("Player models", "*.mdl *.zip *.7z *.rar *.vpk *.gma *.bin *.vpk.part")],
         "image": [("Images", "*.png *.jpg *.jpeg *.bmp *.gif")],
     }[mode]
     try:

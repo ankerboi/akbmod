@@ -15,6 +15,7 @@ from OpenGL import GL as gl
 from ..config import *
 from ..glutil import make_texture, tex2d
 from .vpk import VpkArchive
+from .gma import GmaArchive
 from .vtf import parse_kv, load_vtf
 from .model import SrcModel, _find_vpk_model, _quat_mat3, _angle_quat
 from .model import HIT_HALF_W, HIT_HALF_H, HEAD_FRAC, HEAD_MIN_R, HEAD_MAX_R, HIT_HALF_H_LOW
@@ -227,6 +228,84 @@ def _mesh_on_arm_bones(srcm):
         return False
 
 
+def _norm_tex(t):
+    """A $basetexture / material value -> 'models/x/y' (no 'materials/' prefix, no extension, forward slashes)."""
+    t = str(t or "").replace("\\", "/").lower().strip()
+    t = re.sub(r"^/+", "", t)
+    t = re.sub(r"^materials/", "", t)
+    return re.sub(r"\.(vtf|vmt)$", "", t)
+
+
+_STEM_IDX = {}
+
+
+def _find_by_stem(arch, name, ext):
+    """'materials/<name><ext>' inside the archive: the exact path first, else the one file that has the same
+    file name (addons whose cdmaterials / $basetexture folder differs from where the file really is)."""
+    exact = "materials/" + name + ext
+    if arch.has(exact):
+        return exact
+    key = (id(arch), ext)
+    if key not in _STEM_IDX:
+        idx = {}
+        for n in getattr(arch, "files", {}):
+            low = str(n).replace("\\", "/").lower()
+            if low.endswith(ext) and "materials/" in low:
+                idx.setdefault(low.rsplit("/", 1)[-1][:-len(ext)], []).append(low)
+        _STEM_IDX[key] = idx
+    hits = _STEM_IDX[key].get(name.rsplit("/", 1)[-1], [])
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:       # several: the one whose folder matches the most of the wanted path
+        want = name.split("/")
+        sc = lambda h: sum(1 for a, b in zip(reversed(h[:-len(ext)].split("/")), reversed(want)) if a == b)
+        best = max(hits, key=sc)
+        return best if sc(best) >= 2 else None
+    return None
+
+
+def _find_any(arch, name, ext):
+    """(archive, path) of a material file: in 'arch' itself first, then in every other opened Garry's Mod addon
+    (exact path, or the one file of that name). (None, None) when nobody has it."""
+    hit = _find_by_stem(arch, name, ext)
+    if hit:
+        return arch, hit
+    try:
+        from .gma import OPEN_ARCHIVES
+        for other in list(OPEN_ARCHIVES):
+            if other is arch:
+                continue
+            hit = _find_by_stem(other, name, ext)
+            if hit:
+                return other, hit
+    except Exception:
+        pass
+    return None, None
+
+
+def _vmt_root(arch, vmt, depth=0):
+    """(parameters dict, shader name) of a .vmt. 'patch' materials (include + insert / replace) are resolved
+    against the material they include, so $basetexture etc. are found."""
+    kv = parse_kv(arch.read(vmt).decode("utf-8", "replace"))
+    shader = next(iter(kv.keys()), "")
+    root = next((v for v in kv.values() if isinstance(v, dict)), {})
+    if shader == "patch" and depth < 4:
+        inc = _norm_tex(root.get("include"))
+        inc_vmt = _find_by_stem(arch, inc, ".vmt") if inc else None
+        base, base_shader = ({}, "")
+        if inc_vmt:
+            try:
+                base, base_shader = _vmt_root(arch, inc_vmt, depth + 1)
+            except Exception:
+                base, base_shader = {}, ""
+        merged = dict(base)
+        for sect in ("insert", "replace"):
+            if isinstance(root.get(sect), dict):
+                merged.update(root[sect])
+        return merged, base_shader or shader
+    return root, shader
+
+
 class SrcData:
     """Source model + its textures as GL textures (needs the GL context)."""
 
@@ -241,6 +320,27 @@ class SrcData:
             print("include animations failed:", ex)
         self.name = mdl_name
         self.seqs = srcm.seqs
+        # Garry's Mod weapons whose view-model is only the chassis: barrel, magazine, stock, bolt, scope ... are
+        # separate models in the addon and get bone-merged on top; their bodygroup choices (hide the iron sights
+        # behind a scope ...) are applied to this model
+        self.extras = []
+        sel = {}
+        fn = getattr(arch, "default_attachments", None)
+        if fn is not None:
+            try:
+                for nm, bg in fn(mdl_name):
+                    try:
+                        self.extras.append(SrcData(arch, nm))
+                        sel.update(bg)
+                    except Exception as ex:
+                        print("attachment failed:", nm, ex)
+            except Exception as ex:
+                print("attachments skipped:", ex)
+        if sel:
+            try:
+                srcm.parts = srcm.parts_for(sel)
+            except Exception as ex:
+                print("bodygroups skipped:", ex)
         self.parts = []
         for p in srcm.parts:
             tri = np.ascontiguousarray(p["tri"], np.uint32)
@@ -257,6 +357,28 @@ class SrcData:
                           or any(re.search(r"/(hands|arms|sleeves|gloves)/", c) for c in srcm.cd)
                           or _mesh_on_arm_bones(srcm))
         self.uv = np.ascontiguousarray(srcm.v_uv, np.float32)
+
+    _warned = set()
+
+    def _warn_tex(self, nm, why, tried, shader):
+        """One line per missing texture, so it is clear WHY a model came out grey (texture in another addon, RT scope ...)."""
+        k = (id(self.arch), nm, why)
+        if k in SrcData._warned:
+            return
+        SrcData._warned.add(k)
+        req = list(getattr(self.arch, "required", []) or [])
+        print("[texture] %s: material '%s' - %s (shader %s; looked for: %s)%s"
+              % (self.name, nm, why, shader or "?", ", ".join(dict.fromkeys(tried)) or "-",
+                 ("; this addon lists required addons: " + ", ".join(req)) if req else ""))
+
+    @staticmethod
+    def _glass_tex():
+        """4x4 dark see-through texture: scope lenses / glass use render targets or refraction that we cannot draw."""
+        key = ("glass",)
+        if key not in SrcData._tcache:
+            rgba = np.full((4, 4, 4), (14, 20, 24, 70), np.uint8)
+            SrcData._tcache[key] = make_texture(rgba, 4, 4, mip=False)
+        return SrcData._tcache[key]
 
     @staticmethod
     def _solid_tex(rgb):
@@ -280,26 +402,33 @@ class SrcData:
             info["fill"] = (.82, .64, .52)           # skin
         elif re.search(r"sleeve|arm|glove|shirt|jacket|anarchist|bill|zoey|louis|francis|coach|gambler|mechanic|producer", nm0, re.I):
             info["fill"] = (.35, .38, .42)           # fabric / sleeve (lighter so it shows on dark fog)
+        elif re.search(r"scope|optic|sight|reflex|holo|rail|mount", nm0, re.I):
+            info["fill"] = (.09, .09, .10)           # optic body with no texture: dark anodised metal, not flat grey
         elif is_arms_path or is_arms_name:
             info["fill"] = (.55, .48, .40)           # generic arms mesh: warm mid-tone
         else:
             info["fill"] = (.55, .55, .58)
+        tried, shader_seen = [], ""
         for cand in self.model.material_paths(mat):
-            vmt = "materials/" + cand + ".vmt"
-            if not arch.has(vmt):
-                continue
-            try:
-                kv = parse_kv(arch.read(vmt).decode("utf-8", "replace"))
-                root = next((v for v in kv.values() if isinstance(v, dict)), {})
-            except Exception:
-                root = {}
-            bt = str(root.get("$basetexture") or "").replace("\\", "/").lower()
+            cand = _norm_tex(cand)
+            v_arch, vmt = _find_any(arch, cand, ".vmt")
+            root, shader = {}, ""
+            if vmt:
+                try:
+                    root, shader = _vmt_root(v_arch, vmt)
+                except Exception:
+                    root, shader = {}, ""
+            shader_seen = shader or shader_seen
+            bt = _norm_tex(root.get("$basetexture"))
             if str(root.get("$alphatest", "0")) not in ("0", ""):
                 info["alphatest"] = True
             if str(root.get("$translucent", "0")) not in ("0", ""):
                 info["blend"] = True
             if str(root.get("$additive", "0")) not in ("0", ""):
                 info["add"] = True
+            # scope lenses / glass draw a render target (_rt_*) or refract the screen: nothing we can load
+            if vmt and (bt.startswith("_") or shader == "refract" or "$refracttint" in root):
+                info["glass"] = True
             # $color / $color2 tint when present (helps when texture is missing)
             for ck in ("$color2", "$color"):
                 if ck in root:
@@ -312,14 +441,16 @@ class SrcData:
                             info["fill"] = tuple(max(0.0, min(1.0, c)) for c in cols)
                     except Exception:
                         pass
-            for tp in ([bt] if bt else []) + [cand]:
-                vtf = "materials/" + tp + ".vtf"
-                if not arch.has(vtf):
+            # a material with only a .vtf (the .vmt lives in another addon) still works: try the name itself too
+            for tp in ([bt] if bt and not bt.startswith("_") else []) + [cand]:
+                tried.append(tp)
+                t_arch, vtf = _find_any(arch, tp, ".vtf")
+                if not vtf:
                     continue
-                key = (id(arch), vtf)
+                key = (id(t_arch), vtf)
                 if key not in SrcData._tcache:
                     try:
-                        rgba, real = load_vtf(arch, vtf, 1024)
+                        rgba, real = load_vtf(t_arch, vtf, 1024)
                         rgba = np.array(rgba)
                         if not (info["alphatest"] or info["blend"] or info["add"]):
                             rgba[:, :, 3] = 255     # alpha is usually a shine mask, not see-through
@@ -330,6 +461,14 @@ class SrcData:
                 info["t"] = SrcData._tcache[key]
                 if info["t"]:
                     return info
+        if not info["t"] and re.search(r"lens|glass|stencil|reticle|_rt\b|ads_scope", nm0, re.I):
+            info["glass"] = True        # scope lens / reticle mask whose material lives in another addon
+        if info.get("glass") and not info["t"]:
+            info["blend"], info["add"], info["alphatest"] = True, False, False
+            info["t"] = SrcData._glass_tex()
+            self._warn_tex(nm0, "render-target / refraction material, drawn as dark glass", tried, shader_seen)
+            return info
+        self._warn_tex(nm0, "no .vtf found", tried, shader_seen)
         # No .vtf in the pack (common for L4D2 arms-only VPKs): bake a solid texture from the fill
         # so the mesh is visible in both the game viewmodel and the Skins preview.
         if info.get("fill") and not info["t"]:
@@ -340,6 +479,44 @@ class SrcData:
 # viewmodel (weapon + arms) is re-skinned on the CPU at most this many times per second; lower = more fps while
 # walking / animating, higher = smoother weapon motion
 VM_SKIN_HZ = 100.0
+
+
+class _MergedPart:
+    """An extra model (a weapon attachment) bone-merged onto the weapon skeleton by bone name: a bone with the
+    weapon's name follows the weapon's animation, any other bone hangs off its parent at its own bind pose."""
+
+    def __init__(self, mm, data):
+        self.d = data
+        am = data.model
+        wi = {b["name"].lower(): i for i, b in enumerate(mm.bones)}
+        self.map = [wi.get(b["name"].lower(), -1) for b in am.bones]
+        self.p2b = np.stack([b["p2b"] for b in am.bones]).astype(np.float32)
+        Px = np.ascontiguousarray(am.v_pos, dtype=np.float32)
+        bi = [np.minimum(am.v_bi[:, k], am.nb - 1).astype(np.intp) for k in range(3)]
+        ws = [np.where(am.v_nb > k, am.v_w[:, k], 0.0).astype(np.float32) for k in range(3)]
+        tot = np.maximum(ws[0] + ws[1] + ws[2], 1e-6)
+        self.plan = SrcInst._make_skin_plan(Px, bi, [np.ascontiguousarray(w_ / tot, dtype=np.float32) for w_ in ws])
+        self.lbind = []
+        for b in am.bones:
+            Lb = np.eye(4, dtype=np.float32)
+            Lb[:3, :3] = _quat_mat3(b["quat"])
+            Lb[:3, 3] = b["pos"]
+            self.lbind.append(Lb)
+        self.vtx = None
+
+    def build(self, W):
+        am = self.d.model
+        WA = np.empty((am.nb, 4, 4), dtype=np.float32)
+        for b in range(am.nb):
+            wb = self.map[b]
+            if wb >= 0:
+                WA[b] = W[wb]
+            else:
+                par = am.bones[b]["par"]
+                WA[b] = WA[par] @ self.lbind[b] if 0 <= par < b else self.lbind[b]
+        v = SrcInst._skin_fast(np.matmul(WA, self.p2b)[:, :3, :], self.plan)
+        if np.isfinite(v).all() and np.abs(v).max() < 1e4:
+            self.vtx = np.ascontiguousarray(v, dtype=np.float32)
 
 
 class SrcInst:
@@ -382,7 +559,15 @@ class SrcInst:
         if arms is not None:
             am = arms.model
             wi = {b["name"].lower(): i for i, b in enumerate(mm.bones)}
-            self._amap = [wi.get(b["name"].lower(), -1) for b in am.bones]
+            # Hands must follow the weapon mod's OWN animation. Exact bone name first; when the weapon names its
+            # arm bones differently (CS:GO / Black Ops ports: "v_weapon.Bip01_L_Hand" vs "ValveBiped.Bip01_L_Hand"),
+            # match on the name without its prefix so those hand bones still drive the arms.
+            def _bn(n):
+                return re.sub(r"[\s.]+", "_", n.lower().split(".")[-1].strip())
+            wn = {}
+            for i, b in enumerate(mm.bones):
+                wn.setdefault(_bn(b["name"]), i)
+            self._amap = [wi.get(b["name"].lower(), wn.get(_bn(b["name"]), -1)) for b in am.bones]
             self._ap2b = np.stack([b["p2b"] for b in am.bones]).astype(np.float32)
             self._aP = np.concatenate([am.v_pos, np.ones((len(am.v_pos), 1))], 1).astype(np.float32)
             self._aPx = np.ascontiguousarray(am.v_pos, dtype=np.float32)
@@ -402,6 +587,12 @@ class SrcInst:
             except Exception as ex:
                 print("Arms finger retarget skipped:", ex)
                 self._aret = {}
+        self._ex = []
+        for ed in getattr(data, "extras", []):
+            try:
+                self._ex.append(_MergedPart(mm, ed))
+            except Exception as ex:
+                print("attachment skipped:", ex)
         idle = self.find("idle")
         self.pose(idle[0] if idle else 0, 0)
 
@@ -455,8 +646,8 @@ class SrcInst:
             hit = (hit or by_act(r"^ACT_VM_RELOAD$") or by_act(r"^ACT_VM_RELOAD", r"EMPTY|START|END|INSERT|LOOP")
                    or by_lab(r"(^|_)reload\d*$", r"empty|dry|start|end|insert|loop"))
             return hit[:1]
-        if kind == "shove":
-            return (by_lab(r"shov") or by_act(r"^ACT_VM_(MELEE|BASH|SHOVE)") or by_lab(r"(^|_)(melee|bash|butt|push)$"))[:1]
+        if kind == "cycle":
+            return (by_act(r"^ACT_VM_(PULLBACK|RECHAMBER)") or [])[:1]
         if kind == "slash":
             return (by_act(r"^ACT_VM_(MISS|HIT)CENTER") or by_lab(r"(^|_)(slash|stab|swing)"))[:1]
         return []
@@ -520,8 +711,10 @@ class SrcInst:
                         bad=r"last|empty|dry|miss|alt|secondary|zoom")
         if kind == "slash":
             return pick(r"^midslash", r"slash", r"stab_?miss", r"^stab", r"swing", bad=r"back")
-        if kind == "shove":     # L4D2 shove / melee sequence, when the model has one
-            return pick(r"shov", r"^melee", r"melee|bash|butt|push|bayonet", bad=r"back|knife_|miss_")[:1]
+        if kind == "cycle":      # bolt / cock / pump after the shot (own sequence in GMod weapons)
+            return pick(r"^(cock|bolt|cycle|rechamber|charge|pump)(_?back|_?cycle|_?action|_?open)?\d*$",
+                        r"^(cock|bolt|cycle|rechamber|charge)", r"(^|_)(cock|bolt_?(back|cycle|action)|cycle|rechamber)(_|\d|$)",
+                        bad=r"reload|empty|fire|shoot|attack|idle|draw|deploy|insert|start|end|inspect|sprint|run|walk|ads|iron|sight|zoom|dry")[:1]
         if kind == "reload":
             if self.want_empty:
                 hit = pick(r"^reload_?empty", r"^reload")
@@ -699,6 +892,12 @@ class SrcInst:
             W[lv] = np.matmul(W[par[lv]], L[lv])
         M = np.matmul(W, self._p2b)[:, :3, :]                      # (nb,3,4) float32
         self.vtx = self._skin_fast(M, self._splan)
+        for e in self._ex:
+            try:
+                e.build(W)
+            except Exception as ex:
+                print("attachment pose failed, hiding it:", ex)
+                e.vtx = None
         if self.a is not None:
             try:
                 self._build_arms(W)
@@ -853,6 +1052,9 @@ class SrcInst:
         gl.glEnableClientState(gl.GL_TEXTURE_COORD_ARRAY)
         try:
             self._draw_set(self.d, self.vtx)
+            for e in self._ex:
+                if e.vtx is not None:
+                    self._draw_set(e.d, e.vtx)
         finally:
             gl.glDisable(gl.GL_ALPHA_TEST)
         if self.a is not None and self.avtx is not None:
@@ -876,6 +1078,9 @@ class SrcInst:
         gl.glEnableClientState(gl.GL_TEXTURE_COORD_ARRAY)
         try:
             self._draw_set(self.d, self.vtx, True)
+            for e in self._ex:
+                if e.vtx is not None:
+                    self._draw_set(e.d, e.vtx, True)
         finally:
             gl.glDisable(gl.GL_ALPHA_TEST)
         tex2d(True)
@@ -1256,7 +1461,7 @@ class SrcPlayerInst:
         """(hip, knee, ankle) for one leg; the ankle keeps the foot about flat unless p is given."""
         return (a, k, -0.12 * (a - k) if p is None else p)
 
-    def animate(self, dt, state, spd=0.0, pitch=0.0, kick=0.0, vz=0.0, melee=False, reload=None, hold=None, shove=None):
+    def animate(self, dt, state, spd=0.0, pitch=0.0, kick=0.0, vz=0.0, melee=False, reload=None, hold=None):
         """state: idle | run | crouch | slide | jump.  spd = ground speed, vz = vertical speed,
         kick = 0..1 shot pulse (recoil for guns, slash for a knife), reload = None or 0..1 progress.
         Every pose weight is smoothed, so walking into a crouch, a jump or a slide never pops."""
@@ -1330,27 +1535,20 @@ class SrcPlayerInst:
         arm_drop = 0.5 * run * g * ground * (0.5 + 0.5 * math.cos(2.0 * p)) + 0.3 * sl
         squat = max(cw, 0.6 * sl)
         rl = None if reload is None else max(0.0, min(1.0, float(reload)))
-        # shove: 0..1 progress of the push. Body leans back to wind up, then into the push, then recovers.
-        if shove is not None:
-            sp_ = max(0.0, min(1.0, float(shove)))
-            _push = shove_pose(sp_)[0] / 3.6              # forward thrust, 0..1 at the strike
-            lean += SHOVE_BODY_LEAN * _push
-            twist += 0.12 * shove_pose(sp_)[3] / 20.0
-            shove = round(sp_, 3)
         # ---- skip the solve if nothing visible changed ----
         flat = [x for lg in legs for x in lg]
         key = tuple(round(x, 3) for x in flat + [lean, twist, hip_yaw, pitch, S["k"], air, arm_drop, squat,
-                                                  -1.0 if rl is None else rl]) + (bool(melee), shove, None if hold is None else (round(hold[0], 2), round(hold[1], 2)))
+                                                  -1.0 if rl is None else rl]) + (bool(melee), None if hold is None else (round(hold[0], 2), round(hold[1], 2)))
         self._snap = (legs, lean)
         if key == self._key:
             return
         self._key = key
         self._solve(legs, lean, twist, pitch, S["k"], rl, melee, ground=True, hip_yaw=hip_yaw,
-                    air_arms=air * (1.0 - sl), arm_drop=arm_drop, squat=squat, hold=hold, shove=shove)
+                    air_arms=air * (1.0 - sl), arm_drop=arm_drop, squat=squat, hold=hold)
 
     # ---- core solver ----
     def _solve(self, legs, lean, twist, pitch, kick, reload, melee, ground=True, root=None, extra=None,
-               hip_yaw=0.0, air_arms=0.0, arm_drop=0.0, squat=0.0, ik=None, arm_local=None, hold=None, shove=None):
+               hip_yaw=0.0, air_arms=0.0, arm_drop=0.0, squat=0.0, ik=None, arm_local=None, hold=None):
         m, ix, Wp = self.m, self.ix, self.Wp
         nb = m.nb
         F, L, U = self.F, self.L, self.U
@@ -1450,17 +1648,6 @@ class SrcPlayerInst:
                             pouch = C + Fa * 6 + La * 5 - Ua * (19.0 + slap)
                             Tl = Tl + (pouch - Tl) * down
                             Tr = Tr + (C + Fa * 7 - La * 3 - Ua * 14 - Tr) * down * 0.5
-                    if shove is not None:
-                        # same motion as the first person shove: gun pulled back to the hip, thrust forward and
-                        # swept across, held, then dragged back. Both hands move with the gun.
-                        sf, sl, su, syaw, spit, _sr = shove_pose(float(shove))
-                        k_ = SHOVE_BODY_SCALE
-                        off = Fa * (sf * k_) + La * (sl * k_) + Ua * (su * k_)
-                        Tr = Tr + off
-                        Tl = Tl + off
-                        sep_ = max(4.0, min(float(hold[0]), 26.0)) if hold is not None else 13.0
-                        Tl = Tl + La * (sep_ * math.sin(math.radians(syaw * SHOVE_ROT)))
-                        Tl = Tl + Ua * (sep_ * math.sin(math.radians(spit * SHOVE_ROT)))
                     if air_arms > 0:                                  # arms lift and open for balance
                         Tr = Tr + U * (3.5 * air_arms) - La * (3.0 * air_arms)
                         Tl = Tl + U * (3.5 * air_arms) + La * (3.0 * air_arms)
@@ -1807,8 +1994,14 @@ def is_src_player(rel):
 def src_players(arch):
     """Character models (L4D2 survivor/infected, other Source characters) inside a Source archive."""
     out = []
+    gpm = set()
+    if getattr(arch, "is_gma", False):
+        try:
+            gpm = set(arch.player_model_paths())   # player models the Garry's Mod addon registers in its lua
+        except Exception:
+            gpm = set()
     for nm in arch.files:
-        if not is_src_player(nm):
+        if not (is_src_player(nm) or nm.replace("\\", "/").lower() in gpm):
             continue
         # Skip truncated VPK entries
         if hasattr(arch, "complete") and not arch.complete(nm):
@@ -1839,6 +2032,13 @@ def src_scan(arch):
     World models (w_*) and incomplete VPK entries are skipped.
     """
     out = []
+    gma = getattr(arch, "is_gma", False)
+    gvm = set()
+    if gma:
+        try:
+            gvm = set(arch.viewmodel_paths())      # SWEP.ViewModel = "..." in lua/weapons/*.lua
+        except Exception:
+            gvm = set()
     for nm in arch.files:
         low = nm.replace("\\", "/").lower()
         if not low.endswith(".mdl"):
@@ -1852,8 +2052,9 @@ def src_scan(arch):
             continue
         if re.search(r"display|dropped|arms|sleeve|glove|hands|_zoom|_scope|ragdoll", low):
             continue
-        # view-model naming: v_*.mdl (any folder)
-        if not re.match(r"^v_[^/]*\.mdl$", b):
+        # view-model naming: v_*.mdl (any folder); Garry's Mod also uses c_*.mdl (hands come from the arms model)
+        # and whatever the addon's weapon script names as SWEP.ViewModel
+        if not (re.match(r"^v_[^/]*\.mdl$", b) or (gma and (re.match(r"^(c|vm)_[^/]*\.mdl$", b) or low in gvm))):
             continue
         # Skip truncated downloads so Skins only lists usable models
         if hasattr(arch, "complete") and not arch.complete(nm):

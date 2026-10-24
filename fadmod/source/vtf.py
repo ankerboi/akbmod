@@ -43,7 +43,7 @@ def parse_kv(text):
 
 # ----- VTF textures ---------------------------------------------------------------------------
 _VTF_BPP = {0: 4, 1: 4, 2: 3, 3: 3, 4: 2, 5: 1, 6: 2, 7: 1, 8: 1, 11: 4, 12: 4, 16: 4, 17: 2,
-            18: 2, 19: 2, 21: 2, 22: 2, 23: 4, 26: 4}
+            18: 2, 19: 2, 21: 2, 22: 2, 23: 4, 24: 8, 25: 8, 26: 4}
 
 
 def _vtf_size(fmt, w, h):
@@ -157,6 +157,29 @@ def load_vtf(vpk, name, max_dim=1024):
             img = np.stack([g, g, g, np.full_like(g, 255)], 2)
         elif fmt == 6:
             img = np.stack([a[:, :, 0]] * 3 + [a[:, :, 1]], 2)
+        elif fmt in (4, 17, 18, 19, 21):                 # 16 bit colour (scope reticles / old textures)
+            c = np.frombuffer(raw, "<u2", mw * mh).reshape(mh, mw).astype(np.int32)
+            if fmt in (4, 17):
+                rgb = _rgb565(c)
+                if fmt == 17:
+                    rgb = rgb[:, :, ::-1]
+                al = np.full((mh, mw, 1), 255, np.int32)
+            elif fmt == 19:                              # BGRA4444
+                rgb = np.stack([((c >> 8) & 15) * 17, ((c >> 4) & 15) * 17, (c & 15) * 17], -1)
+                al = (((c >> 12) & 15) * 17)[:, :, None]
+            else:                                        # BGRX5551 / BGRA5551
+                rgb = np.stack([(((c >> 10) & 31) * 255 + 15) // 31, (((c >> 5) & 31) * 255 + 15) // 31,
+                                ((c & 31) * 255 + 15) // 31], -1)
+                al = np.where(c >> 15, 255, 0 if fmt == 21 else 255)[:, :, None]
+            img = np.concatenate([rgb, al], 2).astype(np.uint8)
+        elif fmt == 22:                                  # UV88 (normal-map style)
+            img = np.concatenate([a, np.zeros((mh, mw, 1), np.uint8), np.full((mh, mw, 1), 255, np.uint8)], 2)
+        elif fmt in (24, 25):                            # RGBA16161616F / RGBA16161616
+            if fmt == 24:
+                f = np.frombuffer(raw, "<f2", mw * mh * 4).astype(np.float32).reshape(mh, mw, 4)
+                img = (np.clip(f, 0.0, 1.0) * 255).astype(np.uint8)
+            else:
+                img = (np.frombuffer(raw, "<u2", mw * mh * 4).reshape(mh, mw, 4) >> 8).astype(np.uint8)
         else:
             raise ValueError("unsupported VTF format %d" % fmt)
     return np.ascontiguousarray(img, dtype=np.uint8), bool(flags & 0x2000 or flags & 0x1000)

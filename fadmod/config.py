@@ -45,7 +45,7 @@ DEFAULT_BINDS = {
     "jump": "space", "reload": "r",
     "jumpbug": "z", "edgebug": "x", "pixelsurf": "c",
     "weapon1": "1", "weapon2": "2",
-    "swaphand": "v", "crouch": "left ctrl", "melee": "e",
+    "swaphand": "v", "crouch": "left ctrl",
     "console": "`",
 }
 DEFAULT_XH = {"size": 6, "thick": 2, "gap": 3, "dot": 0, "outline": 1, "r": 0, "g": 255, "b": 0, "a": 1.0}
@@ -56,7 +56,7 @@ BIND_META = [
     ("jumpbug", "Jumpbug (hold)"), ("edgebug", "Edgebug (hold)"), ("pixelsurf", "Pixelsurf (hold + crouch)"),
     ("weapon1", "Primary weapon"), ("weapon2", "Knife"),
     ("swaphand", "Switch hand"),
-    ("crouch", "Crouch"), ("melee", "Melee attack"),
+    ("crouch", "Crouch"),
     ("console", "Developer console"),
 ]
 BASE_SENS = 0.0022
@@ -76,7 +76,7 @@ FADE_TIME = 0.2      # sequence cross-fade (seconds), same feel as the GoldSrc 0
 VM_BOB_SIDE = 0.45    # first-person gun sway left/right while running. Scaled by cl_viewbob
 VM_BOB_UP = 0.55      # first-person gun up/down bounce while running. Scaled by cl_viewbob
 VM_LAND = 1.0         # gun dip when landing (was 2.2)
-VM_IDLE_ANIM = False    # False = the weapon holds a still pose when you stand still; its animation only plays while you move. True = always play the idle animation
+VM_IDLE_ANIM = False    # False = the weapon mod's own idle animation (hands included) plays only while you move; standing still holds its first frame. True = always play it
 SHAKE = 0.6            # screen shake when you shoot: 0 = off, 0.3 = light, 0.6 = medium, 1 = strong
 SHAKE_DECAY = 7.0      # how fast the shake dies down (higher = shorter)
 # weapon held by other players / bots (the weapon model only, no arms) ------------
@@ -100,40 +100,6 @@ HELD_ANCHORS = [
 HELD_WPN_OFS = (0.0, 0.0, 0.0)         # extra shift of the gun in the hand: forward, left, up (game units)
 ANIM_HZ = 60           # player / bot model animation rate at ANY distance (was 50 / 30 / 15 by distance)
 ANIM_STEP = 1.0 / ANIM_HZ
-
-# L4D2 style melee shove (E key) ---------------------------------------------
-SHOVE_TIME = 0.55      # total length of the shove animation + cooldown (seconds)
-SHOVE_HIT_AT = 0.28    # fraction of the animation where the hit lands (the strike peak)
-SHOVE_RANGE = 78.0     # reach in game units
-SHOVE_ARC = 55.0       # half-angle of the hit cone (degrees) - hits everything inside it, like L4D2
-SHOVE_DMG = 50         # damage to enemies hit (100 HP = dies in 2 shoves)
-SHOVE_SHAKE = 0.4      # screen shake on impact
-SHOVE_ROT = 1          # if the gun swings the wrong way (up/down or left/right), flip to -1
-SHOVE_BODY = True      # other players / bots see a two-hand push when you shove (False = off)
-SHOVE_BODY_LEAN = 0.10 # how far the body leans into the strike (radians at the peak)
-SHOVE_BODY_SCALE = 3.0 # size of the gun swing seen on other players (first person values x this)
-# (fwd, left, up, yaw, pitch-up, roll) keyframes: p = 0..1 through the animation
-SHOVE_KEYS = [
-    (0.00,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0),
-    (0.14, -2.2, -1.2, -0.6, -14.0,  20.0,  12.0),   # wind-up: pull the gun back to the hip, muzzle up
-    (0.28,  3.2,  1.4,  0.2,  16.0,  -8.0, -14.0),   # strike: gun thrust forward and swept across
-    (0.38,  3.6,  1.6,  0.3,  18.0,  -9.0, -15.0),   # impact hold
-    (0.70,  0.8,  0.3,  0.0,   4.0,  -2.0,  -3.0),   # drag back
-    (1.00,  0.0,  0.0,  0.0,   0.0,   0.0,   0.0),
-]
-
-
-def shove_pose(p):
-    """Interpolated (fwd, left, up, yaw, pitch_up, roll) of the shove at progress p (0..1)."""
-    p = max(0.0, min(1.0, p))
-    k = SHOVE_KEYS
-    for a, b in zip(k, k[1:]):
-        if p <= b[0]:
-            t = (p - a[0]) / max(1e-6, b[0] - a[0])
-            t = t * t * (3 - 2 * t)
-            return tuple(a[i] + (b[i] - a[i]) * t for i in range(1, 7))
-    return tuple(k[-1][1:])
-
 
 # sMove (GMod) movement 1:1 — from sm_movement.lua + init.lua convars
 #   sv_airaccelerate 1000, sv_accelerate 10, sv_gravity 800, sv_maxvelocity 10000
@@ -160,6 +126,12 @@ EB_COOLDOWN = 0.15
 # Pixel surf (smFakePX): near wall within 20u, airborne, project velocity onto look yaw, vz=0
 PX_WALL_DIST = 8.0
 EDGEBUG_VZ = 40.0           # residual |vz| after clip for passive edgebug detect
+# Ladders (map builder tool 9) - Source / CS:GO CGameMovement::LadderMove
+LADDER_SPEED = 200.0        # MAX_CLIMB_SPEED: speed of each held movement key on a ladder
+LADDER_SCALE = 0.78         # CS:GO sv_ladder_scale_speed: top climbing speed = 200 * 0.78 = 156 u/s
+LADDER_JUMP = 270.0         # jumping off a ladder: velocity = ladder normal * 270 (no upward part)
+LADDER_REACH = 2.0          # grab trace: the hull moved 2 units along the wish direction must touch the ladder
+LADDER_MOUNT_DOT = -0.5     # you must move toward the ladder: wish . ladder normal below this (about 60 deg cone)
 JUMPBUG_WINDOW = 1
 
 

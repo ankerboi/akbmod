@@ -54,14 +54,12 @@ class Ent:
         self.was_walk = False  # walkable state from previous physics tick
         self.land_ticks = 99
         self.pxsurf = False
+        self.ladder = None   # (nx, ny) normal of the ladder being climbed, None = not on a ladder
         self.jb_tick = -999
         self.eb_cd = 0.0
         self._tick = 0
         self.shootT = 0.0
         self.reloadT = 0.0
-        self.shoveT = 0.0       # seconds left in the melee shove (0 = not shoving)
-        self.shoveD = SHOVE_TIME
-        self.shoveHit = True    # False until the hit of this shove has landed
         self.remote = False     # online player driven by network state
         self.nid = -1
         self.tx = self.ty = self.tz = None
