@@ -198,6 +198,32 @@ class RenderTarget:
         gl.glEnd()
 
 
+# Stratum has a short line box (ascent .75em) and the menus were laid out for a taller font (Segoe UI, caps centre
+# ~.73em from the top vs .42em here), so its text is drawn this many em lower to keep the original alignment.
+STRATUM_DY = 0.30
+# Text that used the monospace font (ammo, kill streak number, scoreboard numbers): Consolas' caps centre is ~.46em
+# from the top, almost the same as Stratum's .42em, so it needs only a tiny shift.
+STRATUM_DY_MONO = 0.04
+
+
+_UI_FONT = None
+
+
+def _ui_font_path():
+    """Find the UI font: assets/font/stratum.ttf first, else the first .ttf/.otf in assets/font/, else the old
+    assets/stratum.ttf location."""
+    global _UI_FONT
+    if _UI_FONT is None:
+        assets = Path(__file__).parent / "assets"
+        fdir = assets / "font"
+        cand = fdir / "stratum.ttf"
+        if not cand.is_file():
+            found = sorted(p for p in fdir.glob("*") if p.suffix.lower() in (".ttf", ".otf")) if fdir.is_dir() else []
+            cand = found[0] if found else assets / "stratum.ttf"
+        _UI_FONT = cand
+    return _UI_FONT
+
+
 class Gfx:
     def __init__(self):
         self.fonts = {}
@@ -208,8 +234,14 @@ class Gfx:
     def set_xf(self, ox=0.0, oy=0.0, sc=1.0):
         self.ox, self.oy, self.sc = ox, oy, sc
 
-    def font(self, size, bold, mono=False):
-        k = (size, bold, mono)
+    def font(self, size, bold, mono=False, face=None):
+        face = face or "stratum"       # Stratum is the default UI font; face="sys" forces the system font
+        k = (size, bold, mono, face)
+        if k not in self.fonts and face == "stratum":
+            try:      # the sMove HUD font, looked up in assets/font/ (falls back to assets/stratum.ttf)
+                self.fonts[k] = pygame.font.Font(str(_ui_font_path()), size)
+            except Exception:
+                face = "sys"
         if k not in self.fonts:
             fam = ("consolas,lucidaconsole,couriernew,dejavusansmono,liberationmono,monospace" if mono
                    else "segoeui,arial,helvetica,dejavusans,freesans")
@@ -219,9 +251,9 @@ class Gfx:
     def _px(self, size):
         return max(6, int(round(size * self.sc)))
 
-    def _tex(self, s, size, color, bold, mono=False):
+    def _tex(self, s, size, color, bold, mono=False, face=None):
         px = self._px(size)
-        k = (s, px, color, bold, mono)
+        k = (s, px, color, bold, mono, face)
         c = self.cache.get(k)
         if c:
             return c
@@ -229,7 +261,10 @@ class Gfx:
             for tid, _, _ in self.cache.values():
                 gl.glDeleteTextures([tid])
             self.cache.clear()
-        surf = self.font(px, bold, mono).render(s if s else " ", True, color)
+        fnt = self.font(px, bold, mono, face)
+        if (face or "stratum") == "stratum" and s and any(m is None for m in fnt.metrics(s)):
+            fnt = self.font(px, bold, mono, "sys")      # a glyph Stratum lacks (accents, symbols): system font for this string
+        surf = fnt.render(s if s else " ", True, color)
         w, h = surf.get_size()
         data = pygame.image.tostring(surf, "RGBA", False)
         tid = gl.glGenTextures(1)
@@ -243,11 +278,16 @@ class Gfx:
         self.cache[k] = (tid, w, h)   # w, h are real pixels
         return self.cache[k]
 
-    def text_w(self, s, size, bold=False, mono=False):
-        return self.font(self._px(size), bold, mono).size(s)[0] / self.sc
+    def text_w(self, s, size, bold=False, mono=False, face=None):
+        return self.font(self._px(size), bold, mono, face).size(s)[0] / self.sc
 
-    def text(self, s, x, y, size=14, color=(255, 255, 255), alpha=1.0, bold=False, anchor="l", mono=False):
-        tid, pw, ph = self._tex(s, size, tuple(color), bold, mono)
+    def text_h(self, size, bold=False, mono=False, face=None):
+        return self.font(self._px(size), bold, mono, face).size("Ag")[1] / self.sc
+
+    def text(self, s, x, y, size=14, color=(255, 255, 255), alpha=1.0, bold=False, anchor="l", mono=False, face=None, fix=True):
+        tid, pw, ph = self._tex(s, size, tuple(color), bold, mono, face)
+        if fix and (face or "stratum") == "stratum":
+            y += size * (STRATUM_DY_MONO if mono else STRATUM_DY)   # lower Stratum to where the old font's glyphs sat
         sc = self.sc
         w, h = pw / sc, ph / sc             # size in layout units = exactly pw x ph screen pixels
         if anchor == "c":
@@ -268,6 +308,37 @@ class Gfx:
         gl.glEnd()
         return w
 
+    def stext(self, s, x, y, size, color, alpha=1.0, anchor="l", shadow=False, outline=False, face="stratum"):
+        """Source-style text: optional 1px black drop shadow or outline behind it."""
+        if shadow:
+            self.text(s, x + 1, y + 1, size, (0, 0, 0), alpha=alpha, anchor=anchor, face=face, fix=False)
+        if outline:
+            for ox_, oy_ in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+                self.text(s, x + ox_, y + oy_, size, (0, 0, 0), alpha=alpha, anchor=anchor, face=face, fix=False)
+        self.text(s, x, y, size, color, alpha=alpha, anchor=anchor, face=face, fix=False)
+
+    def rrect(self, x, y, w, h, r, rgba):
+        """Filled rounded rectangle (layout units)."""
+        r = max(0.0, min(r, w / 2, h / 2))
+        pts = []
+        for cx_, cy_, a0 in ((x + w - r, y + r, -90), (x + w - r, y + h - r, 0), (x + r, y + h - r, 90), (x + r, y + r, 180)):
+            for i in range(5):
+                a = math.radians(a0 + i * 22.5)
+                pts.append((cx_ + math.cos(a) * r, cy_ + math.sin(a) * r))
+        gl.glDisable(gl.GL_TEXTURE_2D)
+        gl.glColor4f(*rgba)
+        gl.glBegin(gl.GL_POLYGON)
+        for px_, py_ in pts:
+            gl.glVertex2f(px_, py_)
+        gl.glEnd()
+
+    def wordbox(self, x, y, s, size, boxcol, color, bs=5, shadow=False, outline=False, alpha=1.0):
+        """Garry's Mod draw.WordBox, centred on x: box = text + bs padding, rounded by bs, top at y."""
+        tw, th = self.text_w(s, size, face="stratum"), self.text_h(size, face="stratum")
+        if boxcol[3] > 0:
+            self.rrect(x - tw / 2 - bs, y, tw + bs * 2, th + bs * 2, bs, (boxcol[0], boxcol[1], boxcol[2], boxcol[3] * alpha))
+        self.stext(s, x, y + bs, size, color, alpha=alpha, anchor="c", shadow=shadow, outline=outline)
+
     def rect(self, x, y, w, h, rgba):
         # snap edges to whole screen pixels (a 1-unit border is always at least 1 pixel, never blurry)
         sc, ox, oy = self.sc, self.ox, self.oy
@@ -286,13 +357,19 @@ class Gfx:
         gl.glVertex2f(x1, y1); gl.glVertex2f(x0, y1)
         gl.glEnd()
 
-    def box(self, x, y, w, h, fill, border=None):
-        self.rect(x, y, w, h, fill)
+    def rr(self, x, y, w, h, rgba, r=6):
+        """Rounded rect snapped to whole screen pixels (radius is clamped to half the shorter side)."""
+        sc, ox, oy = self.sc, self.ox, self.oy
+        x0, y0 = round(ox + x * sc), round(oy + y * sc)
+        x1, y1 = max(x0 + 1, round(ox + (x + w) * sc)), max(y0 + 1, round(oy + (y + h) * sc))
+        self.rrect((x0 - ox) / sc, (y0 - oy) / sc, (x1 - x0) / sc, (y1 - y0) / sc, r, rgba)
+
+    def box(self, x, y, w, h, fill, border=None, r=4):
         if border:
-            self.rect(x, y, w, 1, border)
-            self.rect(x, y + h - 1, w, 1, border)
-            self.rect(x, y, 1, h, border)
-            self.rect(x + w - 1, y, 1, h, border)
+            self.rr(x, y, w, h, border, r)
+            self.rr(x + 1, y + 1, w - 2, h - 2, fill, max(0, r - 1))
+        else:
+            self.rr(x, y, w, h, fill, r)
 
 
 def c255(r, g, b, a=1.0):

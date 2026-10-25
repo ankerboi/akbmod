@@ -1,4 +1,4 @@
-"""World collision and rendering: ArenaWorld and FadMapWorld."""
+"""World collision and rendering: FadMapWorld (maps come from .fadmap files)."""
 import base64
 import io
 import math
@@ -25,6 +25,8 @@ PROBES = _fib_dirs(48)
 
 class World:
     feet_offset = 36
+    _FACES = ((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, -1.0, 0.0),
+              (0.0, 1.0, 0.0), (0.0, 0.0, -1.0), (0.0, 0.0, 1.0))
 
     def draw_sky(self, x, y, z):
         pass
@@ -62,109 +64,24 @@ class World:
         return self.probe_normal(x, y, z)
 
 
-class ArenaWorld(World):
-    B = [[-1000, -1000, -40, 1000, 1000, 0], [-1032, -1000, 0, -1000, 1000, 400],
-         [1000, -1000, 0, 1032, 1000, 400], [-1000, -1032, 0, 1000, -1000, 400],
-         [-1000, 1000, 0, 1000, 1032, 400],
-         [-100, -400, 0, 100, -370, 120], [-100, 370, 0, 100, 400, 120],
-         [-500, -100, 0, -400, 0, 100], [400, 0, 0, 500, 100, 100],
-         [-250, 150, 0, -150, 250, 100], [150, -250, 0, 250, -150, 100],
-         [-60, -60, 0, 60, 60, 160]]
+class NoMapWorld(World):
+    """Placeholder used until a .fadmap is loaded: no geometry, nothing to draw. Matches cannot start on it."""
+    B = []
+    meta = []
+    name = "No map"
 
     def __init__(self):
-        B = self.B
-        ct = [[-500 + i * 200, -900, 40] for i in range(6)]
-        tt = [[-500 + i * 200, 900, 40] for i in range(6)]
-        self.spawns = [ct, tt]
-        self._tex = None
-        self._list = None
+        self.spawns = [[[0, 0, 40]], [[0, 0, 40]]]
 
     def solid(self, x, y, z):
-        for b in self.B:
-            if (b[0] - 16 < x < b[3] + 16 and b[1] - 16 < y < b[4] + 16
-                    and b[2] - 36 < z < b[5] + 36):
-                return True
         return False
-
-    def bullet_solid(self, x, y, z):
-        for b in self.B:
-            if b[0] < x < b[3] and b[1] < y < b[4] and b[2] < z < b[5]:
-                return True
-        return False
-
-    _FACES = ((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, -1.0, 0.0),
-              (0.0, 1.0, 0.0), (0.0, 0.0, -1.0), (0.0, 0.0, 1.0))
-
-    def normal_at(self, x, y, z, want_up=False, move=None):
-        if want_up:
-            return (0.0, 0.0, 1.0)  # boxes only have flat tops
-        best, bd = None, 1e30
-        for b in self.B:
-            sv = (b[0] - 16 - x, x - (b[3] + 16), b[1] - 16 - y, y - (b[4] + 16),
-                  b[2] - 36 - z, z - (b[5] + 36))
-            m = max(sv)
-            for i in range(6):
-                if sv[i] < m - .5:
-                    continue  # not a face we are touching
-                n = self._FACES[i]
-                if move is not None and n[0] * move[0] + n[1] * move[1] + n[2] * move[2] > -1e-4:
-                    continue
-                if abs(sv[i]) < bd:
-                    bd = abs(sv[i])
-                    best = n
-        return best
-
-    def _build(self):
-        self._tex = checker_tex()
-        self._list = gl.glGenLists(1)
-        gl.glNewList(self._list, gl.GL_COMPILE)
-        gl.glBindTexture(gl.GL_TEXTURE_2D, self._tex["t"])
-        for b in self.B:
-            col = (0x88 / 255, 0x99 / 255, 0xaa / 255) if b[5] <= 0 else (0xb0 / 255, 0xa0 / 255, 0x90 / 255)
-            gl.glColor3f(*col)
-            x0, y0, z0, x1, y1, z1 = b
-            R = 8
-            faces = [
-                ((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)),  # top
-                ((x0, y1, z0), (x1, y1, z0), (x1, y0, z0), (x0, y0, z0)),  # bottom
-                ((x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)),
-                ((x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1)),
-                ((x0, y1, z0), (x0, y0, z0), (x0, y0, z1), (x0, y1, z1)),
-                ((x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)),
-            ]
-            gl.glBegin(gl.GL_QUADS)
-            for f in faces:
-                for (u, v), p in zip(((0, 0), (R, 0), (R, R), (0, R)), f):
-                    gl.glTexCoord2f(u, v)
-                    gl.glVertex3f(*p)
-            gl.glEnd()
-        gl.glEnable(gl.GL_TEXTURE_2D)
-        gl.glEndList()
-
-    @staticmethod
-    def _solid_box(x0, y0, z0, x1, y1, z1):
-        gl.glBegin(gl.GL_QUADS)
-        for f in (((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)),
-                  ((x0, y1, z0), (x1, y1, z0), (x1, y0, z0), (x0, y0, z0)),
-                  ((x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)),
-                  ((x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1)),
-                  ((x0, y1, z0), (x0, y0, z0), (x0, y0, z1), (x0, y1, z1)),
-                  ((x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1))):
-            for p in f:
-                gl.glVertex3f(*p)
-        gl.glEnd()
 
     def draw(self):
-        if self._list is None:
-            self._build()
-        gl.glEnable(gl.GL_TEXTURE_2D)
-        gl.glCallList(self._list)
-        gl.glColor4f(1, 1, 1, 1)
+        pass
+
 
 class FadMapWorld(World):
     """A map compiled by the FAD-MOD Map Builder (.fadmap): boxes with optional textures + team spawns."""
-
-    _FACES = ArenaWorld._FACES
 
     def __init__(self, d):
         import base64

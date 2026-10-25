@@ -23,21 +23,36 @@ def _find_sub(parent, names):
 
 
 def mod_folders(*names):
-    """Existing folders called one of `names` inside the "mod" folder (next to this script, or in cwd).
-    Never creates anything - if the folder is not there, the list is empty."""
-    names = tuple(n.lower() for n in names)
+    """Existing folders called one of `names` (weapon, player, arms, sound, image, maps ...) inside the "mod" folder
+    OR the "assets" folder (next to this script, in the package, or in cwd). Singular / plural both match
+    (weapon = weapons, sound = sounds ...). Never creates anything - if nothing is there, the list is empty."""
+    want = set()
+    for n in names:
+        n = n.lower()
+        want.add(n)
+        want.add(n + "s")
+        if n.endswith("s") and len(n) > 3:
+            want.add(n[:-1])
+    names = tuple(sorted(want))
     out, seen = [], set()
     # package dir, project root (parent of package), and cwd
     for base in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent, Path.cwd()):
-        mroot = _find_sub(base, ("mod",))
-        if not mroot:
-            continue
-        d = _find_sub(mroot, names)
-        if d:
-            k = str(d.resolve())
-            if k not in seen:
-                seen.add(k)
-                out.append(d)
+        roots = []
+        for rn in ("mod", "assets"):
+            r = _find_sub(base, (rn,))
+            if r:
+                roots.append(r)
+                if rn == "assets":
+                    r2 = _find_sub(r, ("mod",))          # assets/mod/<weapon|player|...> works too
+                    if r2:
+                        roots.append(r2)
+        for mroot in roots:
+            d = _find_sub(mroot, names)
+            if d:
+                k = str(d.resolve())
+                if k not in seen:
+                    seen.add(k)
+                    out.append(d)
     return out
 
 DEFAULT_BINDS = {
@@ -45,7 +60,7 @@ DEFAULT_BINDS = {
     "jump": "space", "reload": "r",
     "jumpbug": "z", "edgebug": "x", "pixelsurf": "c",
     "weapon1": "1", "weapon2": "2",
-    "swaphand": "v", "crouch": "left ctrl",
+    "swaphand": "v", "thirdperson": "b", "crouch": "left ctrl",
     "console": "`",
 }
 DEFAULT_XH = {"size": 6, "thick": 2, "gap": 3, "dot": 0, "outline": 1, "r": 0, "g": 255, "b": 0, "a": 1.0}
@@ -56,6 +71,7 @@ BIND_META = [
     ("jumpbug", "Jumpbug (hold)"), ("edgebug", "Edgebug (hold)"), ("pixelsurf", "Pixelsurf (hold + crouch)"),
     ("weapon1", "Primary weapon"), ("weapon2", "Knife"),
     ("swaphand", "Switch hand"),
+    ("thirdperson", "Toggle third person"),
     ("crouch", "Crouch"),
     ("console", "Developer console"),
 ]
@@ -109,6 +125,11 @@ ANIM_STEP = 1.0 / ANIM_HZ
 # friction 5.2, stopspeed 80, maxspeed 250, duck speed 0.34, bhop prevention 1.1x (sv_enablebunnyhopping 0)
 MAXS, FRIC, STOPS, ACC, AIRACC, AIRCAP, JUMPV, BHCAP = 250, 5.2, 80, 5.5, 12.0, 30.0, 301.993, 1.1
 DUCKSPD = 0.34
+# sMove score system
+SC_BHOP, SC_PX, SC_JB, SC_EB, SC_KILL = 5, 1, 20, 200, 300   # points: bhop, pixelsurf tick, jumpbug, edgebug, kill
+SC_TIMER_LEN = 3.0            # seconds a trick keeps your held points alive
+SC_BHOP_MIN_SPEED = 250       # horizontal speed needed for a hop to count as a bhop
+SC_PX_MIN_SPEED = 150         # horizontal speed needed for a pixelsurf tick to score
 FALL_SAFE_SPEED, FALL_FATAL_SPEED = 580.0, 1024.0   # CS:GO: no damage below 580 u/s, dead at 1024
 SV_GRAVITY = 800.0
 STICK_TO_GROUND = False     # sv_sticktoground 0

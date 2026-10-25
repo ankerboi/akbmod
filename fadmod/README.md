@@ -38,7 +38,7 @@ python run_fadmod.py
 python -m fadmod.main
 ```
 
-Optional mods go in `mod/weapon`, `mod/player`, `mod/arms` next to the package (or in the working directory).
+Optional mods go in `assets/weapon`, `assets/player`, `assets/arms`, `assets/sound`, `assets/image` (and `assets/maps`) inside the package, next to it, or in the working directory. The old `mod/...` folders still work. Singular and plural names both match (`weapon` = `weapons`).
 
 ## Garry's Mod addons (.gma) as weapon / player / arms mods
 
@@ -76,3 +76,24 @@ Build them in `saw_map_editor.py` with the Ladder tool (key `9` or `K`): drag a 
 - Jump leaps off at 270 u/s straight away from the ladder. Climbing past the top of the block drops you back into normal
   movement with the speed you had (you pop over the lip).
 - Standing on the floor and pressing S steps you off.
+
+## sMove score system
+
+Ported from the sMove gamemode. Tricks add to a **held** pool; killing someone banks the held points plus 300.
+
+| Trick | Points |
+|---|---|
+| Bunnyhop (2nd+ chained hop above 250 u/s) | 5 |
+| Pixelsurf (per tick, above 150 u/s) | 1 |
+| Jumpbug | 20 |
+| Edgebug | 200 |
+| Kill | 300 (+ held) |
+
+Every trick restarts a 3 second timer; if it runs out (or you die) the held points are lost. Tunables are the `SC_*`
+constants in `config.py`. The HUD (`draw_smove_hud` in `render.py`) uses the Stratum font and kill sound shipped in
+`assets/`. The velocity box (`speed (speed at last bhop)`) is part of the Score toggle in settings (Score: OFF turns the whole system off).
+
+## Map selection
+Play > Create match > **Load map** opens a map list with a picture for each map (the arena plus every .fadmap
+in `mod/maps`; maps you load once are kept there). Click a map and press Load map, or double-click it.
+Browse file... still lets you pick a .fadmap from anywhere. The picture comes from the map builder (Preview button).

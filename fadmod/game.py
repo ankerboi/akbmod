@@ -20,7 +20,7 @@ from OpenGL import GL as gl
 
 from .config import *
 from .glutil import FX, make_texture
-from .world import World, ArenaWorld, FadMapWorld
+from .world import World, NoMapWorld, FadMapWorld
 from .audio import Audio
 from .entity import Ent
 from .net import NET, Net, NET_STATE_HZ  # NET is the global instance
@@ -33,7 +33,7 @@ from .source.loaders import (
 )
 from .source.model import VM_EVENT_GAIN, SHOTGUN_RELOAD_SCALE, PLAYER_SCALE, HIT_HALF_W, HIT_HALF_H, HIT_HALF_H_LOW, HEAD_FRAC, HEAD_MIN_R, HEAD_MAX_R
 from .source.vtf import parse_kv
-from .render import spray_pattern, xp_info, XP_KILL, XP_KNIFE, HM_TIME, held_points
+from .render import spray_pattern, HM_TIME, held_points
 
 class Game:
     """All game state and logic. Sections: setup; developer console; online glue; physics and movement; combat; view-model playback and weapon animation sounds; mods; maps; per-frame update."""
@@ -84,8 +84,8 @@ class Game:
         self.aspect = 0.0  # 0 = match the window; else forced aspect (stretched to fill); 1.0 = 1:1
         self.fullscreen = False
         self.show_fps = False
-        self.show_speed = False   # speed meter (units per second) in the HUD
-        self.show_jstats = False  # print jump stats (distance, speed, strafes ...) in the chat
+        self.fps_cap = 144.0      # game FPS cap (Settings > Video); 300 = unlimited
+        self.show_score = True    # sMove score system on/off (HUD + points)
         self.chat = []            # chat lines: {"tag", "text", "t"} (t = seconds left)
         self.fps_val = 0.0
         self.vm_adj = [0.0, 0.0, 0.0]  # viewmodel x (forward), y (right), z (up)
@@ -99,11 +99,21 @@ class Game:
         self.death_killer = "UNKNOWN"
         self.player_name = "Player"
         self.streak = 0
-        self.xp = 0              # total XP (saved in the settings file)
-        self.xp_pops = []        # floating "+100" popups
+        # sMove score system: held trick points are banked (plus the kill bonus) when you kill
+        self.sc_total = 0        # banked score
+        self.sc_held = 0         # trick points not banked yet; lost when the timer runs out
+        self.sc_timer = 0.0      # seconds left to keep the combo alive (SM_TIMER)
+        self.sc_trick = ""       # last trick label ("bhop x3", "jb", "eb", "px 0.42s")
+        self.sc_chain = 0        # bunnyhops chained so far
+        self.sc_jvel = 0         # speed at your last chained bhop take-off
+        self.sc_flash_score = 0.0   # banked score turns cyan for a moment when it changes
+        self.sc_flash_ind = 0.0     # trick label / velocity turn cyan on every trick
+        self.sc_kill_t = 0.0        # "+N | Killed X" notice timer
+        self.sc_kill_pts = 0
+        self.sc_kill_name = ""
+        self.sc_px_t0 = None        # time the current pixelsurf started
         self.hm = 0.0            # hit marker timer (CoD style X at the crosshair)
         self.hm_kill = False     # red marker when the hit was a kill
-        self.rank_flash = 0.0    # "RANK UP" banner timer
         self.xh = dict(DEFAULT_XH)   # crosshair settings
         self.vmA = {"vm": None, "w": -1, "s": 0, "t": 0.0, "loop": True}
         self.quit_req = False        # set by the quit console command
@@ -157,8 +167,13 @@ class Game:
                 e.pm = None
 
     def spawn(self, e):
-        lst = self.world.spawns[e.team]
-        s = random.choice(lst)
+        home = getattr(e, "home", None)
+        if home is not None and not e.isP and not e.remote:
+            s = (home[0], home[1], home[2], math.degrees(home[3]))      # a bot added by hand respawns where it was added
+        else:
+            home = None
+            lst = self.world.spawns[e.team]
+            s = random.choice(lst)
         e.x, e.y, e.z = s[0], s[1], s[2]
         n = 0
         while self.world.solid(e.x, e.y, e.z) and n < 80:
@@ -168,7 +183,6 @@ class Game:
         e.px, e.py, e.pz = e.x, e.y, e.z
         e.acc = 0.0
         e.jreq = 0
-        e.js = None
         e.sl = 0.0
         e.scd = 0.0
         e.so = 0.0
@@ -181,7 +195,7 @@ class Game:
             e.yaw = math.radians(s[3])     # spawn point facing from the map builder
         e.pitch = 0.0
         e.ammo = [w.mag for w in CFG["weapons"]]
-        e.w = self.primary if e.isP else 1
+        e.w = self.primary if e.isP else (home[4] if home is not None else 1)
         e.cool = 0.0
         e.zoom = 0
         e.pun_p = e.pun_y = 0.0
@@ -309,6 +323,7 @@ class Game:
             e.ammo = [w.mag for w in CFG["weapons"]]
             e.w = self.primary if not CFG["weapons"][self.primary].melee else 0
             e.anim = fresh_anim()
+            e.home = (e.x, e.y, e.z, e.yaw, e.w)     # respawn here (not at the map spawn points)
         else:
             self.spawn(e)
         self.ents.append(e)
@@ -329,7 +344,7 @@ class Game:
             self.ents.remove(e)
             removed.append(e.name)
         if removed:
-            self.con_print("Kicked %d bot(s): %s" % (len(removed), ", ".join(removed[:8])), (255, 193, 7))
+            self.con_print("Kicked %d bot(s): %s" % (len(removed), ", ".join(removed[:8])), (66, 165, 245))
         else:
             self.con_print("No bots to kick.", (180, 180, 180))
 
@@ -406,21 +421,21 @@ class Game:
                     e.hp = 0
                     self.kill(e, self.P if self.P else e)
                     n += 1
-            self.con_print("Killed %d bot(s)." % n, (255, 193, 7))
+            self.con_print("Killed %d bot(s)." % n, (66, 165, 245))
         elif cmd in ("kill", "killme", "suicide"):
             if self.P and self.P.alive:
                 self.P.hp = 0
                 self.kill(self.P, self.P)
-                self.con_print("You died.", (255, 193, 7))
+                self.con_print("You died.", (66, 165, 245))
         elif cmd in ("restart", "mp_restartgame", "retry"):
             self.reset_game()
             self.con_print("Match restarted.", (157, 211, 103))
         elif cmd == "god":
             self.P.god = not getattr(self.P, "god", False)
-            self.con_print("god %s" % ("ON" if self.P.god else "OFF"), (255, 214, 0))
+            self.con_print("god %s" % ("ON" if self.P.god else "OFF"), (66, 165, 245))
         elif cmd == "noclip":
             self.P.noclip = not getattr(self.P, "noclip", False)
-            self.con_print("noclip %s" % ("ON" if self.P.noclip else "OFF"), (255, 214, 0))
+            self.con_print("noclip %s" % ("ON" if self.P.noclip else "OFF"), (66, 165, 245))
         elif cmd in ("fps", "cl_showfps"):
             if args:
                 self.show_fps = arg(0) not in ("0", "off", "false")
@@ -461,12 +476,7 @@ class Game:
                 on = arg(0) not in ("0", "off", "false")
             else:
                 on = not self.thirdperson
-            self.thirdperson = on
-            P = self.P
-            if P and not on:
-                P.pm = None                 # free the model, it is only needed in third person
-                P._pm_tried = False
-                P._pm_team = None
+            self.set_thirdperson(on)
             self.con_print("thirdperson %s" % ("ON" if on else "OFF"), (157, 211, 103))
         elif cmd == "day":
             FX.day = True
@@ -485,7 +495,7 @@ class Game:
 
     def map_sig(self):
         b = self.files.get("map_raw")
-        return hashlib.sha1(b).hexdigest()[:10] if b else "arena"
+        return hashlib.sha1(b).hexdigest()[:10] if b else "none"
 
     def mk_remote(self, pid, p):
         e = Ent(p["tm"], False, p["n"])
@@ -508,7 +518,7 @@ class Game:
         """room: a room-browser entry (dict), or a list of (ip, port) addresses to try."""
         self.join_msg = ""
         if isinstance(room, dict):
-            ok, self.join_msg = self.use_map_sig(str(room.get("map", "arena")))
+            ok, self.join_msg = self.use_map_sig(str(room.get("map", "none")))
             if not ok:
                 return False
             return self.net.join_room(room, self.player_name, self.map_sig())
@@ -1211,6 +1221,8 @@ class Game:
                 if hs > lim:
                     e.vx *= lim / hs
                     e.vy *= lim / hs
+            if e.isP:
+                self.sc_on_jump(e)
         if gr:
             sp = math.hypot(e.vx, e.vy)
             if sp > .1:
@@ -1300,12 +1312,19 @@ class Game:
             if self._px_snd <= 0:
                 self._px_snd = self.move_hit_interval()
                 self.play_move_hit()
+            if e.isP:
+                self.sc_on_pixelsurf(e)
         else:
             self._px_snd = 0.0
+            if e.isP:
+                self.sc_px_t0 = None
             if want_jb and self.smove_jumpbug(e, want_jb):
                 self.play_move_hit()
+                self.sc_on_trick("jb", SC_JB)
             elif want_eb and self.smove_edgebug(e):
                 self.play_move_hit()
+                self.sc_on_trick("eb", SC_EB)
+                self.sc_chain = 0
 
         # --- CS:GO fall damage ---
         # Landing faster than 580 u/s hurts: (speed - 580) * 100 / (1024 - 580), so 1024 u/s kills.
@@ -1322,81 +1341,105 @@ class Game:
                 if e.hp <= 0:
                     self.kill(e, e)
 
-    def js_tick(self, e, s, g0, v0, dt):
-        """Measure every jump: takeoff speed, distance, max speed, height, strafes and sync.
-        g0 / v0 = on walkable ground / horizontal speed BEFORE this physics tick."""
-        if getattr(e, "ladder", None):                       # climbing: not a jump, nothing to measure
-            e.js = None
-            return
-        g1 = self.walkable(e)
-        v1 = math.hypot(e.vx, e.vy)
-        js = e.js
-        # live tech feedback (sMove-style)
-        if not getattr(e, "pxsurf", False):
-            e._px_shown = False                              # surf ended: the next one prints again
-        if e.isP and self.show_jstats:
-            if getattr(e, "pxsurf", False):
-                if not getattr(e, "_px_shown", False):      # once per pixel surf, not every tick
-                    e._px_shown = True
-                    self.chat_add("Pixelsurf", tag="PX", life=2.0)
-            elif getattr(e, "edgebug", False):
-                self.chat_add("Edgebug  speed %.0f" % v1, tag="EB", life=3.0)
-            elif getattr(e, "jumpbug", False):
-                self.chat_add("Jumpbug", tag="JB", life=2.0)
+    # --------------------------------------------------------------------------
+    # sMove score system
+    # --------------------------------------------------------------------------
 
-        if js is None:
-            if g0 and not g1 and e.vz > 100 and e.sl <= 0 and e.alive:     # left the ground by jumping
-                e.js = {"x": e.px, "y": e.py, "z": e.pz, "pre": v0, "max": v1, "h": 0.0, "n": 0, "ls": 0,
-                        "gain": 0, "ticks": 0, "wj": e.wj,
-                        "bhop": (time.time() - e.last_land) < 0.25,
-                        "jbug": bool(getattr(e, "jumpbug", False))}
-            return
-        if e.sl > 0 or not e.alive:
-            e.js = None
-            return
-        if getattr(e, "jumpbug", False):
-            # a jumpbug launches you again before you land: end the jump that was running
-            # (reported as landing right here) and measure the jumpbug jump from this spot,
-            # so the distance is not added up over two jumps
-            self._js_report(e, js, v1, dt)
-            e.last_land = time.time()
-            e.js = {"x": e.x, "y": e.y, "z": e.z, "pre": v0, "max": v1, "h": 0.0, "n": 0, "ls": 0,
-                    "gain": 0, "ticks": 0, "wj": e.wj, "bhop": False, "jbug": True}
-            return
-        js["ticks"] += 1
-        js["max"] = max(js["max"], v1)
-        js["h"] = max(js["h"], e.z - js["z"])
-        if v1 > v0 + 1e-3:
-            js["gain"] += 1
-        if s and s != js["ls"]:
-            js["n"] += 1
-            js["ls"] = s
-        if not (g1 and not g0):
-            return                                                         # still in the air
-        e.js = None
-        e.last_land = time.time()
-        self._js_report(e, js, v1, dt)
+    def sc_add_held(self, n):
+        self.sc_held += n
 
-    def _js_report(self, e, js, v1, dt):
-        """Print the stats of one finished jump."""
-        dist = math.hypot(e.x - js["x"], e.y - js["y"])
-        dz = e.z - js["z"]
-        if not self.show_jstats or not e.isP or dist < 20 or dist > 4000 or js["ticks"] * dt < 0.15:
+    def sc_keep_alive(self):
+        self.sc_timer = SC_TIMER_LEN
+
+    def sc_on_trick(self, label, pts):
+        """jumpbug / edgebug: points go into the held pool, the timer restarts, the label flashes cyan."""
+        if not self.show_score:
             return
-        if int(e.wj) > int(js["wj"]):
-            kind = "Wall jump"
-        elif js.get("jbug"):
-            kind = "Jumpbug"
-        elif js["bhop"]:
-            return                                  # normal bunnyhops are not printed
-        else:
-            kind = "Jump"
-        if abs(dz) > 2:
-            kind += " (%+.0f)" % dz
-        sync = 100.0 * js["gain"] / max(1, js["ticks"])
-        self.chat_add("%s: %.1f units | Pre: %.0f | Max: %.0f | Height: %.1f | Strafes: %d | Sync: %.0f%%"
-                      % (kind, dist, js["pre"], js["max"], js["h"], js["n"], sync),
-                      tag="JB" if js.get("jbug") and kind.startswith("Jumpbug") else "JUMP")
+        self.sc_add_held(pts)
+        self.sc_keep_alive()
+        self.sc_trick = label
+        self.sc_flash_ind = 0.2
+
+    def sc_on_jump(self, e):
+        """Take-off from the ground. Above 250 u/s each chained hop is a bhop; the 2nd and later score."""
+        if not self.show_score:
+            return
+        hs = math.hypot(e.vx, e.vy)
+        if hs > SC_BHOP_MIN_SPEED:
+            self.sc_chain += 1
+            if self.sc_chain > 1:
+                self.sc_keep_alive()
+                self.sc_add_held(SC_BHOP)
+                self.sc_trick = "bhop x%d" % (self.sc_chain - 1)
+                self.sc_jvel = int(hs)
+                self.sc_flash_ind = 0.2
+
+    def sc_on_pixelsurf(self, e):
+        """Every tick of a pixelsurf keeps the timer up; moving faster than 150 u/s also adds a point."""
+        if not self.show_score:
+            return
+        now = time.time()
+        if self.sc_px_t0 is None:
+            self.sc_px_t0 = now
+        self.sc_keep_alive()
+        self.sc_trick = "px %ss" % self.sc_fmt(round(now - self.sc_px_t0, 2))
+        self.sc_chain = 0
+        if math.hypot(e.vx, e.vy) > SC_PX_MIN_SPEED:
+            self.sc_add_held(SC_PX)
+
+    def sc_on_kill(self, v):
+        """Bank everything you are holding plus the kill bonus."""
+        if not self.show_score:
+            return
+        pts = self.sc_held + SC_KILL
+        self.sc_total += pts
+        self.sc_kill_pts = pts
+        self.sc_kill_name = v.name or "UNKNOWN"
+        self.sc_kill_t = 2.0
+        self.sc_flash_score = 0.3
+        self.sc_held = 0
+        self.sc_timer = 0.0
+        snd = self._kill_sound()
+        if snd is not None:
+            self.audio.play(1.0, snd, 0.0)
+
+    def sc_reset_combo(self):
+        self.sc_held = 0
+        self.sc_timer = 0.0
+        self.sc_chain = 0
+
+    def sc_update(self, dt):
+        P = self.P
+        if not self.show_score:               # score system switched off in settings: nothing runs, nothing shows
+            self.sc_reset_combo()
+            self.sc_kill_t = self.sc_flash_score = self.sc_flash_ind = 0.0
+            self.sc_px_t0 = None
+            return
+        if self.sc_timer > 0 and P.alive:
+            self.sc_timer = max(0.0, self.sc_timer - dt)
+            if self.sc_timer <= 0:
+                self.sc_held = 0              # ran out of time: the held points are lost
+                self.sc_chain = 0
+        elif not P.alive:
+            self.sc_reset_combo()
+        if self.sc_chain and math.hypot(P.vx, P.vy) < SC_BHOP_MIN_SPEED:
+            self.sc_chain = 0                 # slowed down below 250: the bhop chain is over
+        self.sc_flash_score = max(0.0, self.sc_flash_score - dt)
+        self.sc_flash_ind = max(0.0, self.sc_flash_ind - dt)
+        self.sc_kill_t = max(0.0, self.sc_kill_t - dt)
+
+    @staticmethod
+    def sc_fmt(v):
+        return ("%.2f" % v).rstrip("0").rstrip(".")
+
+    def _kill_sound(self):
+        if not hasattr(self, "_ks_snd"):
+            self._ks_snd = None
+            try:
+                self._ks_snd = pygame.mixer.Sound(str(Path(__file__).parent / "assets" / "killsound.wav"))
+            except Exception as ex:
+                print("kill sound failed:", ex)
+        return self._ks_snd
 
     # ==========================================================================
     # combat: shooting, bots, kills, shove, weapon switching
@@ -1429,11 +1472,10 @@ class Game:
         if k.isP and v is not k:
             self.hm, self.hm_kill = HM_TIME, True     # red hit marker on every kill (bots, online players, knife)
             self.streak += 1
-            self.give_xp(XP_KNIFE if (w and w.melee) else XP_KILL, "KNIFE KILL" if (w and w.melee) else "KILL")
-            if self.streak >= 3:
-                self.give_xp(25, "STREAK x%d" % self.streak)
+            self.sc_on_kill(v)
         if v.isP:
             self.streak = 0
+            self.sc_reset_combo()
             self.death_killer = k.name or "UNKNOWN"
             if self.P.zoom:
                 self.P.zoom = 0
@@ -1442,14 +1484,6 @@ class Game:
                            "v": self.net.my_id, "w": k.w})
         if self.score[k.team] >= CFG["frags"]:
             self.over = 6.0
-
-    def give_xp(self, n, label=""):
-        old = xp_info(self.xp)[0]
-        self.xp += n
-        self.xp_pops.append({"txt": "+%d" % n, "sub": label, "t": 1.6})
-        self.xp_pops = self.xp_pops[-5:]
-        if xp_info(self.xp)[0] > old:
-            self.rank_flash = 3.0
 
     def fire(self, e, extra=0.0):
         w = CFG["weapons"][e.w]
@@ -2332,6 +2366,17 @@ class Game:
         except Exception:
             return 0.2
 
+    def set_thirdperson(self, on):
+        self.thirdperson = bool(on)
+        P = self.P
+        if P and not on:
+            P.pm = None                 # free the model, it is only needed in third person
+            P._pm_tried = False
+            P._pm_team = None
+
+    def toggle_thirdperson(self):
+        self.set_thirdperson(not self.thirdperson)
+
     def key_aliases(self, raw):
         """The key itself plus the primary key of every action this key is a second bind for."""
         out = [raw]
@@ -2512,7 +2557,7 @@ class Game:
         # last resort: look for .../weapon/<folder>/... in the path
         parts = [x.lower() for x in Path(path).parts]
         for i, part in enumerate(parts):
-            if part == "weapon" and i + 1 < len(parts):
+            if part in ("weapon", "weapons") and i + 1 < len(parts):
                 nxt = parts[i + 1]
                 if nxt and not nxt.endswith((".mdl", ".vpk", ".gma", ".bin", ".zip", ".7z", ".rar", ".part")):
                     return nxt
@@ -3025,6 +3070,7 @@ class Game:
         base = Path(__file__).resolve().parent
         dirs = list(mod_folders("maps", "map"))
         dirs.append(base / "mod" / "maps")
+        dirs.append(base / "assets" / "maps")
         dirs.append(base / "mod")
         out, seen = [], set()
         for d in dirs:
@@ -3042,7 +3088,8 @@ class Game:
         try:
             sig = hashlib.sha1(raw).hexdigest()[:10]
             d = Path(__file__).resolve().parent / "mod" / "maps"
-            d.mkdir(parents=True, exist_ok=True)
+            if not d.is_dir():          # never create folders: only keep a copy if mod/maps already exists
+                return
             p = d / (sig + ".fadmap")
             if not p.exists():
                 p.write_bytes(raw)
@@ -3070,10 +3117,8 @@ class Game:
             return True, ""
         if self.net.active:
             self.net.leave()          # maps can only change while offline
-        if sig == "arena":
-            self.files["map_raw"] = None
-            self.set_world(ArenaWorld())
-            return True, "Switched to the arena map to match the server."
+        if sig in ("none", "arena"):      # "arena" = servers from older versions that used the built-in map
+            return False, "This server has no map loaded that you can use."
         p = self.find_map_by_sig(sig)
         if p is None:
             return False, ("You don't have this server's map (custom_%s). Get the .fadmap from the host "
@@ -3157,10 +3202,7 @@ class Game:
                         while e.acc >= TICK:
                             e.acc -= TICK
                             e.px, e.py, e.pz = e.x, e.y, e.z
-                            g0 = self.walkable(e)
-                            v0 = math.hypot(e.vx, e.vy)
                             self.ptick(e, TICK, f, s, n, c, sn)
-                            self.js_tick(e, s, g0, v0, TICK)
                         crouch = bool(K.get(B["crouch"])) and e.sl <= 0
                         e.cr += ((1.0 if crouch else 0.0) - e.cr) * min(1.0, dt * 14)
                         e.slk += ((1.0 if e.sl > 0 else 0.0) - e.slk) * min(1.0, dt * (9 if e.sl > 0 else 6))
@@ -3266,11 +3308,8 @@ class Game:
             t["t"] -= dt
             if t["t"] <= 0:
                 self.tracers.remove(t)
-        for pp_ in self.xp_pops:
-            pp_["t"] -= dt
-        self.xp_pops = [pp_ for pp_ in self.xp_pops if pp_["t"] > 0]
-        self.rank_flash = max(0.0, self.rank_flash - dt)
         self.hm = max(0.0, self.hm - dt)
+        self.sc_update(dt)
         for c_ in self.chat:
             c_["t"] -= dt
         self.chat = [c_ for c_ in self.chat if c_["t"] > 0]

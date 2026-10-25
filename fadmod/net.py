@@ -375,7 +375,7 @@ class Net:
         self.t_bc = 0.0
         self.t_st = 0.0
         self.next_id = 1
-        self.map_sig = "arena"
+        self.map_sig = "none"
         self.pname = "Player"
         self.score_cb = lambda: [0, 0]
 

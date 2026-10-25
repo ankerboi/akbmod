@@ -1,7 +1,12 @@
 """Main menu, loadout, skins, settings UI."""
+import base64
+import hashlib
+import io
+import json
 import math
 import re
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +46,7 @@ class Menu:
         self.pfp_path = ""    # profile picture file
         self.pfp_tex = None
         self.pfp_status = ""
-        self.status = "Built-in arena loaded."
+        self.status = "No map loaded - pick one under Play > Create match > Load map."
         self.vm_prev = 0      # weapon shown in the viewmodel preview
         self.vm_dd = False    # preview dropdown open?
         self.cm_open = False      # Play tab: match settings panel shown?
@@ -62,6 +67,12 @@ class Menu:
         self.pv = {}              # cached preview model instances
         self.pv_bb = {}           # cached bounding boxes
         self.waiting = None
+        self.ms_open = False      # map selection window open?
+        self.ms_list = []         # entries: every .fadmap found
+        self.ms_sel = 0
+        self.ms_scroll = 0        # first visible row
+        self.ms_click = (None, 0.0)
+        self.ms_cache = {}        # path -> entry (name, signature, preview texture), re-read only when the file changes
         self.on_launch = on_launch
         self.pick_files = pick_files
         self.hot = []
@@ -121,6 +132,20 @@ class Menu:
         return True
 
     def key_down(self, event):
+        if self.ms_open:
+            if event.key == pygame.K_ESCAPE:
+                self.ms_open = False
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and 0 <= self.ms_sel < len(self.ms_list):
+                self.ms_load(self.ms_list[self.ms_sel])
+            elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN) and self.ms_list:
+                step = {pygame.K_LEFT: -1, pygame.K_RIGHT: 1, pygame.K_UP: -self.ms_cols, pygame.K_DOWN: self.ms_cols}[event.key]
+                self.ms_sel = max(0, min(len(self.ms_list) - 1, self.ms_sel + step))
+                row = self.ms_sel // self.ms_cols
+                if row < self.ms_scroll:
+                    self.ms_scroll = row
+                elif row >= self.ms_scroll + self.ms_rows_vis:
+                    self.ms_scroll = row - self.ms_rows_vis + 1
+            return True
         if self.waiting:
             if event.key == pygame.K_ESCAPE:
                 self.waiting = None
@@ -226,7 +251,7 @@ class Menu:
 
         qy = LHs - 100
         qh = shover(20, qy, 200, 38)
-        gfx.rect(20, qy, 200, 38, c255(42, 42, 42) if qh else c255(24, 24, 24))
+        gfx.rr(20, qy, 200, 38, c255(42, 42, 42) if qh else c255(24, 24, 24))
         gfx.text("Quit", 120, qy + 19 - 9, 13, (229, 57, 53), bold=True, anchor="c")
         self.hot.append((20 * m, qy * m, 200 * m, 38 * m, lambda: setattr(self, "quit_req", True), None))
         gl.glPopMatrix()
@@ -241,14 +266,14 @@ class Menu:
                 fill = c255(58, 58, 58) if hv else c255(42, 42, 42)
             else:
                 fill = c255(42, 42, 42) if hv else c255(24, 24, 24)
-            gfx.rect(x, y, w, h, fill)
+            gfx.rr(x, y, w, h, fill)
             col = (229, 57, 53) if label in ("Close server", "Leave server", "Cancel", "Remove", "Quit") else (255, 255, 255)
             gfx.text(label, x + w / 2, y + h / 2 - 9, 13, col, bold=True, anchor="c")
             self.hot.append((x, y, w, h, fn, None))
 
 
         def panel(x, y, w, h, title, sub=None):
-            gfx.rect(x, y, w, h, c255(17, 17, 17))
+            gfx.rr(x, y, w, h, c255(17, 17, 17))
             if title:
                 gfx.text(title, x + 20, y + 14, 14, (255, 255, 255), bold=True)
             if sub:
@@ -256,9 +281,9 @@ class Menu:
 
         def slider(x, y, w, val, lo, hi, setter):
             t = (val - lo) / (hi - lo)
-            gfx.rect(x, y + 8, w, 4, c255(42, 42, 42))
-            gfx.rect(x, y + 8, w * t, 4, c255(85, 85, 85))
-            gfx.rect(x + w * t - 6, y + 4, 12, 12, c255(230, 230, 230))
+            gfx.rr(x, y + 8, w, 4, c255(42, 42, 42))
+            gfx.rr(x, y + 8, w * t, 4, c255(66, 165, 245))
+            gfx.rr(x + w * t - 6, y + 4, 12, 12, c255(230, 230, 230))
 
             def drag(mxl):
                 tt = max(0.0, min(1.0, (mxl - x) / w))
@@ -380,11 +405,12 @@ class Menu:
                         gfx.text("SERVER NAME", cx + 20, 255, 11, (119, 119, 119), bold=True)
                         field(cx + 20, 272, 474, 34, "room", "Server name")
                     button(cx + 20, byy, 170, 38, "Start match >", do_create, True)
-                    button(cx + 202, byy, 100, 38, "Load map", lambda: self.pick("map"))
+                    button(cx + 202, byy, 100, 38, "Load map", self.ms_show)
                     button(cx + 314, byy, 100, 38, "Back", lambda: setattr(self, "cm_open", False))
+                    gfx.text("Map: " + str(getattr(g.world, "name", "No map"))[:24], cx + 430, byy + 12, 12, (154, 154, 154))
                     miss = self.missing()
                     if miss:
-                        gfx.text("Pick mods in Skins first: " + ", ".join(miss), cx + 430, byy + 12, 11, (255, 193, 7))
+                        gfx.text("Pick mods in Skins first: " + ", ".join(miss), cx + 430, byy + 12, 11, (66, 165, 245))
                     ly = LH
                 else:
                     ly = 128
@@ -447,7 +473,7 @@ class Menu:
                 shown.sort(key=keyf.get(self.sb_sort, keyf["n"]), reverse=self.sb_rev)
 
                 by, bh = ly, LH - 22 - ly
-                gfx.rect(cx, by, cw, bh, c255(17, 17, 17))
+                gfx.rr(cx, by, cw, bh, c255(17, 17, 17))
                 gfx.text("Server browser", cx + 20, by + 12, 14, (255, 255, 255), bold=True)
                 button(cx + 20, by + 36, 150, 28, "Create match",
                        lambda: setattr(self, "cm_open", not self.cm_open), True)
@@ -495,13 +521,13 @@ class Menu:
                         gfx.rect(cx, yy, 3, RH, c255(157, 211, 103))
                     else:
                         gfx.rect(cx, yy, cw, RH, c255(30, 30, 30) if hv else (c255(21, 21, 21) if i % 2 else c255(17, 17, 17)))
-                    dot = (229, 57, 53) if full else ((255, 193, 7) if other else (157, 211, 103))
+                    dot = (229, 57, 53) if full else ((66, 165, 245) if other else (157, 211, 103))
                     gfx.rect(cx + 14, yy + 9, 8, 8, (dot[0] / 255, dot[1] / 255, dot[2] / 255, 1.0))
                     gfx.text(r["n"][:26], cx + cols[0][2], yy + 6, 13, (255, 255, 255), bold=is_sel, mono=True)
                     gfx.text(r["h"][:14], cx + cols[1][2], yy + 7, 12, (170, 170, 170), mono=True)
                     mp = r["map"]
-                    gfx.text("arena" if mp == "arena" else "custom_" + mp[:5], cx + cols[2][2], yy + 7, 12,
-                             (255, 193, 7) if other else (200, 200, 200), mono=True)
+                    gfx.text("none" if mp in ("none", "arena") else "custom_" + mp[:5], cx + cols[2][2], yy + 7, 12,
+                             (66, 165, 245) if other else (200, 200, 200), mono=True)
                     gfx.text("%d/%d" % (r["p"], r["m"]), cx + cols[3][2], yy + 7, 12,
                              (229, 57, 53) if full else (200, 200, 200), mono=True)
                     gfx.text("LAN" if r.get("src") == "lan" else "Internet", cx + cols[4][2], yy + 7, 12, (140, 140, 140), mono=True)
@@ -519,7 +545,7 @@ class Menu:
 
                 # bottom bar: Refresh / Connect
                 fy = by + bh - 46
-                gfx.rect(cx, fy, cw, 46, c255(22, 22, 22))
+                gfx.rr(cx, fy, cw, 46, c255(22, 22, 22))
                 gfx.rect(cx, fy, cw, 1, c255(42, 42, 42))
 
                 def do_refresh():
@@ -545,10 +571,10 @@ class Menu:
                     gfx.text("Connect", cx + 199, fy + 16, 13, (80, 80, 80), bold=True, anchor="c")
                 gfx.text("%d server%s" % (len(shown), "" if len(shown) == 1 else "s"), cx + cw - 20, fy + 16, 12, (140, 140, 140), anchor="r")
                 if sel and sel["map"] != g.map_sig():
-                    have = sel["map"] == "arena" or g.find_map_by_sig(sel["map"]) is not None
+                    have = sel["map"] not in ("none", "arena") and g.find_map_by_sig(sel["map"]) is not None
                     gfx.text("Other map - you have it, it loads on join." if have else
                              "Other map - you don't have it.", cx + 284, fy + 16, 11,
-                             (157, 211, 103) if have else (255, 193, 7))
+                             (157, 211, 103) if have else (66, 165, 245))
 
             # --- open dropdown lists (on top of everything) ---
             for (ox_, oy_, ow_, opts_, setter_, cur_) in overlays:
@@ -563,15 +589,17 @@ class Menu:
             # --- status line (map loaded, join errors, connection progress) ---
             msg = net.status if net.mode else self.status
             bad = msg.startswith(("Denied", "Could", "Conn", "Lost", "The host", "Cannot", "Error"))
-            col = (255, 193, 7) if bad else (170, 170, 170)
+            col = (66, 165, 245) if bad else (170, 170, 170)
             if net.mode or bad:   # only show room status / errors, not the weapons-loaded text
                 lines = [msg[i:i + 56] for i in range(0, min(len(msg), 168), 56)]
                 tw = max(gfx.text_w(l, 12, False, True) for l in lines) + 32
                 th = 16 + 17 * len(lines)
                 tx, ty = LW - 40 - tw, LH - 20 - th
-                gfx.rect(tx, ty, tw, th, c255(41, 41, 41))          # toast: #292929
+                gfx.rr(tx, ty, tw, th, c255(41, 41, 41))          # toast: #292929
                 for i, l in enumerate(lines):
                     gfx.text(l, tx + 16, ty + 9 + i * 17, 12, col if bad else (255, 255, 255), mono=True)
+            if self.ms_open:
+                self.draw_map_select(LW, LH, hover, button)
         elif self.page == "profile":
             gfx.text("YOUR IDENTITY", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Profile.", cx, 48, 34, (255, 255, 255), bold=True)
@@ -605,7 +633,7 @@ class Menu:
             if self.pfp_path:
                 gfx.text("File: " + Path(self.pfp_path).name[:40], cx + 210, 316, 12, (170, 170, 170))
             if self.pfp_status:
-                gfx.text(self.pfp_status[:80], cx + 210, 336, 12, (255, 193, 7))
+                gfx.text(self.pfp_status[:80], cx + 210, 336, 12, (66, 165, 245))
         elif self.page == "loadout":
             # Class screen: grid of weapon cards with live 3D model previews (same renderer as the Skins tab)
             gfx.text("CLASS", cx, 32, 11, (119, 119, 119), bold=True)
@@ -626,7 +654,7 @@ class Menu:
             # equipped summary strip
             gfx.text("EQUIPPED", cx, 134, 11, (119, 119, 119), bold=True)
             gfx.rect(cx, 154, cw, 44, c255(17, 17, 17))
-            gfx.rect(cx, 154, 4, 44, c255(157, 211, 103))
+            gfx.rect(cx, 154, 4, 44, c255(66, 165, 245))
             gfx.text(str(cur.n), cx + 20, 162, 20, (255, 255, 255), bold=True)
             gfx.text(str(cur.cls or "Weapon"), cx + 20 + gfx.text_w(str(cur.n), 20, True) + 12, 168, 12, (130, 130, 130))
             gfx.text("+ " + str(wl[kn].n) + "  (key 2)", cx + cw - 16, 168, 12, (154, 154, 154), anchor="r")
@@ -654,7 +682,7 @@ class Menu:
                 on = (i == g.primary) and not is_melee
                 hv = hover(x, y, cwd, chd) and not is_melee
                 gfx.box(x, y, cwd, chd, c255(26, 26, 26) if (on or hv) else c255(17, 17, 17),
-                        c255(157, 211, 103) if on else (c255(120, 120, 120) if hv else c255(42, 42, 42)))
+                        c255(66, 165, 245) if on else (c255(120, 120, 120) if hv else c255(42, 42, 42)))
                 inst = self.pv_weapon(w._m) if w._m else None
                 self.draw_card_preview(W, H, x + 2, y + 2, cwd - 4, pvh, "weapon", inst)
                 if inst is None:
@@ -664,8 +692,8 @@ class Menu:
                 gfx.text(str(w.n), x + 12, ty, 17, (255, 255, 255) if (on or is_melee) else (210, 210, 210), bold=True)
                 gfx.text(str(w.cls or ("Melee" if is_melee else "Weapon")), x + 12, ty + 24, 11, (130, 130, 130))
                 if on:
-                    gfx.rect(x + cwd - 84, ty + 2, 72, 18, c255(157, 211, 103, .18))
-                    gfx.text("EQUIPPED", x + cwd - 48, ty + 5, 10, (157, 211, 103), bold=True, anchor="c")
+                    gfx.rr(x + cwd - 84, ty + 2, 72, 18, c255(66, 165, 245, .18))
+                    gfx.text("EQUIPPED", x + cwd - 48, ty + 5, 10, (66, 165, 245), bold=True, anchor="c")
                 elif is_melee:
                     gfx.text("ALWAYS", x + cwd - 12, ty + 5, 10, (130, 130, 130), bold=True, anchor="r")
                 if is_melee:
@@ -676,9 +704,9 @@ class Menu:
                         bx = x + 12 + (k % 2) * (bw_ + 12)
                         by = ty + 48 + (k // 2) * 28
                         gfx.text(lab.upper(), bx, by, 9, (110, 110, 110), bold=True)
-                        gfx.rect(bx, by + 14, bw_, 5, c255(42, 42, 42))
-                        gfx.rect(bx, by + 14, bw_ * max(.03, min(1.0, v)), 5,
-                                 c255(157, 211, 103) if on else c255(200, 200, 200))
+                        gfx.rr(bx, by + 14, bw_, 5, c255(42, 42, 42))
+                        gfx.rr(bx, by + 14, bw_ * max(.03, min(1.0, v)), 5,
+                                 c255(66, 165, 245) if on else c255(200, 200, 200))
                     self.hot.append((x, y, cwd, chd, lambda i=i: g.set_primary(i), None))
         elif self.page == "skins":
             gfx.text("YOUR KIT", cx, 32, 11, (119, 119, 119), bold=True)
@@ -735,7 +763,7 @@ class Menu:
                     if on_:
                         gfx.box(bx_, 166, 150, 30, team_tint(TEAM_CT if ct_ else TEAM_T), None)
                     else:
-                        gfx.rect(bx_, 166, 150, 30, c255(42, 42, 42) if hover(bx_, 166, 150, 30) else c255(24, 24, 24))
+                        gfx.rr(bx_, 166, 150, 30, c255(42, 42, 42) if hover(bx_, 166, 150, 30) else c255(24, 24, 24))
                     # logo only, centred in the button (name is just a fallback when no logo file exists)
                     if not draw_team_logo(bx_ + (150 - 26) / 2, 168, 26, 0 if ct_ else 1):
                         gfx.text(TEAM_NAMES[0 if ct_ else 1], bx_ + 75, 166 + 30 / 2 - 9, 13,
@@ -774,7 +802,7 @@ class Menu:
                     kind = "player"
                 hv = hover(x, y, cw2, ch2)
                 gfx.box(x, y, cw2, ch2, c255(17, 17, 17) if not hv else c255(24, 24, 24),
-                        c255(255, 193, 7) if here else (c255(120, 120, 120) if hv else c255(42, 42, 42)))
+                        c255(66, 165, 245) if here else (c255(120, 120, 120) if hv else c255(42, 42, 42)))
                 self.draw_card_preview(W, H, x + 2, y + 2, cw2 - 4, 116, kind, inst)
                 gfx.rect(x + 2, y + 118, cw2 - 4, 1, c255(42, 42, 42))
                 if ar and name == "":
@@ -788,7 +816,7 @@ class Menu:
                     tags = [(f"{i + 1}  {w.n}"[:12], (1, 1, 1, .14), (230, 230, 230))
                             for i, w in enumerate(ws) if w._m == name]
                 elif ar:
-                    tags = [("EQUIPPED", (1, 1, 1, .14), (255, 193, 7))] if here else []
+                    tags = [("EQUIPPED", (1, 1, 1, .14), (66, 165, 245))] if here else []
                 else:
                     tags = [(TEAM_NAMES[0 if tk == "CT" else 1], team_tint(TEAM_CT) if tk == "CT" else team_tint(TEAM_T),
                              TEAM_CT if tk == "CT" else TEAM_T)
@@ -798,12 +826,12 @@ class Menu:
                     tm_ = TEAM_NAMES.index(txt) if (not wp and not ar and txt in TEAM_NAMES) else None
                     if tm_ is not None and team_logo(tm_):
                         # team tag = logo only
-                        gfx.rect(bx, y + 144, 30, 18, bg)
+                        gfx.rr(bx, y + 144, 30, 18, bg)
                         draw_team_logo(bx + 7, y + 145, 16, tm_)
                         bx += 30 + 6
                         continue
                     tw2 = gfx.text_w(txt, 10, True) + 14
-                    gfx.rect(bx, y + 144, tw2, 18, bg)
+                    gfx.rr(bx, y + 144, tw2, 18, bg)
                     gfx.text(txt, bx + tw2 / 2, y + 147, 10, fg, bold=True, anchor="c")
                     bx += tw2 + 6
                 if not tags:
@@ -823,10 +851,10 @@ class Menu:
             gfx.text(f"{int(g.audio.volume * 100)}%", cx + cw - 20, 14 + 204, 13, (255, 255, 255), bold=True, anchor="r")
             slider(cx + 20, 204 + 40, cw - 40, g.audio.volume, 0, 1, lambda v: setattr(g.audio, "volume", v))
 
-            panel(cx, 282, cw, 312, "Key bindings")
+            panel(cx, 282, cw, 356, "Key bindings")
             gfx.text("Two keys per action (left = main, right = second). The same key can be used for several actions. Backspace clears the second.", cx + cw - 20, 284 + 14, 11, (119, 119, 119), anchor="r")
             for i, (aid, label) in enumerate(BIND_META):
-                col, row = divmod(i, 7)
+                col, row = divmod(i, 8)
                 rx = cx + 20 + col * 330
                 ry = 282 + 44 + row * 38
                 gfx.box(rx, ry, 320, 32, c255(17, 17, 17), c255(24, 24, 24))
@@ -843,8 +871,8 @@ class Menu:
                     txt = "Press..." if waiting else (key_label(val).replace("Mouse ", "M").replace(" / Back", "").replace(" / Forward", "") if val else "-")
                     gfx.text(txt, bx + bw / 2, ry + 9, 11, (255, 255, 255) if val or waiting else (110, 110, 110), anchor="c")
                     self.hot.append((bx, ry + 3, bw, 26, lambda a=sid: setattr(self, "waiting", a), None))
-            button(cx + 350, 282 + 44 + 6 * 38, 150, 32, "Reset defaults", self.reset_keys)
-            button(cx + 512, 282 + 44 + 6 * 38, 150, 32, "Back to play", lambda: self.set_page("play"), True)
+            _nb = len(BIND_META)
+            button(cx + 20 + (_nb // 8) * 330, 282 + 44 + (_nb % 8) * 38 + 2, 150, 32, "Reset defaults", self.reset_keys)
         elif self.page == "settings" and self.set_sub == "viewmodel":
             gfx.text("WEAPON POSITION", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Viewmodel.", cx, 48, 34, (255, 255, 255), bold=True)
@@ -951,17 +979,19 @@ class Menu:
             gfx.text(f"{int(round(g.fov_cfg))}", cx + cw - 20, 14 + 292, 13, (255, 255, 255), bold=True, anchor="r")
             slider(cx + 20, 292 + 62, cw - 190, g.fov_cfg, 50, 110, lambda v: setattr(g, "fov_cfg", float(round(v))))
             button(cx + cw - 150, 292 + 54, 130, 30, "Reset to 75", lambda: setattr(g, "fov_cfg", 75.0))
-            panel(cx, 400, cw, 100, "Fullscreen", "Fills the whole screen. You can also press F11 any time.")
+            panel(cx, 400, cw, 100, "Fullscreen / FPS cap", "Fullscreen: press F11 any time. FPS cap: limits how fast the game runs.")
             button(cx + 20, 400 + 54, 200, 36, "Fullscreen: ON" if g.fullscreen else "Fullscreen: OFF",
                    lambda: (set_fullscreen(g, not g.fullscreen), save_settings(g, self)), bool(g.fullscreen))
-            panel(cx, 508, cw, 100, "FPS counter / Speed meter / Jump stats",
-                  "FPS: top-left. Speed: bottom center. Jump stats: distance, speed and strafes in chat.")
+            _fc = float(g.fps_cap)
+            gfx.text("FPS cap: Unlimited" if _fc >= 300 else f"FPS cap: {int(_fc)}", cx + cw - 20, 400 + 14, 13, (255, 255, 255), bold=True, anchor="r")
+            slider(cx + 250, 400 + 62, cw - 290, _fc, 30, 300,
+                   lambda v: setattr(g, "fps_cap", float(max(30, min(300, round(v / 10) * 10)))))
+            panel(cx, 508, cw, 100, "FPS counter / Score",
+                  "FPS: top-left. Score: points, combo timer, trick label and speed box (turns the whole score system off).")
             button(cx + 20, 508 + 54, 200, 36, "FPS counter: ON" if g.show_fps else "FPS counter: OFF",
                    lambda: (setattr(g, "show_fps", not g.show_fps), save_settings(g, self)), bool(g.show_fps))
-            button(cx + 240, 508 + 54, 200, 36, "Speed meter: ON" if g.show_speed else "Speed meter: OFF",
-                   lambda: (setattr(g, "show_speed", not g.show_speed), save_settings(g, self)), bool(g.show_speed))
-            button(cx + 460, 508 + 54, 200, 36, "Jump stats: ON" if g.show_jstats else "Jump stats: OFF",
-                   lambda: (setattr(g, "show_jstats", not g.show_jstats), save_settings(g, self)), bool(g.show_jstats))
+            button(cx + 240, 508 + 54, 200, 36, "Score: ON" if g.show_score else "Score: OFF",
+                   lambda: (setattr(g, "show_score", not g.show_score), save_settings(g, self)), bool(g.show_score))
         gl.glPopMatrix()
 
     def missing(self):
@@ -969,6 +999,9 @@ class Menu:
         return []
 
     def check_ready(self):
+        if not self.g.files.get("map_raw"):
+            self.status = "Load a map first: Create match > Load map (or drop a .fadmap on the window)."
+            return False
         return True
 
     def set_pfp(self, path):
@@ -1030,6 +1063,7 @@ class Menu:
         if p == "online":           # the old Online tab lives inside Play now
             p = "play"
         self.page = p
+        self.ms_open = False
         self.vm_dd = False
         self.dd = None
         self.waiting = None
@@ -1041,6 +1075,10 @@ class Menu:
         self.lo_page = 0
 
     def wheel(self, dy):
+        if self.ms_open:
+            if dy:
+                self.ms_scroll = max(0, self.ms_scroll + (-1 if dy > 0 else 1))
+            return
         if self.page == "play" and dy:
             self.sb_scroll = max(0, self.sb_scroll + (-1 if dy > 0 else 1))
         if self.page == "skins" and dy:
@@ -1295,6 +1333,179 @@ class Menu:
             gl.glPopMatrix()
             gl.glMatrixMode(gl.GL_MODELVIEW)
             self._end_3d_preview(W, H)
+
+    # ==========================================================================
+    # map selection: pictures of every map (Play > Create match > Load map)
+    # ==========================================================================
+    ms_cols = 3
+    ms_rows_vis = 2
+
+    def _ms_tex(self, d):
+        """Preview dict from a .fadmap ({"png": base64} or {"raw", "w", "h"}) -> (GL texture, w, h)."""
+        if "png" in d:
+            surf = pygame.image.load(io.BytesIO(base64.b64decode(d["png"])), "x.png").convert_alpha()
+        else:
+            w, h = int(d["w"]), int(d["h"])
+            raw = zlib.decompress(base64.b64decode(d["raw"]))
+            surf = pygame.image.frombuffer(raw, (w, h), "RGBA").convert_alpha()
+        w, h = surf.get_size()
+        arr = np.frombuffer(pygame.image.tostring(surf, "RGBA", False), np.uint8).reshape(h, w, 4)
+        tid = make_texture(arr, w, h, mip=False)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+        return tid, w, h
+
+    def ms_entry(self, p):
+        """Name + preview of a .fadmap, read without decoding the whole file. Cached until the file changes."""
+        p = Path(p)
+        st = p.stat()
+        key = str(p)
+        c = self.ms_cache.get(key)
+        if c and c["mt"] == st.st_mtime and c["sz"] == st.st_size:
+            return c
+        raw = p.read_bytes()
+        e = {"path": p, "mt": st.st_mtime, "sz": st.st_size, "name": p.stem,
+             "sig": hashlib.sha1(raw).hexdigest()[:10], "tex": None}
+        dec = json.JSONDecoder()
+        try:
+            i = raw.find(b'"name":')
+            if 0 <= i < 4096:
+                nm, _ = dec.raw_decode(raw[i + 7:i + 7 + 300].decode("utf-8", "ignore").lstrip())
+                if isinstance(nm, str) and nm.strip():
+                    e["name"] = nm.strip()
+        except Exception:
+            pass
+        try:
+            i = raw.find(b'"preview":')
+            if 0 <= i < 4096:                       # the map builder writes it right after the name
+                d, _ = dec.raw_decode(raw[i + 10:i + 10 + 4000000].decode("ascii", "ignore").lstrip())
+                e["tex"] = self._ms_tex(d)[0]
+        except Exception:
+            e["tex"] = None
+        if c and c.get("tex"):
+            try:
+                gl.glDeleteTextures([c["tex"]])
+            except Exception:
+                pass
+        self.ms_cache[key] = e
+        return e
+
+    def ms_scan(self):
+        out, seen = [], set()
+        for d in self.g._map_dirs():
+            try:
+                files = sorted(d.rglob("*.fadmap"))
+            except Exception:
+                continue
+            for p in files:
+                try:
+                    e = self.ms_entry(p)
+                except Exception:
+                    continue
+                if e["sig"] in seen:                 # the same map in two folders: show it once
+                    continue
+                seen.add(e["sig"])
+                out.append(e)
+        out.sort(key=lambda e: e["name"].lower())
+        self.ms_list = out
+        cur = self.g.map_sig()
+        self.ms_sel = next((i for i, e in enumerate(self.ms_list) if e["sig"] == cur), 0)
+        self.ms_scroll = 0
+
+    def ms_show(self):
+        self.ms_scan()
+        self.ms_open = True
+        self.ms_click = (None, 0.0)
+
+    def ms_pick(self, i):
+        now = time.time()
+        last_i, t0 = self.ms_click
+        self.ms_sel = i
+        if last_i == i and now - t0 < 0.45:          # double click = load
+            self.ms_load(self.ms_list[i])
+            return
+        self.ms_click = (i, now)
+
+    def ms_load(self, e):
+        g = self.g
+        self.status = g.load_map(e["path"])
+        self.ms_open = False
+
+    def ms_browse(self):
+        before = self.g.map_sig()
+        self.pick("map")
+        if self.g.map_sig() != before:
+            self.ms_open = False
+        else:
+            self.ms_scan()
+
+    def draw_map_select(self, LW, LH, hover, button):
+        gfx = self.gfx
+        gfx.rect(0, 0, LW, LH, (0, 0, 0, 0.8))
+        self.hot.append((0, 0, LW, LH, lambda: None, None))          # blocks clicks on the page below
+        pw, ph = min(LW - 80, 1000), LH - 100
+        px, py = (LW - pw) / 2, 50
+        gfx.rr(px, py, pw, ph, c255(17, 17, 17), 8)
+        gfx.text("SELECT MAP", px + 24, py + 20, 11, (119, 119, 119), bold=True)
+        gfx.text("Click a map, then press Load map (or double-click it).", px + 24, py + 38, 13, (154, 154, 154))
+        CW, CH, GAP = 260, 146, 18                                     # card picture is 16:9
+        card_h = CH + 50
+        gx0, gy0 = px + 24, py + 76
+        cols = max(1, int((pw - 48 + GAP) // (CW + GAP)))
+        rows_vis = max(1, int((ph - 76 - 76 + GAP) // (card_h + GAP)))
+        self.ms_cols, self.ms_rows_vis = cols, rows_vis
+        n = len(self.ms_list)
+        rows = (n + cols - 1) // cols
+        self.ms_scroll = max(0, min(self.ms_scroll, max(0, rows - rows_vis)))
+        cur = self.g.map_sig()
+        for r in range(rows_vis):
+            for c in range(cols):
+                i = (self.ms_scroll + r) * cols + c
+                if i >= n:
+                    break
+                e = self.ms_list[i]
+                x, y = gx0 + c * (CW + GAP), gy0 + r * (card_h + GAP)
+                sel, hv = i == self.ms_sel, hover(x, y, CW, card_h)
+                gfx.rr(x - 3, y - 3, CW + 6, card_h + 6,
+                       c255(157, 211, 103) if sel else (c255(80, 80, 80) if hv else c255(36, 36, 36)), 8)
+                gfx.rr(x, y, CW, card_h, c255(24, 24, 24), 6)
+                if e.get("tex"):
+                    gl.glEnable(gl.GL_TEXTURE_2D)
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, e["tex"])
+                    gl.glColor4f(1, 1, 1, 1)
+                    gl.glBegin(gl.GL_QUADS)
+                    gl.glTexCoord2f(0, 0); gl.glVertex2f(x, y)
+                    gl.glTexCoord2f(1, 0); gl.glVertex2f(x + CW, y)
+                    gl.glTexCoord2f(1, 1); gl.glVertex2f(x + CW, y + CH)
+                    gl.glTexCoord2f(0, 1); gl.glVertex2f(x, y + CH)
+                    gl.glEnd()
+                    gl.glDisable(gl.GL_TEXTURE_2D)
+                else:
+                    gfx.rect(x, y, CW, CH, c255(14, 14, 14))
+                    gfx.text("NO PREVIEW", x + CW / 2, y + CH / 2 - 9, 14,
+                             (90, 90, 90), bold=True, anchor="c")
+                nm = e["name"]
+                if gfx.text_w(nm, 14, True) > CW - 20:
+                    while len(nm) > 1 and gfx.text_w(nm + "...", 14, True) > CW - 20:
+                        nm = nm[:-1]
+                    nm = nm.rstrip() + "..."
+                gfx.text(nm, x + 10, y + CH + 10, 14, (255, 255, 255), bold=True)
+                here = e["sig"] == cur
+                sub = "Loaded now" if here else "%.1f MB" % (e["sz"] / 1048576.0)
+                gfx.text(sub, x + 10, y + CH + 30, 11, (157, 211, 103) if here else (130, 130, 130))
+                self.hot.append((x, y, CW, card_h, lambda i=i: self.ms_pick(i), None))
+        if rows > rows_vis:
+            gfx.text("Row %d-%d of %d  (mouse wheel / arrow keys)" % (self.ms_scroll + 1, min(rows, self.ms_scroll + rows_vis), rows),
+                     px + pw - 24, py + 20, 11, (130, 130, 130), anchor="r")
+        by = py + ph - 56
+        ok_e = self.ms_list[self.ms_sel] if 0 <= self.ms_sel < n else None
+        button(px + 24, by, 150, 38, "Load map", (lambda: self.ms_load(ok_e)) if ok_e else (lambda: None), True)
+        button(px + 186, by, 150, 38, "Browse file...", self.ms_browse)
+        button(px + pw - 24 - 110, by, 110, 38, "Close", lambda: setattr(self, "ms_open", False))
+        if n == 0:
+            gfx.text("No maps yet. Browse file... (or drop a .fadmap on the window) adds a map here.",
+                     px + 24, by - 24, 12, (130, 130, 130))
 
     def pick(self, mode):
         paths = self.pick_files(mode)

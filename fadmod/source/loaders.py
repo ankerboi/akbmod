@@ -478,7 +478,7 @@ class SrcData:
 
 # viewmodel (weapon + arms) is re-skinned on the CPU at most this many times per second; lower = more fps while
 # walking / animating, higher = smoother weapon motion
-VM_SKIN_HZ = 100.0
+VM_SKIN_HZ = 75.0   # weapon + arms animation update rate (fixed)
 
 
 class _MergedPart:
@@ -786,7 +786,7 @@ class SrcInst:
         if key == self.last and not force:
             return
         now = time.perf_counter()
-        if (not force and self.last is not None and self.last[0] == si and self.bt <= 0
+        if (not force and VM_SKIN_HZ > 0 and self.last is not None and self.last[0] == si
                 and (now - getattr(self, "_pose_t", 0.0)) < (1.0 / VM_SKIN_HZ)):
             return  # keep previous mesh; self.last stays so a newer frame retries next tick
         self.last = key
@@ -2002,6 +2002,10 @@ def src_players(arch):
             gpm = set()
     for nm in arch.files:
         if not (is_src_player(nm) or nm.replace("\\", "/").lower() in gpm):
+            continue
+        # Arms / hands / gloves are never player models, even when the addon registers them with
+        # player_manager.AddValidModel (c_hands style addons do that): keep them out of the player list.
+        if _is_arms_mdl(nm):
             continue
         # Skip truncated VPK entries
         if hasattr(arch, "complete") and not arch.complete(nm):

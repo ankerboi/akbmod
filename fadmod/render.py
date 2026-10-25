@@ -90,6 +90,69 @@ def draw_held_weapon(w, grip):
     gl.glPopMatrix()
 
 
+_TP_DIST = 105.0       # how far behind the head the third-person camera sits
+_TP_MARGIN = 7.0       # gap kept to walls
+_TP_RETURN = 5.0       # how fast the camera swings back out after a wall let go of it (1 / s)
+_TP_HEIGHT = 14.0      # camera sits a little above the eye line
+
+
+def _tp_free(world, x, y, z, rx, ry):
+    """True when a small camera body around (x, y, z) is not inside a wall (centre + both shoulders)."""
+    return not (world.solid(x, y, z) or world.solid(x + rx, y + ry, z) or world.solid(x - rx, y - ry, z))
+
+
+def _third_person_cam(game, ex, ey, ez, fx, fy, fz):
+    """Smooth, wall-safe third-person camera. Returns (x, y, z, draw_own_body).
+
+    - height follows a low-passed eye height, so crouching / slides / landings glide instead of snapping
+    - the distance is swept against the map with a small body (not a single ray), so corners do not clip
+    - it jumps in at once when a wall comes close (never looks through geometry) and eases back out slowly
+    """
+    now = time.perf_counter()
+    st = getattr(game, "_tpc", None)
+    if st is None:
+        st = game._tpc = {"t": now, "ez": ez, "back": _TP_DIST}
+    dt = max(0.001, min(0.1, now - st["t"]))
+    st["t"] = now
+    if abs(ez - st["ez"]) > 80:                       # respawn / teleport: do not glide across the map
+        st["ez"], st["back"] = ez, 0.0
+    st["ez"] += (ez - st["ez"]) * (1.0 - math.exp(-dt * 16.0))
+    ez = st["ez"] + _TP_HEIGHT * 0.5
+
+    # sideways direction of the view, for the shoulder probes
+    hl = math.hypot(fx, fy) or 1.0
+    rx, ry = -fy / hl * 5.0, fx / hl * 5.0
+    w = game.world
+    # how far back is free: coarse steps, then refine inside the last step
+    free, step = 0.0, 8.0
+    d, hit = step, False
+    while d <= _TP_DIST + step:
+        dd = min(d, _TP_DIST)
+        if not _tp_free(w, ex - fx * dd, ey - fy * dd, ez - fz * dd + _TP_HEIGHT * (dd / _TP_DIST), rx, ry):
+            hit = True
+            break
+        free = dd
+        if dd >= _TP_DIST:
+            break
+        d += step
+    if hit:                                           # wall somewhere in (free, d]: refine in small steps
+        fine = free + 2.0
+        while fine < d:
+            if not _tp_free(w, ex - fx * fine, ey - fy * fine, ez - fz * fine + _TP_HEIGHT * (fine / _TP_DIST), rx, ry):
+                break
+            free = fine
+            fine += 2.0
+    target = max(0.0, free - _TP_MARGIN) if hit else _TP_DIST
+    back = st["back"]
+    if target < back:
+        back = target                                 # wall: be in front of it immediately
+    else:
+        back += (target - back) * (1.0 - math.exp(-dt * _TP_RETURN))   # free again: glide out
+    st["back"] = back
+    lift = _TP_HEIGHT * (back / _TP_DIST)
+    return ex - fx * back, ey - fy * back, ez - fz * back + lift, back > 22.0
+
+
 def render_scene(game, W, H):
     P = game.P
     gl.glViewport(0, 0, W, H)
@@ -109,20 +172,26 @@ def render_scene(game, W, H):
     ey = P.py + (P.y - P.py) * al
     ez = P.pz + (P.z - P.pz) * al + 17 + P.so
     ppx, ppy, ppz = ex, ey, P.pz + (P.z - P.pz) * al      # where your own body is drawn (third person)
-    vp = max(-1.5, min(1.5, P.pitch + P.pun_p))   # view = aim + recoil punch
-    vy = P.yaw + P.pun_y
-    _sk = game.shake * SHAKE
-    if _sk > 0.002:
-        _a = _sk * _sk * 0.03 + _sk * 0.004              # radians of jitter
-        vp = max(-1.5, min(1.5, vp + random.uniform(-_a, _a)))
-        vy += random.uniform(-_a, _a)
-        gl.glRotatef(random.uniform(-1, 1) * _sk * 0.9, 0, 0, 1)   # tiny roll
+    tp = bool(game.thirdperson) and not (P.zoom and P.w == 0)       # scoped AWP always stays first person
+    if tp:
+        # third person: plain aim direction - no recoil punch, screen shake or slide roll, so the camera stays calm
+        vp = max(-1.5, min(1.5, P.pitch))
+        vy = P.yaw
+    else:
+        vp = max(-1.5, min(1.5, P.pitch + P.pun_p))   # view = aim + recoil punch
+        vy = P.yaw + P.pun_y
+        _sk = game.shake * SHAKE
+        if _sk > 0.002:
+            _a = _sk * _sk * 0.03 + _sk * 0.004              # radians of jitter
+            vp = max(-1.5, min(1.5, vp + random.uniform(-_a, _a)))
+            vy += random.uniform(-_a, _a)
+            gl.glRotatef(random.uniform(-1, 1) * _sk * 0.9, 0, 0, 1)   # tiny roll
     cp = math.cos(vp)
     fx, fy, fz = cp * math.cos(vy), cp * math.sin(vy), math.sin(vp)
-    if P.slk > 0.001:
+    if P.slk > 0.001 and not tp:
         lat = P.sdx * math.sin(P.yaw) - P.sdy * math.cos(P.yaw)   # sideways part of the slide
         gl.glRotatef(P.slk * (1.2 + 2.5 * lat), 0, 0, 1)           # slight lean into the slide
-    tp = bool(game.thirdperson) and not (P.zoom and P.w == 0)       # scoped AWP always stays first person
+    own_body = True
     if tp:
         if getattr(P, "_pm_team", None) != P.team:
             P._pm_team = P.team
@@ -130,14 +199,9 @@ def render_scene(game, W, H):
         if P.pm is None and not getattr(P, "_pm_tried", False):
             P._pm_tried = True
             game.build_entity_model(P, True)
-        # pull the camera back along the view direction, stopping short of walls
-        back = 0.0
-        for dd in range(6, 121, 6):
-            if game.world.solid(ex - fx * dd, ey - fy * dd, ez - fz * dd + 6):
-                break
-            back = float(dd)
-        back = max(0.0, back - 8.0)
-        ex, ey, ez = ex - fx * back, ey - fy * back, ez - fz * back + 6.0 * (back / 120.0)
+        ex, ey, ez, own_body = _third_person_cam(game, ex, ey, ez, fx, fy, fz)
+    else:
+        game._tpc = None            # next time third person is switched on the camera starts in place (no swoop)
     glu.gluLookAt(ex, ey, ez, ex + fx, ey + fy, ez + fz, 0, 0, 1)
 
     game.world.draw_sky(ex, ey, ez)
@@ -145,7 +209,7 @@ def render_scene(game, W, H):
     game.world.draw()
 
     for e in game.ents:
-        if e.isP and not tp:
+        if e.isP and (not tp or not own_body):
             continue
         if not e.alive and not (e.pm and e.anim.get("ds", -1) >= 0):
             continue  # no death sequence to show: the body just vanishes
@@ -334,20 +398,6 @@ def spray_pattern(n):
     return up, -right   # yaw grows to the left in this game
 
 
-XP_KILL, XP_KNIFE = 100, 150
-XP_YELLOW = (255, 214, 0)
-
-
-def xp_info(xp):
-    """(rank, xp into this rank, xp needed for the next rank). Rank 1 needs 600 XP, each next one 100 more."""
-    lvl, need = 1, 600
-    while xp >= need:
-        xp -= need
-        lvl += 1
-        need += 100
-    return lvl, xp, need
-
-
 HM_TIME = 0.28   # how long the hit marker shows (seconds)
 
 
@@ -389,6 +439,35 @@ def draw_crosshair(gfx, cx, cy, xh):
         gfx.rect(x, y, w, hh, col)
 
 
+def draw_smove_hud(game, gfx, W, H, P):
+    """sMove HUD: combo timer + held points under the crosshair, trick label, kill notice, velocity."""
+    if not game.show_score:
+        return
+    cy = (0, 255, 255)
+    white = (255, 255, 255)
+    fs_score, fs_small, fs_trick, fs_timer, fs_held = W * 0.05, W * 0.015, W * 0.012, W * 0.012, W * 0.01
+    if not P.alive or game.over:
+        return
+    # combo timer (green -> yellow -> orange -> red)
+    t = game.sc_timer
+    if t > 0:
+        tc = (0, 255, 0) if t >= 2 else (255, 255, 0) if t >= 1.5 else (255, 153, 0) if t >= 1 else (255, 0, 0)
+        gfx.stext(game.sc_fmt(round(t, 2)), W * 0.5, H * 0.47, fs_timer, tc, anchor="c", outline=True)
+    killing = game.sc_kill_t > 0
+    if game.sc_held > 0 and not killing:
+        gfx.stext("+%d" % game.sc_held, W * 0.5, H * 0.51, fs_held, white, anchor="c", outline=True)
+        if game.sc_trick:
+            gfx.wordbox(W * 0.5, H * 0.825, game.sc_trick, fs_trick, (0, 0, 0, 200 / 255),
+                        cy if game.sc_flash_ind > 0 else white, shadow=True)
+    if killing:
+        gfx.stext("+%d | Killed %s" % (game.sc_kill_pts, game.sc_kill_name), W * 0.5, H / 1.95, fs_timer, white,
+                  anchor="c", outline=True)
+    # velocity: horizontal speed and (speed at the last chained bhop)
+    if True:
+        gfx.wordbox(W * 0.5, H * 0.88, "%d (%d)" % (int(math.hypot(P.vx, P.vy)), game.sc_jvel), fs_small,
+                    (0, 0, 0, 200 / 255), cy if game.sc_flash_ind > 0 else white, shadow=True)
+
+
 def draw_scoreboard(game, gfx, W, H):
     """Hold Tab: big team logos + names on each side, the score in the middle, player tables under them."""
     colw = min(470, (W - 120) / 2)
@@ -400,7 +479,7 @@ def draw_scoreboard(game, gfx, W, H):
     total_h = head_h + th_h + rows * rh + 24
     x0 = W / 2 - total_w / 2
     top = max(20, H / 2 - total_h / 2)
-    gfx.rect(x0 - 16, top - 12, total_w + 32, total_h + 24, (14 / 255, 14 / 255, 14 / 255, .93))
+    gfx.rr(x0 - 16, top - 12, total_w + 32, total_h + 24, (14 / 255, 14 / 255, 14 / 255, .93))
     LOGO = 84
     sc = game.score
     accent = ((210, 210, 210), (210, 210, 210))
@@ -427,7 +506,6 @@ def draw_scoreboard(game, gfx, W, H):
         y = top + head_h + 4
         gfx.rect(x, y, colw, th_h, (30 / 255, 30 / 255, 30 / 255, 1))
         gfx.text("PLAYER", x + 12, y + 6, 11, (154, 154, 154), bold=True)
-        gfx.text("RANK", x + colw - 130, y + 6, 11, (154, 154, 154), bold=True, anchor="r")
         gfx.text("KILLS", x + colw - 70, y + 6, 11, (154, 154, 154), bold=True, anchor="r")
         gfx.text("DEATHS", x + colw - 10, y + 6, 11, (154, 154, 154), bold=True, anchor="r")
         y += th_h
@@ -440,7 +518,7 @@ def draw_scoreboard(game, gfx, W, H):
             else:
                 v = 24 if i % 2 else 19
                 gfx.rect(x, y, colw, rh, (v / 255, v / 255, v / 255, 1))
-            c = (255, 193, 7) if e.isP else ((255, 255, 255) if e.alive else (130, 130, 130))
+            c = (255, 255, 255) if e.alive else (130, 130, 130)      # your own row is marked by the green side bar
             nx = x + 12
             _m = getattr(game, "menu", None)
             if e.isP and _m is not None and getattr(_m, "pfp_tex", None):
@@ -456,8 +534,6 @@ def draw_scoreboard(game, gfx, W, H):
                 gl.glEnd()
                 nx = x + 40
             gfx.text(e.name or "UNKNOWN", nx, y + 6, 14, c, bold=bool(e.isP), mono=True)
-            if e.isP:
-                gfx.text(str(xp_info(game.xp)[0]), x + colw - 130, y + 6, 14, (255, 214, 0), bold=True, anchor="r", mono=True)
             gfx.text(str(e.kills), x + colw - 70, y + 6, 14, c, anchor="r", mono=True)
             gfx.text(str(e.deaths), x + colw - 10, y + 6, 14, c, anchor="r", mono=True)
             y += rh
@@ -492,19 +568,6 @@ def render_hud(game, gfx, W, H, menu_visible):
         draw_crosshair(gfx, W / 2, H / 2, game.xh)
     if P.alive and game.hm > 0:
         draw_hitmarker(W / 2, H / 2, game.hm, game.hm_kill)
-
-    # XP popups (yellow, rise and fade next to the crosshair)
-    if P.alive:
-        for i, pp_ in enumerate(reversed(game.xp_pops)):
-            a_ = min(1.0, pp_["t"] / 0.5)
-            yy_ = H / 2 + 34 + i * 24 - (1.6 - pp_["t"]) * 10
-            gfx.text(pp_["txt"], W / 2 + 28, yy_, 20, XP_YELLOW, alpha=a_, bold=True, mono=True)
-            gfx.text(pp_["sub"], W / 2 + 28 + gfx.text_w(pp_["txt"], 20, True, True) + 8, yy_ + 6, 12,
-                     (255, 240, 160), alpha=a_, bold=True)
-    lv_ = xp_info(game.xp)[0]
-    if game.rank_flash > 0:
-        gfx.text("RANK UP!", W / 2, H * 0.22, 40, XP_YELLOW, alpha=min(1.0, game.rank_flash), bold=True, anchor="c")
-        gfx.text("RANK %d" % lv_, W / 2, H * 0.22 + 46, 22, (255, 255, 255), alpha=min(1.0, game.rank_flash), bold=True, anchor="c")
 
     # (top score bar removed; the win message below still shows when the match ends)
     sc = game.score
@@ -543,8 +606,8 @@ def render_hud(game, gfx, W, H, menu_visible):
         al_ = max(0.0, min(1.0, ln["t"] / 1.5))
         tg_ = "[%s] " % ln["tag"]
         tw_ = gfx.text_w(tg_, 10, True) + gfx.text_w(ln["text"], 10)
-        gfx.rect(10, cy_ - 2, tw_ + 12, 16, (22 / 255, 22 / 255, 22 / 255, .8 * al_))
-        gfx.text(tg_, 16, cy_, 10, (255, 193, 7), alpha=al_, bold=True)
+        gfx.rr(10, cy_ - 2, tw_ + 12, 16, (22 / 255, 22 / 255, 22 / 255, .8 * al_))
+        gfx.text(tg_, 16, cy_, 10, (66, 165, 245), alpha=al_, bold=True)
         gfx.text(ln["text"], 16 + gfx.text_w(tg_, 10, True), cy_, 10, (255, 255, 255), alpha=al_)
         cy_ -= 19
 
@@ -558,7 +621,7 @@ def render_hud(game, gfx, W, H, menu_visible):
         vw = gfx.text_w(en["victim"], 14, en["vl"]) + 20
         tw = kw + ww + vw
         x = W - 18 - tw
-        gfx.rect(x - 4, y - 4, tw + 8, rh + 8, (22 / 255, 22 / 255, 22 / 255, .94))
+        gfx.rr(x - 4, y - 4, tw + 8, rh + 8, (22 / 255, 22 / 255, 22 / 255, .94))
         for sx, sw, team, mine in ((x, kw, en["kt"], en["kl"]), (x + kw + ww, vw, en["vt"], en["vl"])):
             col = TEAM_CT if team == 0 else TEAM_T
             gfx.rect(sx, y, sw, rh, team_tint(col))
@@ -576,7 +639,7 @@ def render_hud(game, gfx, W, H, menu_visible):
         ky = 18 + 5 * 38 + 8   # fixed spot: just below the room for 5 kill feed rows
         gfx.rect(W - 18 - 150, ky - 4, 150, 30, (22 / 255, 22 / 255, 22 / 255, .94))
         gfx.text("KILL STREAK", W - 18 - 140, ky + 5, 11, (154, 154, 154), bold=True)
-        gfx.text(str(game.streak), W - 18 - 10, ky + 2, 20, (255, 193, 7), bold=True, anchor="r", mono=True)
+        gfx.text(str(game.streak), W - 18 - 10, ky + 2, 20, (66, 165, 245), bold=True, anchor="r", mono=True)
 
     # Health vignette removed: no red border at low HP.
 
@@ -585,15 +648,15 @@ def render_hud(game, gfx, W, H, menu_visible):
         gfx.rect(0, 0, W, H, (0, 0, 0, .45))
         pw, ph = 380, 168
         px, py = W / 2 - pw / 2, H / 2 - ph / 2
-        gfx.rect(px - 12, py - 12, pw + 24, ph + 24, (22 / 255, 22 / 255, 22 / 255, .94))
+        gfx.rr(px - 12, py - 12, pw + 24, ph + 24, (22 / 255, 22 / 255, 22 / 255, .94))
         gfx.text("AKB / ARENA", W / 2, py - 4, 12, (154, 154, 154), bold=True, anchor="c")
         col = TEAM_CT if P.team == 0 else TEAM_T
-        gfx.rect(px, py + 22, pw, 34, team_tint(col))
+        gfx.rr(px, py + 22, pw, 34, team_tint(col))
         gfx.text("ELIMINATED", px + 10, py + 30, 15, col, bold=True)
         gfx.text(f"{P.kills} / {P.deaths}", px + pw - 10, py + 28, 22, col, bold=True, anchor="r")
         gfx.text("KILLED BY", px + 10, py + 66, 11, (154, 154, 154), bold=True)
-        gfx.rect(px, py + 84, pw, 24, (42 / 255, 42 / 255, 42 / 255, 1))
-        gfx.text(game.death_killer, px + 10, py + 88, 14, (255, 193, 7), bold=True, mono=True)
+        gfx.rr(px, py + 84, pw, 24, (42 / 255, 42 / 255, 42 / 255, 1))
+        gfx.text(game.death_killer, px + 10, py + 88, 14, (66, 165, 245), bold=True, mono=True)
         gfx.text(f"RESPAWNING IN {max(1, math.ceil(P.resp))}", W / 2, py + 130, 12, (154, 154, 154), bold=True, anchor="c")
 
     # scoreboard (hold Tab)
@@ -601,9 +664,7 @@ def render_hud(game, gfx, W, H, menu_visible):
         draw_scoreboard(game, gfx, W, H)
     if game.show_fps:
         gfx.text(f"{int(round(game.fps_val))} FPS", 12, 10, 14, (255, 255, 255), bold=True, mono=True)
-    if game.show_speed and P.alive and not game.over:
-        sp_ = math.hypot(P.vx, P.vy)                     # horizontal speed, units / second
-        gfx.text(f"{int(round(sp_))}", W / 2, H - 66, 26, (255, 255, 255), bold=True, anchor="c", mono=True)
+    draw_smove_hud(game, gfx, W, H, P)
 
     # CS:GO-style developer console
     if game.con_open:
@@ -619,12 +680,12 @@ def render_hud(game, gfx, W, H, menu_visible):
         visible = log[start:end]
         y0 = ch - 36 - line_h * len(visible)
         for i, ln in enumerate(visible):
-            gfx.text(ln["t"][:120], 10, y0 + i * line_h, 13, ln.get("c", (200, 200, 200)), mono=True)
+            gfx.text(ln["t"][:120], 10, y0 + i * line_h, 13, ln.get("c", (200, 200, 200)), mono=True, face="sys")
         # input row
         gfx.rect(0, ch - 28, W, 28, (8 / 255, 10 / 255, 14 / 255, 0.98))
         caret = "|" if int(time.time() * 2) % 2 == 0 else " "
-        gfx.text("] " + game.con_text + caret, 10, ch - 22, 14, (255, 255, 255), mono=True)
-        gfx.text("~ close  |  help  |  arrows history", W - 12, ch - 20, 11, (120, 130, 140), anchor="r", mono=True)
+        gfx.text("] " + game.con_text + caret, 10, ch - 22, 14, (255, 255, 255), mono=True, face="sys")
+        gfx.text("~ close  |  help  |  arrows history", W - 12, ch - 20, 11, (120, 130, 140), anchor="r", mono=True, face="sys")
 
     gl.glColor4f(1, 1, 1, 1)
     gl.glEnable(gl.GL_TEXTURE_2D)

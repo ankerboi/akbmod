@@ -17,7 +17,6 @@ def load_settings(game, menu):
         b2 = j.get("binds2", {})
         game.binds2 = {k: b2[k] for k in DEFAULT_BINDS if isinstance(b2.get(k), str) and b2[k]}
         game.sens = float(j.get("sens", BASE_SENS))
-        game.xp = max(0, int(j.get("xp", 0) or 0))
         game.hand_swap = bool(j.get("hand_swap", False))
         aj = j.get("arms")
         if isinstance(aj, str):
@@ -43,8 +42,11 @@ def load_settings(game, menu):
         menu.resw, menu.resh = str(game.res[0]), str(game.res[1])
         game.want_fullscreen = bool(j.get("fullscreen", False))
         game.show_fps = bool(j.get("show_fps", False))
-        game.show_speed = bool(j.get("show_speed", False))
-        game.show_jstats = bool(j.get("show_jstats", False))
+        game.show_score = bool(j.get("show_score", True))
+        try:
+            game.fps_cap = max(30.0, min(300.0, float(j.get("fps_cap", 144.0))))
+        except Exception:
+            game.fps_cap = 144.0
         try:
             game.viewbob = max(0.0, min(2.0, float(j.get("viewbob", 0.5))))
         except Exception:
@@ -120,8 +122,8 @@ def set_fullscreen(game, on):
 def save_settings(game, menu):
     try:
         SETTINGS_FILE.write_text(json.dumps({
-            "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "binds2": game.binds2, "hand_swap": game.hand_swap, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "primary": game.primary, "day": bool(FX.day), "res": list(game.res), "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "show_speed": bool(game.show_speed), "show_jstats": bool(game.show_jstats), "fov": game.fov_cfg, "vm_offset": game.vm_adj,
-            "sens": game.sens, "xp": int(game.xp), "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh, "viewbob": float(game.viewbob),
+            "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "binds2": game.binds2, "hand_swap": game.hand_swap, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "primary": game.primary, "day": bool(FX.day), "res": list(game.res), "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "show_score": bool(game.show_score), "fov": game.fov_cfg, "vm_offset": game.vm_adj, "fps_cap": float(game.fps_cap),
+            "sens": game.sens, "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh, "viewbob": float(game.viewbob),
         }, indent=2))
     except Exception:
         pass

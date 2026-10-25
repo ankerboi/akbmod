@@ -49,7 +49,7 @@ from OpenGL import GLU as glu
 
 from fadmod.config import *
 from fadmod.glutil import FX
-from fadmod.world import ArenaWorld, FadMapWorld
+from fadmod.world import NoMapWorld, FadMapWorld
 from fadmod.audio import Audio
 from fadmod.net import NET
 from fadmod.game import Game
@@ -72,9 +72,13 @@ def main():
     pygame.init()
     # MSAA off (sharper image; no edge soft-blur from multisampling)
     flags = pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
-    # vsync off: uncapped FPS (may tear; highest frame rate)
+    # vsync off: the FPS limit is the "FPS cap" slider in Settings > Video
     try:
         pygame.display.gl_set_attribute(pygame.GL_SWAP_CONTROL, 0)
+    except Exception:
+        pass
+    try:                                  # ask for a 24-bit depth buffer: with the driver default (can be 16-bit)
+        pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 24)   # flat terrain 0.2 above a floor z-fights / vanishes
     except Exception:
         pass
     try:
@@ -113,12 +117,12 @@ def main():
         if not v:
             game.keys.clear()
             menu.set_page("play")
-            save_settings(game, menu)      # keeps your XP
+            save_settings(game, menu)    
 
     menu = Menu(game, gfx, launch, file_dialog)
     game.menu = menu               # lets the scoreboard draw your profile picture
     load_settings(game, menu)
-    game.set_world(ArenaWorld())
+    game.set_world(NoMapWorld())
     if getattr(game, "want_fullscreen", False):
         set_fullscreen(game, True)
     game.player_name = menu.name.strip() or "Player"
@@ -158,7 +162,7 @@ def main():
         menu.status = (menu.status + " Arms: " + str(ex)).strip()
 
     if not any(mod_folders(n) for n in ("weapon", "player", "arms")):
-        menu.status = (menu.status + " No mod folder found next to the script (mod/weapon, mod/player, mod/arms).").strip()
+        menu.status = (menu.status + " No weapon / player / arms folder found (put them in assets/weapon, assets/player, assets/arms, or in mod/).").strip()
 
     clock = pygame.time.Clock()
     last = time.perf_counter()
@@ -277,6 +281,8 @@ def main():
                                 game.select_weapon(i)
                         if name == b["swaphand"]:
                             game.hand_swap = not game.hand_swap
+                        if name == b["thirdperson"]:
+                            game.toggle_thirdperson()
                         if name == "f":
                             FX.flash = not FX.flash
                 else:
@@ -319,6 +325,8 @@ def main():
                                     game.select_weapon(i)
                             if code == b["swaphand"]:
                                 game.hand_swap = not game.hand_swap
+                            if code == b["thirdperson"]:
+                                game.toggle_thirdperson()
                     elif btn == 1:
                         game.keys["mouse1"] = True
                     elif btn == 3:
@@ -411,7 +419,7 @@ def main():
                 gfx.text("] " + game.con_text + caret, 10, ch - 22, 14, (255, 255, 255), mono=True)
                 gfx.text("~ close  |  help", W - 12, ch - 20, 11, (120, 130, 140), anchor="r", mono=True)
         pygame.display.flip()
-        clock.tick()   # no FPS cap
+        clock.tick(0 if game.fps_cap >= 300 else int(game.fps_cap))   # FPS cap slider (300 = unlimited)
 
     NET.close()
     save_settings(game, menu)

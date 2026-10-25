@@ -30,8 +30,6 @@ class Ent:
         self.zoom = 0
         self.acc = 0.0
         self.jreq = 0
-        self.js = None          # jump stats: the jump being measured (None = not in a tracked jump)
-        self.last_land = -9.0   # time.time() of the last landing (to tell a bunnyhop from a standing jump)
         self.sl = 0.0
         self.scd = 0.0
         self.so = 0.0
@@ -61,6 +59,7 @@ class Ent:
         self.shootT = 0.0
         self.reloadT = 0.0
         self.remote = False     # online player driven by network state
+        self.home = None        # (x, y, z, yaw, weapon) for bots added with bot_add: they respawn there, not at the map spawn points
         self.nid = -1
         self.tx = self.ty = self.tz = None
         self.tyaw = self.tpitch = 0.0
