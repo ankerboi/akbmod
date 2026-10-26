@@ -1,6 +1,6 @@
 # FAD-MOD
 
-CS-style FPS with Source engine (L4D2 / HL2) mod support.
+Source engine (L4D2 / HL2) mod support.
 
 ## Package layout
 
