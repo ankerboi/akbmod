@@ -1,15 +1,15 @@
-# FAD-MOD
+# AKB-MOD
 
 Source engine (L4D2 / HL2) mod support.
 
 ## Package layout
 
 ```
-fadmod/
+akbmod/
   __init__.py
   config.py       # constants, binds, weapons config, helpers
   glutil.py       # OpenGL helpers, atmosphere shaders (FX)
-  world.py        # ArenaWorld, FadMapWorld (collision + draw)
+  world.py        # ArenaWorld, AkbMapWorld (collision + draw)
   source/
     __init__.py
     vpk.py        # Valve VPK reader
@@ -30,12 +30,12 @@ fadmod/
 
 ## Run
 
-From the directory that contains the `fadmod` package:
+From the directory that contains the `akbmod` package:
 
 ```bash
-python run_fadmod.py
+python run_akbmod.py
 # or
-python -m fadmod.main
+python -m akbmod.main
 ```
 
 Optional mods go in `assets/weapon`, `assets/player`, `assets/arms`, `assets/sound`, `assets/image` (and `assets/maps`) inside the package, next to it, or in the working directory. The old `mod/...` folders still work. Singular and plural names both match (`weapon` = `weapons`).
@@ -60,7 +60,7 @@ Installed automatically on first run: `numpy`, `pygame-ce`, `PyOpenGL`, and opti
 ## Source maps (.gma / .bsp)
 
 Open a Garry's Mod addon (`.gma`) or a Source `.bsp` in `saw_map_editor.py` (Import button, Ctrl+I, or drop the file
-on the window), press F5, and load the resulting `.fadmap` in the game. The map is baked into the `.fadmap` under
+on the window), press F5, and load the resulting `.akbmap` in the game. The map is baked into the `.akbmap` under
 `"bsp"`: a triangle mesh (drawn with the map's textures) and convex brushes (collision for players and bullets, with
 real slopes and angled walls). Displacements are included. Static props (models) and moving brush entities (doors,
 buttons) are not.
@@ -68,7 +68,7 @@ buttons) are not.
 ## Ladders
 
 Build them in `saw_map_editor.py` with the Ladder tool (key `9` or `K`): drag a tall, thin block against a wall and press
-`R` until the arrow points at the side the player stands on. F5 writes them to the `.fadmap` (`"lad"`), and the ladder is invisible in the game (build the look yourself with boxes / decals) and the game runs CS:GO-style ladder movement (`Game.ladder_tick`, tunables `LADDER_*` in `config.py`):
+`R` until the arrow points at the side the player stands on. F5 writes them to the `.akbmap` (`"lad"`), and the ladder is invisible in the game (build the look yourself with boxes / decals) and the game runs CS:GO-style ladder movement (`Game.ladder_tick`, tunables `LADDER_*` in `config.py`):
 
 - Walk into a ladder holding a move key to grab it. No gravity, no friction.
 - Each held key gives 156 u/s (200 x `LADDER_SCALE` 0.78) in your VIEW direction, split along the ladder: forward looks
@@ -94,6 +94,6 @@ constants in `config.py`. The HUD (`draw_smove_hud` in `render.py`) uses the Str
 `assets/`. The velocity box (`speed (speed at last bhop)`) is part of the Score toggle in settings (Score: OFF turns the whole system off).
 
 ## Map selection
-Play > Create match > **Load map** opens a map list with a picture for each map (the arena plus every .fadmap
+Play > Create match > **Load map** opens a map list with a picture for each map (the arena plus every .akbmap
 in `mod/maps`; maps you load once are kept there). Click a map and press Load map, or double-click it.
-Browse file... still lets you pick a .fadmap from anywhere. The picture comes from the map builder (Preview button).
+Browse file... still lets you pick a .akbmap from anywhere. The picture comes from the map builder (Preview button).

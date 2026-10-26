@@ -68,7 +68,7 @@ class Menu:
         self.pv_bb = {}           # cached bounding boxes
         self.waiting = None
         self.ms_open = False      # map selection window open?
-        self.ms_list = []         # entries: every .fadmap found
+        self.ms_list = []         # entries: every .akbmap found
         self.ms_sel = 0
         self.ms_scroll = 0        # first visible row
         self.ms_click = (None, 0.0)
@@ -247,7 +247,7 @@ class Menu:
         nav("Settings", "settings", 256)
         if g.net.active:
             gfx.text("ONLINE: " + g.net.room[:18], 20, LHs - 48, 11, (104, 104, 104), mono=True)
-        gfx.text("FAD-MOD", 20, LHs - 26, 12, (154, 154, 154), bold=True)
+        gfx.text("AKB-MOD", 20, LHs - 26, 12, (154, 154, 154), bold=True)
 
         qy = LHs - 100
         qh = shover(20, qy, 200, 38)
@@ -1000,7 +1000,7 @@ class Menu:
 
     def check_ready(self):
         if not self.g.files.get("map_raw"):
-            self.status = "Load a map first: Create match > Load map (or drop a .fadmap on the window)."
+            self.status = "Load a map first: Create match > Load map (or drop a .akbmap on the window)."
             return False
         return True
 
@@ -1341,7 +1341,7 @@ class Menu:
     ms_rows_vis = 2
 
     def _ms_tex(self, d):
-        """Preview dict from a .fadmap ({"png": base64} or {"raw", "w", "h"}) -> (GL texture, w, h)."""
+        """Preview dict from a .akbmap ({"png": base64} or {"raw", "w", "h"}) -> (GL texture, w, h)."""
         if "png" in d:
             surf = pygame.image.load(io.BytesIO(base64.b64decode(d["png"])), "x.png").convert_alpha()
         else:
@@ -1357,7 +1357,7 @@ class Menu:
         return tid, w, h
 
     def ms_entry(self, p):
-        """Name + preview of a .fadmap, read without decoding the whole file. Cached until the file changes."""
+        """Name + preview of a .akbmap, read without decoding the whole file. Cached until the file changes."""
         p = Path(p)
         st = p.stat()
         key = str(p)
@@ -1395,7 +1395,7 @@ class Menu:
         out, seen = [], set()
         for d in self.g._map_dirs():
             try:
-                files = sorted(d.rglob("*.fadmap"))
+                files = sorted(d.rglob("*.akbmap"))
             except Exception:
                 continue
             for p in files:
@@ -1504,7 +1504,7 @@ class Menu:
         button(px + 186, by, 150, 38, "Browse file...", self.ms_browse)
         button(px + pw - 24 - 110, by, 110, 38, "Close", lambda: setattr(self, "ms_open", False))
         if n == 0:
-            gfx.text("No maps yet. Browse file... (or drop a .fadmap on the window) adds a map here.",
+            gfx.text("No maps yet. Browse file... (or drop a .akbmap on the window) adds a map here.",
                      px + 24, by - 24, 12, (130, 130, 130))
 
     def pick(self, mode):

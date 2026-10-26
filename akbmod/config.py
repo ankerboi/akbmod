@@ -1,4 +1,4 @@
-"""FAD-MOD configuration, constants, and small pure helpers."""
+"""AKB-MOD configuration, constants, and small pure helpers."""
 import math
 import re
 import sys

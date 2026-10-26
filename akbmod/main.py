@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FAD-MOD entry point."""
+"""AKB-MOD entry point."""
 import os
 import sys
 import time
@@ -47,17 +47,17 @@ import pygame
 from OpenGL import GL as gl
 from OpenGL import GLU as glu
 
-from fadmod.config import *
-from fadmod.glutil import FX
-from fadmod.world import NoMapWorld, FadMapWorld
-from fadmod.audio import Audio
-from fadmod.net import NET
-from fadmod.game import Game
-from fadmod.source.gma import is_gma_path
-from fadmod.gfx import Gfx, RenderTarget
-from fadmod.menu import Menu
-from fadmod.render import render_scene, render_hud
-from fadmod.settings import load_settings, save_settings, set_fullscreen, file_dialog
+from akbmod.config import *
+from akbmod.glutil import FX
+from akbmod.world import NoMapWorld, AkbMapWorld
+from akbmod.audio import Audio
+from akbmod.net import NET
+from akbmod.game import Game
+from akbmod.source.gma import is_gma_path
+from akbmod.gfx import Gfx, RenderTarget
+from akbmod.menu import Menu
+from akbmod.render import render_scene, render_hud
+from akbmod.settings import load_settings, save_settings, set_fullscreen, file_dialog
 
 def main():
     if sys.platform == "win32":
@@ -90,7 +90,7 @@ def main():
             pygame.display.set_mode((1280, 720), flags, vsync=0)
         except Exception:
             pygame.display.set_mode((1280, 720), flags)
-    pygame.display.set_caption("FAD-MOD")
+    pygame.display.set_caption("AKB-MOD")
     pygame.font.init()
 
     audio = Audio()

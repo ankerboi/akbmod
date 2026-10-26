@@ -20,7 +20,7 @@ from OpenGL import GL as gl
 
 from .config import *
 from .glutil import FX, make_texture
-from .world import World, NoMapWorld, FadMapWorld
+from .world import World, NoMapWorld, AkbMapWorld
 from .audio import Audio
 from .entity import Ent
 from .net import NET, Net, NET_STATE_HZ  # NET is the global instance
@@ -2945,7 +2945,7 @@ class Game:
         for p in sorted(paths, key=lambda q: len(Path(q).parts)):
             p = Path(p)
             n = p.name.lower()
-            if n.endswith(".fadmap"):
+            if n.endswith(".akbmap"):
                 status = self.load_map(p)
                 continue
             # L4D2 weapon packs (.vpk, or browser partial downloads .vpk.part)
@@ -3049,13 +3049,13 @@ class Game:
     # ==========================================================================
 
     def load_map(self, path):
-        """Load a .fadmap made with the FAD-MOD Map Builder. Returns a status string."""
+        """Load a .akbmap made with the AKB-MOD Map Builder. Returns a status string."""
         path = Path(path)
         if self.net.active:
             return "Leave the online server before loading a map."
         try:
             raw = path.read_bytes()
-            world = FadMapWorld(json.loads(raw.decode("utf-8")))
+            world = AkbMapWorld(json.loads(raw.decode("utf-8")))
         except Exception as ex:
             return f"Cannot load map {path.name}: {ex}"
         self.files["map_raw"] = raw          # used for the online map signature
@@ -3090,17 +3090,17 @@ class Game:
             d = Path(__file__).resolve().parent / "mod" / "maps"
             if not d.is_dir():          # never create folders: only keep a copy if mod/maps already exists
                 return
-            p = d / (sig + ".fadmap")
+            p = d / (sig + ".akbmap")
             if not p.exists():
                 p.write_bytes(raw)
         except Exception:
             pass
 
     def find_map_by_sig(self, sig):
-        """Path of a local .fadmap whose signature matches `sig`, or None."""
+        """Path of a local .akbmap whose signature matches `sig`, or None."""
         for d in self._map_dirs():
             try:
-                files = list(d.rglob("*.fadmap"))
+                files = list(d.rglob("*.akbmap"))
             except Exception:
                 continue
             for p in files:
@@ -3121,7 +3121,7 @@ class Game:
             return False, "This server has no map loaded that you can use."
         p = self.find_map_by_sig(sig)
         if p is None:
-            return False, ("You don't have this server's map (custom_%s). Get the .fadmap from the host "
+            return False, ("You don't have this server's map (custom_%s). Get the .akbmap from the host "
                            "and load it (or drop it in mod/maps), then join again." % sig[:5])
         msg = self.load_map(p)
         if self.map_sig() != sig:

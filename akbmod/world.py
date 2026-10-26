@@ -1,4 +1,4 @@
-"""World collision and rendering: FadMapWorld (maps come from .fadmap files)."""
+"""World collision and rendering: AkbMapWorld (maps come from .akbmap files)."""
 import base64
 import io
 import math
@@ -65,7 +65,7 @@ class World:
 
 
 class NoMapWorld(World):
-    """Placeholder used until a .fadmap is loaded: no geometry, nothing to draw. Matches cannot start on it."""
+    """Placeholder used until a .akbmap is loaded: no geometry, nothing to draw. Matches cannot start on it."""
     B = []
     meta = []
     name = "No map"
@@ -80,14 +80,14 @@ class NoMapWorld(World):
         pass
 
 
-class FadMapWorld(World):
-    """A map compiled by the FAD-MOD Map Builder (.fadmap): boxes with optional textures + team spawns."""
+class AkbMapWorld(World):
+    """A map compiled by the AKB-MOD Map Builder (.akbmap): boxes with optional textures + team spawns."""
 
     def __init__(self, d):
         import base64
         import zlib
-        if not isinstance(d, dict) or d.get("format") != "fadmap":
-            raise ValueError("not a FAD-MOD map file")
+        if not isinstance(d, dict) or d.get("format") != "akbmap":
+            raise ValueError("not a AKB-MOD map file")
         self.name = str(d.get("name", "map"))
         self.B, self.meta = [], []
         self.K, self.D, self.Y = [], [], []      # shape kind per box (0 box, 1 slope, 2 cylinder), slope uphill direction, spin (deg)
