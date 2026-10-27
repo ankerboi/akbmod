@@ -1,107 +1,47 @@
 # AKB-MOD
 
-Source engine (L4D2 / HL2) mod support.
-
-## Package layout
-
-```
-akbmod/
-  __init__.py
-  config.py       # constants, binds, weapons config, helpers
-  glutil.py       # OpenGL helpers, atmosphere shaders (FX)
-  world.py        # ArenaWorld, AkbMapWorld (collision + draw)
-  source/
-    __init__.py
-    vpk.py        # Valve VPK reader
-    gma.py        # Garry's Mod .gma reader
-    vtf.py        # KeyValues + VTF textures
-    model.py      # SrcModel (MDL/VVD/VTX + animation)
-    loaders.py    # view-models, player models, arms, archives
-  audio.py
-  net.py          # LAN discovery + direct UDP peers (offline + LAN only)
-  entity.py       # Ent (player/bot)
-  game.py         # Game state, physics, weapons, bots
-  gfx.py          # 2D text/boxes, logos, RenderTarget
-  menu.py         # main menu / loadout / settings UI
-  render.py       # 3D scene + HUD
-  settings.py     # settings.json load/save
-  main.py         # entry point
-```
+First-person team deathmatch (BUM vs FAD) with Source weapon/player mods, CS:GO-style movement, a trick score system and a 3D map builder. Offline or LAN only.
 
 ## Run
 
-From the directory that contains the `akbmod` package:
-
-```bash
-python run_akbmod.py
-# or
-python -m akbmod.main
+```
+python run_akbmod.py        # the game
+python saw_editor.py        # the map builder
 ```
 
-Optional mods go in `assets/weapon`, `assets/player`, `assets/arms`, `assets/sound`, `assets/image` (and `assets/maps`) inside the package, next to it, or in the working directory. The old `mod/...` folders still work. Singular and plural names both match (`weapon` = `weapons`).
+Missing packages (`numpy`, `pygame-ce`, `PyOpenGL`) install on first run. Needs Python 3.10+.
 
-## Garry's Mod addons (.gma) as weapon / player / arms mods
+## Features
 
-Drop a `.gma` into `mod/weapon`, `mod/player` or `mod/arms`, drag it onto the window, or use Add files. It is read in
-place (nothing is unpacked), like a `.vpk`, and one addon can give weapons, players and arms together:
+- Team deathmatch, up to 6 players on LAN. Offline bots only via the dev console (`` ` ``).
+- Maps load by themselves (last used, else the first `.akbmap` in the map folders).
+- sMove score: bhop 5, pixel surf 1/tick, jumpbug 20, edgebug 200, kill 300 + held points.
+- Pixel surf only inside pixel surf zones; CS:GO-style ladders.
+- Keys (remappable): WASD, Space jump, Ctrl crouch, R reload, 1/2 weapons, Z/X/C jumpbug/edgebug/pixel surf, V swap hand, B third person.
 
-- Weapons: `v_*.mdl`, `c_*.mdl`, and every `SWEP.ViewModel` named in the addon's `lua/weapons/*.lua`. `c_` models have
-  no hands: pick an arms model in Skins (a `c_arms*.mdl` inside the addon is found automatically). Sounds inside the
-  addon are used for the weapon they belong to. Weapon stats stay the game's own.
-- Players: `models/player/...` and anything the addon registers with `player_manager.AddValidModel`.
-- Workshop legacy downloads (`<id>_legacy.bin`) work too: a `.bin` is checked by its contents and treated as a `.gma` if it is one (other `.bin` files are ignored).
-- Workshop downloads (LZMA-compressed `.gma`) are unpacked once into the temp folder. A `.gma` inside a `.zip` / `.7z` /
-  `.rar` works too. A `.gma` that is a map goes through `saw_map_editor.py` (see below).
+## Mods
 
-## Dependencies
+Put files in `akbmod/assets/` (or `mod/`): `weapon`, `player`, `arms`, `sound`, `image`. Or drag them onto the game window. Pick them in the **Skins** tab.
 
-Installed automatically on first run: `numpy`, `pygame-ce`, `PyOpenGL`.
+Supported: Source models (`.mdl`, `.vpk`) and Garry's Mod addons (`.gma`, also inside `.zip`/`.7z`/`.rar`). GoldSrc / CS 1.6 models do not work.
 
-## Play modes
+## Maps
 
-Offline and LAN only (no internet servers, no brokers, no hole punching). Host a LAN match in Play > Create match > Mode: LAN; players on the same network see it in the server list. Over the internet, use a virtual LAN such as Radmin VPN and type the host's IP in Join by IP.
+1. Run `python saw_editor.py`. Draw boxes (`B`), place spawns (`1` BUM, `2` FAD), drop images on faces to texture them.
+2. `Ctrl+S` saves the project (`.akbproj`). `F5` compiles it to a `.akbmap`.
+3. Put the `.akbmap` in `akbmod/assets/map`.
 
-## Maps load themselves
+Other tools: `3` slope, `4` cylinder, `7` decal, `8` pixel surf zone, `9` ladder, `Ctrl+I` import a `.gma` / `.bsp` / `.vpk` map. `F1` shows all controls.
 
-On start the last map you used loads (or the first `.akbmap` found in the maps folders), and Start match loads one automatically if none is loaded. Joining a LAN game loads the host's map by itself when you have it.
+## Play online with Radmin VPN
 
-## Source maps (.gma / .bsp)
+1. Everyone installs Radmin VPN. One person creates a network, the others join it.
+2. Everyone has the same `.akbmap` in `akbmod/assets/map`.
+3. Host: **Play > Create match > Mode: LAN > Start match**. Allow the game through the firewall (UDP). Send friends your Radmin IP (starts with `26.`).
+4. Friends: **Play**, type the IP in **Join by IP** (`26.x.x.x`, or `26.x.x.x:27778`), press **Join**.
 
-Open a Garry's Mod addon (`.gma`) or a Source `.bsp` in `saw_map_editor.py` (Import button, Ctrl+I, or drop the file
-on the window), press F5, and load the resulting `.akbmap` in the game. The map is baked into the `.akbmap` under
-`"bsp"`: a triangle mesh (drawn with the map's textures) and convex brushes (collision for players and bullets, with
-real slopes and angled walls). Displacements are included. Static props (models) and moving brush entities (doors,
-buttons) are not.
+## Problems
 
-## Ladders
-
-Build them in `saw_map_editor.py` with the Ladder tool (key `9` or `K`): drag a tall, thin block against a wall and press
-`R` until the arrow points at the side the player stands on. F5 writes them to the `.akbmap` (`"lad"`), and the ladder is invisible in the game (build the look yourself with boxes / decals) and the game runs CS:GO-style ladder movement (`Game.ladder_tick`, tunables `LADDER_*` in `config.py`):
-
-- Walk into a ladder holding a move key to grab it. No gravity, no friction.
-- Each held key gives 156 u/s (200 x `LADDER_SCALE` 0.78) in your VIEW direction, split along the ladder: forward looks
-  where you look, so W while looking up climbs, W while looking steeply down (past 45 deg) descends; A / D shuffle sideways.
-- Jump leaps off at 270 u/s straight away from the ladder. Climbing past the top of the block drops you back into normal
-  movement with the speed you had (you pop over the lip).
-- Standing on the floor and pressing S steps you off.
-
-## sMove score system
-
-Ported from the sMove gamemode. Tricks add to a **held** pool; killing someone banks the held points plus 300.
-
-| Trick | Points |
-|---|---|
-| Bunnyhop (2nd+ chained hop above 250 u/s) | 5 |
-| Pixelsurf (per tick, above 150 u/s) | 1 |
-| Jumpbug | 20 |
-| Edgebug | 200 |
-| Kill | 300 (+ held) |
-
-Every trick restarts a 3 second timer; if it runs out (or you die) the held points are lost. Tunables are the `SC_*`
-constants in `config.py`. The HUD (`draw_smove_hud` in `render.py`) uses the Stratum font and kill sound shipped in
-`assets/`. The velocity box (`speed (speed at last bhop)`) is part of the Score toggle in settings (Score: OFF turns the whole system off).
-
-## Map selection
-Play > Create match > **Load map** opens a map list with a picture for each map (the arena plus every .akbmap
-in `mod/maps`; maps you load once are kept there). Click a map and press Load map, or double-click it.
-Browse file... still lets you pick a .akbmap from anywhere. The picture comes from the map builder (Preview button).
+- **No map found:** put a `.akbmap` in `akbmod/assets/map` (a `.gma`/`.bsp` must be compiled with F5 first).
+- **Different map:** use the host's exact `.akbmap`.
+- **Could not reach the host:** same Radmin network? IP right? Firewall allows UDP?
