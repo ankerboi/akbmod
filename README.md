@@ -10,7 +10,7 @@ Python 3.10+. Packages install on first run.
 ## Features
 
 - Up to 6 players on LAN. Bots only via the console (`` ` ``).
-- Score: bhop 5, pixel surf 1/tick, jumpbug 20, edgebug 200, kill 300 + held points.
+- Smove score: bhop 5, pixel surf 1/tick, jumpbug 20, edgebug 200, kill 300 + held points.
 - Pixel surf works only inside pixel surf zones.
 - Keys (remappable): WASD, Space, Ctrl crouch, R reload, 1/2 weapons, Z/X/C jumpbug/edgebug/pixel surf, V swap hand, B third person.
 
