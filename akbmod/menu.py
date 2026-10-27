@@ -5,6 +5,7 @@ import io
 import json
 import math
 import re
+import socket
 import time
 import zlib
 from pathlib import Path
@@ -16,7 +17,7 @@ from OpenGL import GLU as glu
 
 from .config import *
 from .glutil import make_texture, FX
-from .net import NET_MAX_PLAYERS, BROKER_ROOT
+from .net import NET_MAX_PLAYERS, NET_GAME_PORT, lan_ip
 from .gfx import Gfx, c255, team_tint, team_logo, draw_team_logo, draw_mod_image, mod_image
 from .source.loaders import make_vm, SrcInst, SrcPlayerInst, SrcSpec
 from .settings import save_settings, set_fullscreen
@@ -38,7 +39,7 @@ class Menu:
         self.name = ""
         self.focus = False
         self.room = ""        # online: room name field
-        self.ip = ""          # online: direct-join field
+        self.ip = ""          # LAN: join by IP (works over Radmin VPN / virtual LAN too)
         self.edit = None      # which online text field has focus
         self.quit_req = False
         self.resw = str(RENDER_W)   # video: typed resolution
@@ -52,7 +53,7 @@ class Menu:
         self.cm_open = False      # Play tab: match settings panel shown?
         self.dd = None            # Play tab: which dropdown is open (mode / time)
         self._dd_was = None       # dropdown that was open when the mouse went down
-        self.play_online = False  # Play tab: create match as Online (host server) instead of Offline
+        self.play_online = False  # Play tab: create match as LAN (host a server) instead of Offline
         self.sb_tab = "all"       # server browser tab: all | net | lan
         self.sb_sort = "n"        # server browser sort column
         self.sb_rev = False
@@ -302,7 +303,7 @@ class Menu:
             net = g.net
             gfx.text("READY WHEN YOU ARE", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Enter the arena.", cx, 48, 34, (255, 255, 255), bold=True)
-            gfx.text("Create a match, or join a server from the server browser. No port forwarding needed.",
+            gfx.text("Play offline, or host / join a LAN game. Over the internet, use a virtual LAN (e.g. Radmin VPN) and Join by IP.",
                      cx, 96, 13, (154, 154, 154))
 
             def field(x, y, w, h, key, ph):
@@ -377,7 +378,7 @@ class Menu:
             # --- top panel: current server / create match ---
             if net.mode == "host":
                 panel(cx, 128, cw, 112, "Hosting: " + net.room[:40],
-                      "Your server is listed in the server browser. Friends join with one click.")
+                      "Players on your LAN see it in the server list. Over Radmin VPN they use Join by IP: " + lan_ip() + ":" + str(net.port))
                 gfx.text("Players: %d / %d" % (len(net.peers) + 1, NET_MAX_PLAYERS),
                          cx + 20, 180, 13, (200, 200, 200))
                 button(cx + 20, 202, 150, 32, "Close server", do_leave)
@@ -397,8 +398,8 @@ class Menu:
                     online = self.play_online
                     byy = 330 if online else 272
                     panel(cx, 128, cw, byy + 38 + 24 - 128, "Create match", "Pick your options, then press Start match. Change your name in Profile.")
-                    dropdown(cx + 20, 204, 150, "mode", "MODE", "Online" if online else "Offline",
-                             [("Offline", "offline"), ("Online", "online")], set_mode)
+                    dropdown(cx + 20, 204, 150, "mode", "MODE", "LAN" if online else "Offline",
+                             [("Offline", "offline"), ("LAN", "online")], set_mode)
                     dropdown(cx + 182, 204, 150, "time", "TIME", "Day" if FX.day else "Night",
                              [("Night", "night"), ("Day", "day")], set_time)
                     if online:
@@ -505,7 +506,7 @@ class Menu:
                 self.sb_scroll = max(0, min(self.sb_scroll, max(0, len(shown) - vis)))
                 if not shown:
                     gfx.text("No servers found yet.", cx + cw / 2, ry0 + 40, 14, (150, 150, 150), bold=True, anchor="c")
-                    gfx.text("Create an online match, or ask a friend to - servers show up here by themselves.",
+                    gfx.text("Host a LAN match, or ask a friend to - LAN servers show up here by themselves. Radmin VPN: use Join by IP.",
                              cx + cw / 2, ry0 + 64, 12, (110, 110, 110), anchor="c")
                 sel = next((r for r in shown if r["id"] == self.sb_sel), None)
                 if not sel:
@@ -530,7 +531,7 @@ class Menu:
                              (66, 165, 245) if other else (200, 200, 200), mono=True)
                     gfx.text("%d/%d" % (r["p"], r["m"]), cx + cols[3][2], yy + 7, 12,
                              (229, 57, 53) if full else (200, 200, 200), mono=True)
-                    gfx.text("LAN" if r.get("src") == "lan" else "Internet", cx + cols[4][2], yy + 7, 12, (140, 140, 140), mono=True)
+                    gfx.text("LAN", cx + cols[4][2], yy + 7, 12, (140, 140, 140), mono=True)
 
                     def pick_row(r=r):
                         now_ = time.time()
@@ -550,13 +551,6 @@ class Menu:
 
                 def do_refresh():
                     net.lan_rooms.clear()
-                    net.net_rooms.clear()
-                    try:
-                        t = "%s/rooms/+" % BROKER_ROOT
-                        net.broker.unsub(t)
-                        net.broker.sub(t)
-                    except Exception:
-                        pass
                     self.sb_scroll = 0
 
                 def do_connect():
@@ -570,10 +564,33 @@ class Menu:
                     gfx.box(cx + 134, fy + 7, 130, 32, c255(20, 20, 20), c255(32, 32, 32))
                     gfx.text("Connect", cx + 199, fy + 16, 13, (80, 80, 80), bold=True, anchor="c")
                 gfx.text("%d server%s" % (len(shown), "" if len(shown) == 1 else "s"), cx + cw - 20, fy + 16, 12, (140, 140, 140), anchor="r")
+
+                def do_join_ip():
+                    txt = self.ip.strip()
+                    if not txt:
+                        self.status = "Type the host's IP first (example: 26.12.34.56 or 192.168.1.20:27778)."
+                        return
+                    host_, _, prt_ = txt.partition(":")
+                    try:
+                        prt = int(prt_) if prt_ else NET_GAME_PORT
+                        host_ = socket.gethostbyname(host_.strip())
+                    except Exception:
+                        self.status = "Cannot use that address: " + txt
+                        return
+                    if not self.check_ready():
+                        return
+                    g.player_name = pname()
+                    g.P.name = g.player_name
+                    g.join_msg = ""
+                    g.net_join([(host_, prt)])
+                    self.status = g.join_msg or net.status
+                gfx.text("Join by IP", cx + 280, fy + 16, 12, (140, 140, 140))
+                field(cx + 354, fy + 7, 190, 32, "ip", "host IP[:port]")
+                button(cx + 554, fy + 7, 90, 32, "Join", do_join_ip)
                 if sel and sel["map"] != g.map_sig():
                     have = sel["map"] not in ("none", "arena") and g.find_map_by_sig(sel["map"]) is not None
                     gfx.text("Other map - you have it, it loads on join." if have else
-                             "Other map - you don't have it.", cx + 284, fy + 16, 11,
+                             "Other map - you don't have it.", cx + 660, fy + 16, 11,
                              (157, 211, 103) if have else (66, 165, 245))
 
             # --- open dropdown lists (on top of everything) ---
@@ -1000,8 +1017,11 @@ class Menu:
 
     def check_ready(self):
         if not self.g.files.get("map_raw"):
-            self.status = "Load a map first: Create match > Load map (or drop a .akbmap on the window)."
-            return False
+            msg = self.g.auto_load_map()        # no map yet: load one by itself
+            if not self.g.files.get("map_raw"):
+                self.status = "No map found. Put a .akbmap in the maps folder (mod/maps) or drop one on the window."
+                return False
+            self.status = msg
         return True
 
     def set_pfp(self, path):

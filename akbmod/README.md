@@ -18,7 +18,7 @@ akbmod/
     model.py      # SrcModel (MDL/VVD/VTX + animation)
     loaders.py    # view-models, player models, arms, archives
   audio.py
-  net.py          # LAN + MQTT room browser + UDP peers
+  net.py          # LAN discovery + direct UDP peers (offline + LAN only)
   entity.py       # Ent (player/bot)
   game.py         # Game state, physics, weapons, bots
   gfx.py          # 2D text/boxes, logos, RenderTarget
@@ -55,7 +55,15 @@ place (nothing is unpacked), like a `.vpk`, and one addon can give weapons, play
 
 ## Dependencies
 
-Installed automatically on first run: `numpy`, `pygame-ce`, `PyOpenGL`, and optionally `paho-mqtt`.
+Installed automatically on first run: `numpy`, `pygame-ce`, `PyOpenGL`.
+
+## Play modes
+
+Offline and LAN only (no internet servers, no brokers, no hole punching). Host a LAN match in Play > Create match > Mode: LAN; players on the same network see it in the server list. Over the internet, use a virtual LAN such as Radmin VPN and type the host's IP in Join by IP.
+
+## Maps load themselves
+
+On start the last map you used loads (or the first `.akbmap` found in the maps folders), and Start match loads one automatically if none is loaded. Joining a LAN game loads the host's map by itself when you have it.
 
 ## Source maps (.gma / .bsp)
 

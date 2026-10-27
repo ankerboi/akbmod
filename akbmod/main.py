@@ -10,7 +10,7 @@ os.environ.setdefault("SDL_MOUSE_RELATIVE_MODE_WARP", "0")
 os.environ.setdefault("SDL_MOUSE_RELATIVE_SYSTEM_SCALE", "0")
 
 def _ensure_deps():
-    """Install missing packages automatically (pygame, PyOpenGL, numpy, paho-mqtt)."""
+    """Install missing packages automatically (pygame, PyOpenGL, numpy)."""
     import importlib.util
     import subprocess
 
@@ -32,11 +32,6 @@ def _ensure_deps():
             print("Could not install:", ", ".join(missing))
             print("Run manually: pip install " + " ".join(missing))
             sys.exit(1)
-    # optional: the internet room browser (free public MQTT broker). Not fatal if it fails.
-    if importlib.util.find_spec("paho") is None:
-        print("Installing paho-mqtt (internet room browser) ...")
-        if not pip(["paho-mqtt"]):
-            print("Could not install paho-mqtt - only LAN rooms will be found. Run: pip install paho-mqtt")
     importlib.invalidate_caches()
 
 
@@ -97,7 +92,6 @@ def main():
     game = Game(audio)
     gfx = Gfx()
     NET.start_discovery()
-    NET.start_broker()
 
     def launch():
         menu.focus = False
@@ -123,6 +117,9 @@ def main():
     game.menu = menu               # lets the scoreboard draw your profile picture
     load_settings(game, menu)
     game.set_world(NoMapWorld())
+    amsg = game.auto_load_map()          # maps load by themselves: last used map, else the first one found
+    if amsg:
+        menu.status = amsg
     if getattr(game, "want_fullscreen", False):
         set_fullscreen(game, True)
     game.player_name = menu.name.strip() or "Player"
@@ -368,7 +365,7 @@ def main():
         if game.net_joined:           # the host accepted us: drop straight into the room
             game.net_joined = False
             launch()
-        if game.net_notice:           # denied / lost the host: back to the Online tab with the reason
+        if game.net_notice:           # denied / lost the host: back to the Play tab with the reason
             menu.status = game.net_notice
             game.net_notice = ""
             if game.lock:

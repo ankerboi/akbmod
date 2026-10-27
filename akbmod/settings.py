@@ -73,6 +73,7 @@ def load_settings(game, menu):
                     game.xh[k] = type(dv)(xj[k])
                 except Exception:
                     pass
+        game.last_map_path = str(j.get("last_map", "") or "")
         pf = j.get("pfp")
         if pf and Path(pf).is_file():
             menu.set_pfp(pf)
@@ -123,7 +124,7 @@ def save_settings(game, menu):
     try:
         SETTINGS_FILE.write_text(json.dumps({
             "arms": (game.arms_pick or ("" if game.arms_off else None)), "binds": game.binds, "binds2": game.binds2, "hand_swap": game.hand_swap, "player_models": game.pm_saved, "weapon_models": {str(k): v for k, v in game.wm_pick.items()}, "primary": game.primary, "day": bool(FX.day), "res": list(game.res), "fullscreen": bool(game.fullscreen), "show_fps": bool(game.show_fps), "show_score": bool(game.show_score), "fov": game.fov_cfg, "vm_offset": game.vm_adj, "fps_cap": float(game.fps_cap),
-            "sens": game.sens, "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh, "viewbob": float(game.viewbob),
+            "sens": game.sens, "volume": game.audio.volume, "name": menu.name, "pfp": menu.pfp_path, "crosshair": game.xh, "viewbob": float(game.viewbob), "last_map": getattr(game, "last_map_path", ""),
         }, indent=2))
     except Exception:
         pass

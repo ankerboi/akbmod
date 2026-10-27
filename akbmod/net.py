@@ -1,10 +1,8 @@
-"""LAN discovery, MQTT broker room browser (phone book + hole-punch signalling only), direct UDP peer-to-peer.
+"""LAN play: UDP broadcast room discovery + direct UDP peer-to-peer (also works over a virtual LAN such as Radmin VPN / FreeLAN with Direct join by IP).
 
-Game traffic NEVER goes through a server: players talk straight to each other over UDP.
-The public MQTT brokers only carry the room list and the tiny "punch now" signals."""
+Game traffic never goes through a server: players talk straight to each other over UDP. There is no internet room browser."""
 import json
 import os
-import queue
 import random
 import socket
 import struct
@@ -28,17 +26,8 @@ NET_MAX_PLAYERS = 6
 NET_STATE_HZ = 40      # how often your position is sent online (was 25)
 NET_DROPPABLE = ("st", "shot")  # sent without resend, newest state wins
 
-BROKER_ROOT = "akbarena-v2"
-BROKER_HOSTS = ("broker.hivemq.com", "broker.emqx.io", "test.mosquitto.org")   # free, no account, tried in order
-STUN_HOSTS = (("stun.l.google.com", 19302), ("stun1.l.google.com", 19302),
-              ("stun.cloudflare.com", 3478), ("stun.nextcloud.com", 3478),
-              ("stun.sipgate.net", 3478), ("stun.stunprotocol.org", 3478))
 JOIN_TIMEOUT = 30.0            # seconds a join may take before giving up
 JOIN_RETRY = 9.0               # new socket + new attempt every this many seconds while nothing answers
-SPRAY_BEFORE, SPRAY_AFTER = 8, 56   # symmetric-NAT port prediction window around the STUN-observed ports
-SPRAY_PER_TICK = 12
-STUN_COOKIE = 0x2112A442
-
 def lan_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -50,163 +39,20 @@ def lan_ip():
         return "127.0.0.1"
 
 
-class Broker:
-    """Free public MQTT brokers used as the phone book (room list) and as the signalling
-    channel for NAT hole punching. We connect to ALL of them at the same time (one thread
-    each) and publish / subscribe on every one that is up, so a slow or dead broker never
-    delays you and two players can never end up on different brokers.
-    Results arrive in self.q (duplicates from several brokers are harmless)."""
-
-    def __init__(self):
-        self.clis = {}            # host -> paho client
-        self.okh = set()          # hosts that are connected right now
-        self.err = ""
-        self.q = queue.Queue()
-        self.want = set()
-        self.threads = []
-        self.stop = False
-
-    @property
-    def ok(self):
-        return bool(self.okh)
-
-    def start(self):
-        if self.threads:
-            return
-        for h in BROKER_HOSTS:
-            t = threading.Thread(target=self._run, args=(h,), daemon=True)
-            t.start()
-            self.threads.append(t)
-
-    def _run(self, host):
-        try:
-            import paho.mqtt.client as mqtt
-        except Exception:
-            self.err = "paho-mqtt missing (pip install paho-mqtt)"
-            return
-        cid = "akb-%012x" % random.getrandbits(48)
-        while not self.stop:
-            try:
-                try:
-                    cli = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=cid, userdata=host)   # paho 2.x
-                except AttributeError:
-                    cli = mqtt.Client(client_id=cid, userdata=host)                                      # paho 1.x
-                cli.on_connect = self._on_connect
-                cli.on_disconnect = self._on_disc
-                cli.on_message = self._on_msg
-                try:
-                    cli.reconnect_delay_set(min_delay=1, max_delay=5)
-                except Exception:
-                    pass
-                self.clis[host] = cli
-                cli.connect(host, 1883, keepalive=20)      # paho's own connect timeout is 5s
-            except Exception as ex:
-                self.clis.pop(host, None)
-                if not self.okh:
-                    self.err = "%s: %s" % (host, str(ex)[:40])
-                time.sleep(3.0)
-                continue
-            cli.loop_start()      # keeps running and reconnects by itself
-            while not self.stop:
-                time.sleep(1.0)
-            try:
-                cli.loop_stop()
-                cli.disconnect()
-            except Exception:
-                pass
-            return
-
-    def _on_connect(self, c, host, flags, rc, *a):
-        good = (rc == 0) or (str(rc) == "Success")
-        if good:
-            self.okh.add(host)
-            self.err = ""
-            for t in list(self.want):
-                try:
-                    c.subscribe(t, qos=0)
-                except Exception:
-                    pass
-        else:
-            self.okh.discard(host)
-            if not self.okh:
-                self.err = "%s refused (%s)" % (host, rc)
-
-    def _on_disc(self, c, host, *a):
-        self.okh.discard(host)
-
-    def _on_msg(self, c, u, msg):
-        try:
-            j = json.loads(msg.payload.decode("utf-8", "ignore")) if msg.payload else None
-        except ValueError:
-            return
-        # retain=True: this is the broker's stored copy (delivered on subscribe), not a live announce
-        self.q.put((msg.topic, j, bool(getattr(msg, "retain", False))))
-
-    def _live(self):
-        return [self.clis[h] for h in list(self.okh) if h in self.clis]
-
-    def sub(self, topic):
-        self.want.add(topic)
-        for c in self._live():
-            try:
-                c.subscribe(topic, qos=0)
-            except Exception:
-                pass
-
-    def unsub(self, topic):
-        self.want.discard(topic)
-        for c in self._live():
-            try:
-                c.unsubscribe(topic)
-            except Exception:
-                pass
-
-    def pub(self, topic, obj, retain=False):
-        """obj=None with retain=True deletes a retained message. Goes out on every live broker."""
-        live = self._live()
-        if not live:
-            return False
-        payload = b"" if obj is None else json.dumps(obj, separators=(",", ":"))
-        deleting = (obj is None and retain)
-        sent = False
-        infos = []
-        for c in live:
-            try:
-                # A retained delete must be confirmed by the broker (QoS 1), otherwise a broker
-                # that momentarily misses it keeps the closed room stored forever.
-                infos.append(c.publish(topic, payload, qos=1 if deleting else 0, retain=retain))
-                sent = True
-            except Exception:
-                pass
-        if deleting:
-            # Wait for every PUBACK, then say it a couple more times: any broker that was
-            # reconnecting when we first sent the delete would otherwise still show the room.
-            deadline = time.time() + 0.4
-            for inf in infos:
-                try:
-                    inf.wait_for_publish(timeout=max(0.05, deadline - time.time()))
-                except Exception:
-                    pass
-            time.sleep(0.05)
-            for _ in range(2):
-                for c in self._live():
-                    try:
-                        c.publish(topic, b"", qos=1, retain=True)
-                    except Exception:
-                        pass
-                time.sleep(0.08)
-        return sent
-
-    def close(self):
-        self.stop = True
-        for c in list(self.clis.values()):
-            try:
-                c.disconnect()
-                c.loop_stop()
-            except Exception:
-                pass
-        self.clis = {}
-        self.okh = set()
+def local_ips():
+    """Every IPv4 address of this PC (LAN adapter + virtual LAN adapters)."""
+    out = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip not in out and not ip.startswith(("127.", "169.254.")):
+                out.append(ip)
+    except Exception:
+        pass
+    ip = lan_ip()
+    if ip not in out and not ip.startswith("127."):
+        out.append(ip)
+    return out
 
 
 class UConn:
@@ -334,18 +180,6 @@ class _Mux:
 class Net:
     def __init__(self):
         self.mux = _Mux(self)
-        self._rts = {}            # room id -> last announce timestamp seen (stale-room filter)
-        self._dead = {}           # room id -> wall-clock time we saw the host close it (ignore late copies)
-        self.jid = ""             # joiner: stable id of this join (same across socket retries)
-        self.sym = False          # our NAT gives a different public port per destination (symmetric)
-        self.pports = []          # distinct public ports STUN servers saw us on
-        self.stun_obs = {}        # stun server addr -> (ip, port) it saw
-        self.t_pub1 = 0.0
-        self.spray = []           # host: [ip, lo, hi, until, cursor] guesses at a symmetric joiner's ports
-        self._jspray = None       # joiner: same, aimed at a symmetric host
-        self._hsym = False
-        self._hpp = []
-        self._hip = ""
         self.mode = None          # None | "host" | "joining" | "client"
         self.room = ""
         self.rid = ""
@@ -360,22 +194,11 @@ class Net:
         self.sock = None          # the one UDP game socket
         self.port = 0
         self.conn = None          # client: link to the host
-        self.pub = None           # our public (ip, port) as seen from the internet, via STUN
-        self.punch = []           # host: [addr, until, next_send] hole-punch targets
-        self.stun_addrs = []
-        self.stun_tids = {}       # transaction id -> STUN server it was sent to
-        self.stun_started = False
-        self.t_stun = 0.0
         self.t_ann = 0.0
         self.host_t0 = 0.0
-        self.pub_warned = False
-        self.join_rid = None
         self.join_t0 = 0.0
-        self.t_sig = 0.0
         self.cid = "%08x" % random.getrandbits(32)
         self.lan_rooms = {}       # rooms found by UDP broadcast on this network
-        self.net_rooms = {}       # rooms found through the internet broker
-        self.broker = Broker()
         self.udp = None           # LAN discovery socket
         self.status = ""
         self.t_bc = 0.0
@@ -391,14 +214,7 @@ class Net:
 
     @property
     def rooms(self):
-        d = dict(self.net_rooms)
-        d.update(self.lan_rooms)      # a room seen on both: the direct LAN route wins
-        return d
-
-    def start_broker(self):
-        self.broker.sub("%s/rooms/+" % BROKER_ROOT)
-        self.broker.start()
-        self._stun_start()        # resolve the STUN servers now so Host / Join don't wait for DNS
+        return dict(self.lan_rooms)
 
     # ----- LAN discovery (UDP broadcast) -----
     def start_discovery(self):
@@ -417,7 +233,7 @@ class Net:
             s.setblocking(False)
             self.udp = s
         except OSError:
-            self.udp = None   # fine: the internet room browser still works
+            self.udp = None   # no room list then; Direct join by IP still works
 
     def _disc(self, now):
         if self.udp:
@@ -447,9 +263,10 @@ class Net:
                                   "p": self.nplayers(), "m": self.max_players, "port": self.port,
                                   "map": self.map_sig}, separators=(",", ":")).encode()
                 targets = ["255.255.255.255"]
-                ip = lan_ip()
-                if ip.count(".") == 3 and not ip.startswith("127."):
-                    targets.append(".".join(ip.split(".")[:3] + ["255"]))
+                for ip in local_ips():       # every adapter, so a virtual LAN (Radmin VPN, FreeLAN) gets the broadcast too
+                    t = ".".join(ip.split(".")[:3] + ["255"])
+                    if t not in targets:
+                        targets.append(t)
                 for t in targets:
                     try:
                         self.udp.sendto(pkt, (t, NET_DISC_PORT))
@@ -457,194 +274,6 @@ class Net:
                         pass
         for k in [k for k, r in self.lan_rooms.items() if now - r["seen"] > 4.0]:
             del self.lan_rooms[k]
-        for k in [k for k, r in self.net_rooms.items() if now - r["seen"] > 7.0]:    # ~3 missed announces = gone
-            del self.net_rooms[k]
-        if len(self._rts) > 200:
-            self._rts.clear()
-
-    # ----- internet broker: room list + hole-punch signalling -----
-    def _broker_poll(self, now):
-        b = self.broker
-        for _ in range(200):
-            try:
-                topic, j, retained = b.q.get_nowait()
-            except queue.Empty:
-                break
-            parts = topic.split("/")
-            if len(parts) != 3:
-                continue
-            kind, rid = parts[1], parts[2]
-            if kind == "rooms":
-                if j is None:                     # the host closed the room
-                    self.net_rooms.pop(rid, None)
-                    self._rts.pop(rid, None)
-                    self._dead[rid] = now
-                    if len(self._dead) > 200:
-                        self._dead.clear()
-                    continue
-                if not isinstance(j, dict) or j.get("g") != NET_MAGIC or rid == self.rid:
-                    continue
-                # A room we closed ourselves must never come back, whatever a broker still stores.
-                dead_at = self._dead.get(rid)
-                if dead_at is not None:
-                    if now - dead_at < 300.0:
-                        continue
-                    self._dead.pop(rid, None)
-                try:
-                    ts = float(j.get("ts", 0))
-                except (TypeError, ValueError):
-                    continue
-                age = abs(time.time() - ts)
-                # A retained message is only the broker's stored copy of the last announcement.
-                # The host re-announces every 2 s, so an old retained copy means the host is gone.
-                if retained and age > 15.0:
-                    continue
-                if (not retained) and age > 15.0:
-                    # Looks old: either a leftover of a closed room, or the host's PC clock
-                    # is off. A live host re-announces every few seconds with a new ts,
-                    # a dead room never does - so only show it once its ts changes.
-                    if self._rts.get(rid) in (None, ts):
-                        self._rts[rid] = ts
-                        continue
-                self._rts[rid] = ts
-                try:
-                    pub = j["pub"]
-                    lan = j.get("lan")
-                    pp = [int(x) for x in (j.get("pp") or [])][:8]
-                    self.net_rooms[rid] = {
-                        "id": rid, "n": str(j.get("n", ""))[:28], "h": str(j.get("h", ""))[:16],
-                        "p": int(j.get("p", 1)), "m": int(j.get("m", NET_MAX_PLAYERS)),
-                        "ip": str(pub[0]), "port": int(pub[1]), "map": str(j.get("map", "")),
-                        "lan": [str(lan[0]), int(lan[1])] if lan else None,
-                        "sym": bool(j.get("sym")), "pp": pp,
-                        "seen": now, "src": "net",
-                    }
-                except (KeyError, ValueError, TypeError, IndexError):
-                    continue
-            elif kind == "sig" and self.mode == "host" and rid == self.rid:
-                if isinstance(j, dict) and j.get("t") == "punch":
-                    self._punch_to(j, now)
-
-    def _same_lan(self, ip):
-        mine = lan_ip()
-        return mine.count(".") == 3 and ip.count(".") == 3 and mine.rsplit(".", 1)[0] == ip.rsplit(".", 1)[0]
-
-    def _punch_to(self, j, now):
-        """A joiner told us (through the broker) where it is: fire packets at it so our NAT
-        lets its packets in. If its NAT hands out a new public port per destination (symmetric),
-        also fire at the ports it is most likely to use toward us."""
-        try:
-            addrs = []
-            if j.get("pub"):
-                addrs.append((str(j["pub"][0]), int(j["pub"][1])))
-            if j.get("lan") and self._same_lan(str(j["lan"][0])):
-                addrs.append((str(j["lan"][0]), int(j["lan"][1])))
-            pp = [int(x) for x in (j.get("pp") or [])][:8]
-        except (KeyError, ValueError, TypeError, IndexError):
-            return
-        for a in addrs:
-            for pu in self.punch:
-                if pu[0] == a:
-                    pu[1] = now + 25.0
-                    pu[2] = 0.0   # send immediately
-                    break
-            else:
-                self.punch.append([a, now + 25.0, 0.0])  # keep punching long enough for slow STUN
-        if j.get("sym") and pp and addrs:
-            ip = addrs[0][0]
-            lo, hi = max(1, min(pp) - SPRAY_BEFORE), min(65535, max(pp) + SPRAY_AFTER)
-            for sp in self.spray:
-                if sp[0] == ip:
-                    sp[1], sp[2], sp[3] = lo, hi, now + 25.0
-                    break
-            else:
-                self.spray.append([ip, lo, hi, now + 25.0, lo])
-
-    def _announce(self, now):
-        self.t_ann = now
-        self.broker.pub("%s/rooms/%s" % (BROKER_ROOT, self.rid), {
-            "g": NET_MAGIC, "id": self.rid, "n": self.room, "h": self.pname,
-            "p": self.nplayers(), "m": self.max_players, "map": self.map_sig,
-            "pub": list(self.pub), "lan": [lan_ip(), self.port], "ts": int(time.time()),
-            "sym": 1 if self.sym else 0, "pp": self.pports[:8],
-        }, retain=True)
-
-    # ----- STUN: learn our public address (no server of our own needed) -----
-    def _stun_start(self):
-        if self.stun_started:
-            return
-        self.stun_started = True
-
-        def one(h, p):
-            try:
-                self.stun_addrs.append((socket.gethostbyname(h), p))
-            except OSError:
-                pass
-        for h, p in STUN_HOSTS:      # one thread per server: a slow DNS lookup blocks nobody
-            threading.Thread(target=one, args=(h, p), daemon=True).start()
-
-    def _stun_tick(self, now):
-        if not (self.sock and self.stun_addrs and now >= self.t_stun):
-            return
-        if self.pub is None or now < self.t_pub1 + 1.0:
-            # still looking for our public address (or just found it and want a second opinion
-            # from the other servers, which tells us if our NAT is symmetric): ask fast
-            self.t_stun = now + 0.25
-            targets = list(self.stun_addrs)
-        elif self.mode == "host":
-            # Keep asking while hosting: this (a) keeps the router's UDP mapping from timing out
-            # (typically 30-60s idle) and (b) notices if the router gave us a different public
-            # port, so the room list never advertises a dead address.
-            self.t_stun = now + 8.0
-            targets = self.stun_addrs[:2]
-        else:
-            return
-        if len(self.stun_tids) > 120:
-            self.stun_tids.clear()
-        for a in targets:
-            tid = os.urandom(12)
-            self.stun_tids[tid] = a
-            try:
-                self.sock.sendto(struct.pack(">HHI", 1, 0, STUN_COOKIE) + tid, a)
-            except OSError:
-                pass
-
-    def _stun_reply(self, data):
-        mt, ln = struct.unpack_from(">HH", data, 0)
-        srv = self.stun_tids.get(data[8:20])
-        if mt != 0x0101 or srv is None:
-            return
-        p, end = 20, min(len(data), 20 + ln)
-        xor = mapped = None
-        while p + 4 <= end:
-            at, al = struct.unpack_from(">HH", data, p)
-            v = data[p + 4:p + 4 + al]
-            if at == 0x0020 and al >= 8 and v[1] == 1:
-                port = struct.unpack(">H", v[2:4])[0] ^ (STUN_COOKIE >> 16)
-                ip = bytes(a ^ b for a, b in zip(v[4:8], struct.pack(">I", STUN_COOKIE)))
-                xor = (".".join(str(x) for x in ip), port)
-            elif at == 0x0001 and al >= 8 and v[1] == 1:
-                mapped = (".".join(str(x) for x in v[4:8]), struct.unpack(">H", v[2:4])[0])
-            p += 4 + al + (-al % 4)
-        seen = xor or mapped
-        if not seen:
-            return
-        if not self.stun_obs:
-            self.t_pub1 = time.time()
-        self.stun_obs[srv] = seen
-        # Our public address = the answer of the first server in our list that replied.
-        order = {a: i for i, a in enumerate(self.stun_addrs)}
-        first = min(self.stun_obs, key=lambda a: order.get(a, 99))
-        newpub = self.stun_obs[first]
-        ports = sorted({o[1] for o in self.stun_obs.values()})
-        self.pports = ports[:8]
-        # different servers saw different ports = the router picks a new public port per destination
-        newsym = len(ports) > 1
-        changed = (newpub != self.pub) or (newsym != self.sym)
-        self.pub, self.sym = newpub, newsym
-        if self.pub and self.mode == "host" and changed:
-            self.t_ann = 0.0          # announce the (new) public address right away
-            self.status = "Hosting '%s' - friends can join from the server browser, no port forwarding needed." % self.room
 
     # ----- sockets -----
     def _open_udp(self, port=0, tries=1):
@@ -677,29 +306,16 @@ class Net:
                 if self.sock is None or self.sock.fileno() < 0:
                     break
                 continue
-            if len(data) >= 20 and data[4:8] == struct.pack(">I", STUN_COOKIE):
-                self._stun_reply(data)
-                continue
             try:
                 pkt = json.loads(data)
             except ValueError:
                 continue
             self._route(pkt, addr)
 
-    def _learn_punch(self, addr):
-        """The host's punch packets arrive from the port its router really uses toward us. When that
-        differs from the address it announced (symmetric NAT), start sending our hello there too."""
-        c = self.conn
-        if self.mode != "joining" or c is None or c.locked or addr in c.addrs or len(c.addrs) >= 8:
-            return
-        if addr[0] in {a[0] for a in self._jcands}:
-            c.addrs.append(addr)
-
     def _route(self, pkt, addr):
         if not isinstance(pkt, dict):
             return
-        if "p" in pkt:        # "p" = hole-punch noise, but it also tells a joiner where the host really is
-            self._learn_punch(addr)
+        if "p" in pkt:        # stray keep-alive noise
             return
         c = None
         if self.mode == "host":
@@ -716,15 +332,6 @@ class Net:
             c = self.conn
         if c is not None:
             c.feed(pkt, addr)
-
-    def _stun_reset(self):
-        self.pub = None
-        self.sym = False
-        self.pports = []
-        self.stun_obs = {}
-        self.stun_tids.clear()
-        self.t_pub1 = 0.0
-        self.t_stun = 0.0
 
     # ----- host / join / leave -----
     def nplayers(self):
@@ -745,59 +352,25 @@ class Net:
         self.rid = "%08x" % random.getrandbits(32)
         self.my_id = 0
         self.my_team = team
-        self.players, self.peers, self.pending, self.by_addr, self.punch = {}, {}, [], {}, []
-        self.spray = []
+        self.players, self.peers, self.pending, self.by_addr = {}, {}, [], {}
         self.next_id = 1
         self.map_sig, self.pname = map_sig, pname
-        self._stun_reset()
-        self.pub_warned = False
         self.host_t0 = time.time()
-        self.t_ann = 0.0
-        self.t_stun = 0.0
-        self._stun_start()
-        self.broker.sub("%s/sig/%s" % (BROKER_ROOT, self.rid))
-        self.status = "Hosting '%s' - finding your public address..." % room
+        self.status = "Hosting '%s' on your network (LAN / virtual LAN). Your address: %s:%d" % (room, lan_ip(), self.port)
         return True
 
     @staticmethod
     def room_cands(r):
-        """Addresses to try for a room-browser entry."""
-        out, seen = [], set()
-
-        def add(ip, port):
-            try:
-                a = (str(ip), int(port))
-            except (TypeError, ValueError):
-                return
-            if a in seen:
-                return
-            seen.add(a)
-            out.append(a)
-
-        if r.get("src") == "lan":
-            add(r["ip"], r["port"])
-        else:
-            lan = r.get("lan")
-            mine = lan_ip()
-            # Prefer LAN when both ends look like the same private subnet
-            if lan and mine.count(".") == 3 and str(lan[0]).count(".") == 3:
-                if mine.rsplit(".", 1)[0] == str(lan[0]).rsplit(".", 1)[0]:
-                    add(lan[0], lan[1])
-                # Also try LAN address first for common private ranges (same router / VPN)
-                elif str(lan[0]).startswith(("10.", "192.168.", "172.")):
-                    add(lan[0], lan[1])
-            add(r["ip"], r["port"])
-            if lan:
-                add(lan[0], lan[1])
-        return out
+        """Address to try for a room-list entry."""
+        try:
+            return [(str(r["ip"]), int(r["port"]))]
+        except (KeyError, TypeError, ValueError):
+            return []
 
     def join_room(self, r, pname, map_sig):
-        info = None
-        if r.get("src") == "net":
-            info = {"ip": r.get("ip", ""), "sym": bool(r.get("sym")), "pp": list(r.get("pp") or [])}
-        return self.join(self.room_cands(r), r["id"] if r.get("src") == "net" else None, pname, map_sig, info)
+        return self.join(self.room_cands(r), pname, map_sig)
 
-    def join(self, cands, rid, pname, map_sig, info=None):
+    def join(self, cands, pname, map_sig):
         self.leave()
         self.start_discovery()
         sock = self._open_udp()
@@ -808,29 +381,14 @@ class Net:
         self.port = sock.getsockname()[1]
         self.mode = "joining"
         self.pname, self.map_sig = pname, map_sig
-        self._stun_reset()
-        self.join_rid = rid
         self.join_t0 = time.time()
-        self.t_sig = 0.0
-        self._join_pub_sent = False
-        self._join_punch_t = 0.0
         self._join_sec = -1
-        self._stun_start()
-        self.jid = "%08x" % random.getrandbits(32)      # same for the whole join, even across retries
-        self.cid = "%08x" % random.getrandbits(32)      # new for every attempt
+        self.jid = "%08x" % random.getrandbits(32)
+        self.cid = "%08x" % random.getrandbits(32)
         self._jcands = list(cands)
-        self._try_t0 = time.time()
-        self._join_try = 1
-        self._hip = str((info or {}).get("ip", ""))
-        self._hsym = bool((info or {}).get("sym"))
-        self._hpp = list((info or {}).get("pp") or [])
-        self._jspray = None
-        if self._hsym and self._hpp and self._hip:
-            lo, hi = max(1, min(self._hpp) - SPRAY_BEFORE), min(65535, max(self._hpp) + SPRAY_AFTER)
-            self._jspray = [self._hip, lo, hi, lo]
         self.conn = UConn(self.mux, cands)
         self.conn.send(self._hello())
-        self.status = "Connecting to the server (direct peer-to-peer, up to %ds)..." % JOIN_TIMEOUT
+        self.status = "Connecting to the server (up to %ds)..." % JOIN_TIMEOUT
         return True
 
     def _hello(self):
@@ -838,14 +396,6 @@ class Net:
                 "cid": self.cid, "jid": self.jid}
 
     def leave(self, status=None):
-        if self.mode == "host" and self.rid:
-            # kill the retained announcement, and remember the room locally so a stored copy on
-            # any broker that missed the delete can never bring the closed room back
-            self._dead[self.rid] = time.time()
-            self.net_rooms.pop(self.rid, None)
-            self._rts.pop(self.rid, None)
-            self.broker.pub("%s/rooms/%s" % (BROKER_ROOT, self.rid), None, retain=True)
-            self.broker.unsub("%s/sig/%s" % (BROKER_ROOT, self.rid))
         for c in list(self.peers.values()):
             c.bye()
         if self.conn:
@@ -860,19 +410,15 @@ class Net:
             except OSError:
                 pass
         self.sock = self.conn = None
-        self.peers, self.pending, self.by_addr, self.punch, self.players = {}, [], {}, [], {}
-        self.spray, self._jspray = [], None
+        self.peers, self.pending, self.by_addr, self.players = {}, [], {}, {}
         self.mode = None
         self.rid = ""
         self.my_id = 0
-        self._stun_reset()
-        self.join_rid = None
         if status is not None:
             self.status = status
 
     def close(self):
         self.leave()
-        self.broker.close()
         if self.udp:
             try:
                 self.udp.close()
@@ -926,10 +472,8 @@ class Net:
     def poll(self, now):
         msgs = []
         self._disc(now)
-        self._broker_poll(now)
         if self.sock:
             self._pump(now)
-            self._stun_tick(now)
         if self.mode == "host":
             self._poll_host(now, msgs)
         elif self.mode == "joining":
@@ -939,31 +483,6 @@ class Net:
         return msgs
 
     def _poll_host(self, now, msgs):
-        if self.pub and now - self.t_ann >= 2.0:          # re-announce every 2s so a dead room is noticed fast
-            self._announce(now)
-        if not self.pub and not self.pub_warned and now - self.host_t0 > 6.0:
-            self.pub_warned = True
-            self.status = ("Hosting '%s' - could not find your public address (is UDP blocked?). "
-                           "Only players on your network can join." % self.room)
-        for pu in self.punch[:]:
-            if now > pu[1]:
-                self.punch.remove(pu)
-            elif now >= pu[2]:
-                pu[2] = now + 0.05   # fire often: keeps both NATs open during join
-                try:
-                    self.sock.sendto(b'{"p":1}', pu[0])
-                except OSError:
-                    pass
-        for sp in self.spray[:]:
-            if now > sp[3]:
-                self.spray.remove(sp)
-                continue
-            for _ in range(SPRAY_PER_TICK):      # guess the ports a symmetric-NAT joiner will come from
-                try:
-                    self.sock.sendto(b'{"p":1}', (sp[0], sp[4]))
-                except OSError:
-                    pass
-                sp[4] = sp[1] if sp[4] >= sp[2] else sp[4] + 1
         for c in list(self.pending):
             for m in c.read():
                 if m.get("t") != "hello":
@@ -986,7 +505,7 @@ class Net:
                 elif m.get("map") != self.map_sig:
                     why = f"Different map. The host uses '{self.map_sig}', you have '{m.get('map')}'. Load the same map first."
                 if why:
-                    c.send({"t": "deny", "why": why})
+                    c.send({"t": "deny", "why": why, "map": self.map_sig})
                     for _ in range(2):
                         c.unacked and c._raw(list(c.unacked.values())[-1][0])
                     self._forget(c)
@@ -1037,72 +556,13 @@ class Net:
             if c.dead or now - c.last > 10:
                 self._drop(c, msgs)
 
-    def _retry_join(self, now):
-        """Nothing answered yet. A fresh socket (new public port) + new attempt id often works where
-        the first try got stuck on a stale NAT mapping or a lost signal. The join keeps its jid, so
-        the host throws away any half-open link from the earlier try."""
-        sock = self._open_udp()
-        if sock is None:
-            return
-        old_sock, old_conn = self.sock, self.conn
-        if old_conn:
-            old_conn.close()
-        if old_sock:
-            try:
-                old_sock.close()
-            except OSError:
-                pass
-        self.sock = sock
-        self.port = sock.getsockname()[1]
-        self._stun_reset()
-        self.t_sig = 0.0
-        self._join_pub_sent = False
-        self._join_punch_t = 0.0
-        self.cid = "%08x" % random.getrandbits(32)
-        self._try_t0 = now
-        self._join_try += 1
-        self.conn = UConn(self.mux, self._jcands)
-        self.conn.send(self._hello())
-
     def _poll_joining(self, now, msgs):
         c = self.conn
-        # After STUN resolves, re-send hello so the host sees the correct return path
-        if self.pub and not self._join_pub_sent:
-            self._join_pub_sent = True
-            self.t_sig = 0.0
-            c.send(self._hello())
-        if self.join_rid and now - self.t_sig >= 0.25 and (self.pub or now - self.join_t0 > 0.6):
-            # tell the host (via the broker) where to punch through to us
-            self.t_sig = now
-            self.broker.pub("%s/sig/%s" % (BROKER_ROOT, self.join_rid), {
-                "t": "punch", "cid": self.cid, "n": self.pname,
-                "pub": list(self.pub) if self.pub else None, "lan": [lan_ip(), self.port],
-                "sym": 1 if self.sym else 0, "pp": self.pports[:8]})
-        # Joiner must also punch the host (classic simultaneous UDP open)
-        if c and c.addrs and now - self._join_punch_t >= 0.05:
-            self._join_punch_t = now
-            for a in list(c.addrs):
-                try:
-                    self.sock.sendto(b'{"p":1}', a)
-                except OSError:
-                    pass
-            if self._jspray and not c.locked:
-                # host's NAT picks a new public port per destination: our hello has to land on
-                # the one it opens toward us, so try every port it is likely to be
-                sp = self._jspray
-                hello = json.dumps({"q": 1, "a": 0, "m": self._hello()}, separators=(",", ":")).encode()
-                for _ in range(SPRAY_PER_TICK):
-                    try:
-                        self.sock.sendto(hello, (sp[0], sp[3]))
-                    except OSError:
-                        pass
-                    sp[3] = sp[1] if sp[3] >= sp[2] else sp[3] + 1
         c.flush()
         sec = int(now - self.join_t0)
         if sec != self._join_sec:
             self._join_sec = sec
-            self.status = "Connecting to the server (direct peer-to-peer, attempt %d, %ds / %ds)..." % (
-                self._join_try, sec, JOIN_TIMEOUT)
+            self.status = "Connecting to the server (%ds / %ds)..." % (sec, JOIN_TIMEOUT)
         for m in c.read():
             t = m.get("t")
             if t == "welcome":
@@ -1115,21 +575,14 @@ class Net:
                 CFG["frags"] = int(m.get("frags", CFG["frags"]))
                 FX.day = bool(m.get("day", 0))       # the host picks night / day for the map
                 self.status = f"Joined '{self.room}'."
-                self._jspray = None
                 msgs.append(m)
             elif t == "deny":
                 self.leave("Denied: " + str(m.get("why", "Denied.")))
-                msgs.append({"t": "failed"})
+                msgs.append({"t": "failed", "map": str(m.get("map", "")), "cands": list(self._jcands)})
                 return
-        if (self.mode == "joining" and not c.dead and not c.locked
-                and now - self._try_t0 > JOIN_RETRY and now - self.join_t0 < JOIN_TIMEOUT - JOIN_RETRY + 3.0):
-            self._retry_join(now)
-            return
         if self.mode == "joining" and (c.dead or now - self.join_t0 > JOIN_TIMEOUT):
-            why = ("Could not reach the server directly. Both of you should: "
-                   "1) stay in the game while connecting  2) allow the game through the firewall  "
-                   "3) make sure neither network blocks UDP (a phone hotspot is a good test). "
-                   "If both of you are on mobile / carrier-grade NAT, a direct connection is impossible.")
+            why = ("Could not reach the host. Check that you are on the same network (or the same Radmin VPN / "
+                   "virtual LAN), that the address is right, and that the firewall allows the game (UDP).")
             self.leave(why)
             msgs.append({"t": "failed"})
 

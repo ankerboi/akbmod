@@ -79,6 +79,7 @@ class Game:
         self.remotes = {}
         self.my_team = 0
         self.net_notice = ""
+        self.last_map_path = ""
         self.net_joined = False
         self.res = (RENDER_W, RENDER_H)   # resolution the game renders at (typed in Settings > Video), stretched to the window
         self.aspect = 0.0  # 0 = match the window; else forced aspect (stretched to fill); 1.0 = 1:1
@@ -514,15 +515,15 @@ class Game:
         self.reset_game()
         return True
 
-    def net_join(self, room, rid=None):
-        """room: a room-browser entry (dict), or a list of (ip, port) addresses to try."""
+    def net_join(self, room):
+        """room: a room-list entry (dict), or a list of (ip, port) addresses to try."""
         self.join_msg = ""
         if isinstance(room, dict):
             ok, self.join_msg = self.use_map_sig(str(room.get("map", "none")))
             if not ok:
                 return False
             return self.net.join_room(room, self.player_name, self.map_sig())
-        return self.net.join(room, rid, self.player_name, self.map_sig())
+        return self.net.join(room, self.player_name, self.map_sig())
 
     def net_set_team(self, tm):
         """Switch to team tm (0 = BUM, 1 = FAD) while on a server; everyone is told."""
@@ -572,6 +573,15 @@ class Game:
         elif t in ("failed", "closed"):
             if t == "closed":
                 self.reset_game()
+            # joined by IP with a different map: if we have the host's map, load it and try again by itself
+            hm, cands = str(m.get("map", "")), m.get("cands")
+            if t == "failed" and cands and hm and hm != self.map_sig() and hm not in ("none", "arena") \
+                    and self.find_map_by_sig(hm) is not None:
+                ok, msg = self.use_map_sig(hm)
+                if ok and self.net.join([tuple(c) for c in cands], self.player_name, self.map_sig()):
+                    self.net_notice = ""
+                    self.join_msg = msg
+                    return
             self.net_notice = net.status or m.get("why", "")
         elif t == "join":
             pid = int(m["id"])
@@ -3058,13 +3068,37 @@ class Game:
             world = AkbMapWorld(json.loads(raw.decode("utf-8")))
         except Exception as ex:
             return f"Cannot load map {path.name}: {ex}"
-        self.files["map_raw"] = raw          # used for the online map signature
+        self.files["map_raw"] = raw          # used for the LAN map signature
         self.set_world(world)
         self.remember_map(raw)
+        self.last_map_path = str(path)
         extra = ", Source map" if getattr(world, "_bsp", None) else ""
         return f"Map loaded: {world.name} ({len(world.B)} boxes{extra})."
 
-    # --- online: find a map by its signature so joining a custom-map server just works ---
+    def auto_load_map(self):
+        """Load a map without asking: the last one you used, else the first .akbmap found in the map folders."""
+        if self.files.get("map_raw") or self.net.active:
+            return ""
+        cands = []
+        lp = getattr(self, "last_map_path", "")
+        if lp:
+            cands.append(Path(lp))
+        for d in self._map_dirs():
+            try:
+                cands.extend(sorted(d.rglob("*.akbmap")))
+            except Exception:
+                pass
+        for p in cands:
+            try:
+                if p.is_file():
+                    msg = self.load_map(p)
+                    if self.files.get("map_raw"):
+                        return msg
+            except Exception:
+                continue
+        return ""
+
+    # --- LAN: find a map by its signature so joining a custom-map server just works ---
     @staticmethod
     def _map_dirs():
         base = Path(__file__).resolve().parent
