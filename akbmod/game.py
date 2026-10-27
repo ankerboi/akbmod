@@ -3098,6 +3098,22 @@ class Game:
                 continue
         return ""
 
+    def map_search_report(self):
+        """Explain why no map was found: which folders were searched and what is in them."""
+        dirs = self._map_dirs()
+        if not dirs:
+            return "No map folder found. Create akbmod/assets/map (or mod/maps) and put a .akbmap in it."
+        other = []
+        for d in dirs:
+            try:
+                other += [p.name for p in d.iterdir() if p.is_file() and p.suffix.lower() in (".gma", ".bsp", ".zip", ".json", ".fadmap")]
+            except Exception:
+                pass
+        msg = "No .akbmap in: " + ", ".join(str(d) for d in dirs)[:120] + "."
+        if other:
+            msg += " Found %s - open it in the map editor (F5) to make a .akbmap." % other[0][:30]
+        return msg
+
     # --- LAN: find a map by its signature so joining a custom-map server just works ---
     @staticmethod
     def _map_dirs():

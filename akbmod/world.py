@@ -86,7 +86,7 @@ class AkbMapWorld(World):
     def __init__(self, d):
         import base64
         import zlib
-        if not isinstance(d, dict) or d.get("format") != "akbmap":
+        if not isinstance(d, dict) or d.get("format") not in ("akbmap", "fadmap"):
             raise ValueError("not a AKB-MOD map file")
         self.name = str(d.get("name", "map"))
         self.B, self.meta = [], []

@@ -1019,7 +1019,7 @@ class Menu:
         if not self.g.files.get("map_raw"):
             msg = self.g.auto_load_map()        # no map yet: load one by itself
             if not self.g.files.get("map_raw"):
-                self.status = "No map found. Put a .akbmap in the maps folder (mod/maps) or drop one on the window."
+                self.status = self.g.map_search_report()
                 return False
             self.status = msg
         return True

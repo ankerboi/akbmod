@@ -7,7 +7,7 @@ Run:  python map_builder.py        (missing packages install automatically)
 What you do
   1. Build with boxes (walls, floors, stairs, crates ...). Put an image on any box as its texture.
   2. Place spawn points for the BLACK team and the YELLOW team.
-  3. Press F5 (Compile). You get a .fadmap file.  In the game: Play > Load map  (or drag the file onto the game).
+  3. Press F5 (Compile). You get a .akbmap file.  In the game: Play > Load map  (or drag the file onto the game).
 
 Controls
   Camera   hold RIGHT mouse + mouse = look      W A S D = move     Q / E = down / up
@@ -55,7 +55,7 @@ Texture  DRAG an image file from your PC and DROP it on the face you want (that 
            down to climb, A / D to shuffle sideways, Jump to leap off. Select / move / stretch / spin / copy it like a box
            (R on a selected ladder turns its side).
   Source   Ctrl+I (or the Import button, or drop the file on the window) = load a Garry's Mod addon (.gma, or a Workshop
-  maps    legacy .bin), a Source addon package (.vpk) or map (.bsp). ALL of its geometry comes in: every brush, face and displacement is baked into the .fadmap, drawn
+  maps    legacy .bin), a Source addon package (.vpk) or map (.bsp). ALL of its geometry comes in: every brush, face and displacement is baked into the .akbmap, drawn
            with its textures and collided with exactly (slopes, angled walls, arches ...). Its player spawns come along, and its LADDERS
            (func_useableladder / func_ladder) become ladder zones (orange blocks) you can move, turn with R, or delete.
            Textures: the map's own pack is read; stock textures (hl2 / css / csgo / garrysmod) are found if those games
@@ -111,7 +111,7 @@ import pygame
 from OpenGL import GL as gl
 
 HERE = Path(__file__).resolve().parent
-MAP_FORMAT = "fadmap"
+MAP_FORMAT = "akbmap"          # what the game loads (old "fadmap" files are still read)
 MAP_VERSION = 1
 GRIDS = (8, 16, 32, 64, 128)
 TILES = (32, 64, 128, 256, 512, 1024)
@@ -645,7 +645,7 @@ def cube_to_equirect(faces, W=2048, H=1024):
 
 # --------------------------------------------------------------------------
 # Source engine maps (.gma / .bsp)
-#   The map is baked into the .fadmap as  "bsp": a triangle mesh (what you see)
+#   The map is baked into the .akbmap as  "bsp": a triangle mesh (what you see)
 #   + convex brushes (what you collide with).  Every brush, every face and every
 #   displacement of the map ends up in the game - not just boxes.
 # --------------------------------------------------------------------------
@@ -2821,7 +2821,7 @@ class MapDoc:
         return d
 
     def from_dict(self, d):
-        if d.get("format") != MAP_FORMAT:
+        if d.get("format") not in (MAP_FORMAT, "fadmap"):
             raise ValueError("not a FAD-MOD map file")
         self.tex = [decode_tex(t) for t in d.get("textures", [])]
         self.boxes = [Box(b["b"], b.get("t", -1), b.get("tt"), b.get("tile", 128), b.get("c", DEFAULT_COL), b.get("f"), b.get("k", 0), b.get("d", 0), b.get("yaw", 0.0), b.get("px", 0), b.get("lad", 0))
@@ -3028,7 +3028,7 @@ def compile_doc(doc, out_path, progress=None):
     d["bounds"] = [round(min(b[i] for b in bl), 1) for i in range(3)] + [round(max(b[i + 3] for b in bl), 1) for i in range(3)]
     for e in d["boxes"][len(boxes):]:         # the last ones are the decals: the game makes them non-solid
         e["dc"] = 1
-    say("Writing .fadmap file...", 0.88)
+    say("Writing .akbmap file...", 0.88)
     raw = json.dumps(d, separators=(",", ":")).encode("utf-8")
     Path(out_path).write_bytes(raw)
     say("Done", 1.0)
@@ -4713,10 +4713,10 @@ class App:
     def save(self, as_new=False):
         path = self.doc.path
         if as_new or not path:
-            path = ask_save((self.doc.name or "my_map") + ".fadproj", ".fadproj", "Save project")
+            path = ask_save((self.doc.name or "my_map") + ".akbproj", ".akbproj", "Save project")
             if not path:
                 if not as_new and not self.doc.path and _tk_dialog(lambda fd: True) is None:
-                    path = str(HERE / (self.doc.name + ".fadproj"))     # no file dialog available
+                    path = str(HERE / (self.doc.name + ".akbproj"))     # no file dialog available
                 else:
                     return None
         path = str(path)
@@ -4817,7 +4817,7 @@ class App:
             self.clear_progress()
 
     def open_project(self, path=None):
-        path = path or ask_open([("Map project / Source map", "*.fadproj *.fadmap *.bin *.bsp *.gma *.vpk")], "Open map")
+        path = path or ask_open([("Map project / Source map", "*.akbproj *.fadproj *.akbmap *.fadmap *.bin *.bsp *.gma *.vpk")], "Open map")
         if not path:
             return
         if str(path).lower().endswith((".bin", ".bsp", ".gma", ".vpk")):
@@ -4838,7 +4838,7 @@ class App:
             for t in doc.tex + ([doc.sky] if doc.sky else []):
                 t.upload()
             self.set_progress(0.95, "Almost done...")
-            doc.path = path if str(path).endswith(".fadproj") else None
+            doc.path = path if str(path).lower().endswith((".akbproj", ".fadproj")) else None
             doc.name = Path(path).stem
             self.doc = doc
             self.reset_cube_gl()
@@ -4860,7 +4860,7 @@ class App:
             if not self.save():
                 self.msg("Save the project first, then compile.")
                 return
-        out = Path(self.doc.path).with_suffix(".fadmap")
+        out = Path(self.doc.path).with_suffix(".akbmap")
         try:
             self.set_progress(0.05, "Compiling map...")
             def prog(text, frac=None):
@@ -4892,7 +4892,7 @@ class App:
             self.W, self.H = pygame.display.get_window_size()
         elif t == pygame.DROPFILE:
             p = ev.file
-            if p.lower().endswith((".fadproj", ".fadmap", ".gma", ".bin", ".vpk", ".bsp")):
+            if p.lower().endswith((".akbproj", ".fadproj", ".akbmap", ".fadmap", ".gma", ".bin", ".vpk", ".bsp")):
                 self.open_project(p)
             else:
                 pos = getattr(ev, "pos", None)
