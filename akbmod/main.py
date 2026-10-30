@@ -55,6 +55,20 @@ from akbmod.render import render_scene, render_hud
 from akbmod.settings import load_settings, save_settings, set_fullscreen, file_dialog
 
 def main():
+    # Spacewar (480): write steam_appid.txt and talk to Steam *before* the window opens,
+    # so the client shows "Playing Spacewar" and avatars can load.
+    try:
+        from akbmod.steam import get_steam, _write_appid
+        _write_appid()
+        _steam = get_steam()
+        if _steam.connect():
+            print("[steam]", _steam.status_hint)
+        else:
+            print("[steam]", _steam.status_hint)
+    except Exception as ex:
+        print("[steam] init skipped:", ex)
+        _steam = None
+
     if sys.platform == "win32":
         try:
             import ctypes
@@ -116,6 +130,25 @@ def main():
     menu = Menu(game, gfx, launch, file_dialog)
     game.menu = menu               # lets the scoreboard draw your profile picture
     load_settings(game, menu)
+    # Always use Steam username + avatar (dll or local Steam install fallback)
+    try:
+        from akbmod.steam import get_steam
+        st = get_steam()
+        if not st.available:
+            st.connect()  # retry after pygame is up
+        if st.available:
+            if st.persona:
+                menu.name = st.persona[:24]
+            menu.apply_steam_avatar(st, force=True)
+            menu.status = st.status_hint
+            game.player_name = menu.name
+            game.P.name = menu.name
+            print("[steam]", st.status_hint, "id=", st.me)
+        else:
+            print("[steam]", st.status_hint)
+            menu.status = st.status_hint
+    except Exception as ex:
+        print("[steam] avatar:", ex)
     game.set_world(NoMapWorld())
     amsg = game.auto_load_map()          # maps load by themselves: last used map, else the first one found
     if amsg:
@@ -361,6 +394,18 @@ def main():
         last = now
         if raw_dt > 0:   # smoothed FPS for the counter
             game.fps_val = game.fps_val * 0.9 + (1.0 / raw_dt) * 0.1 if game.fps_val else 1.0 / raw_dt
+        try:
+            from akbmod.steam import get_steam
+            st = get_steam()
+            if st.available:
+                st.run_callbacks()
+                if menu is not None:
+                    if st.persona:
+                        menu.name = st.persona[:24]
+                    if not menu.pfp_tex or menu.pfp_path == "steam":
+                        menu.apply_steam_avatar(st)
+        except Exception:
+            pass
         game.update(dt)
         if game.net_joined:           # the host accepted us: drop straight into the room
             game.net_joined = False

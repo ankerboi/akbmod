@@ -198,11 +198,9 @@ class RenderTarget:
         gl.glEnd()
 
 
-# Stratum has a short line box (ascent .75em) and the menus were laid out for a taller font (Segoe UI, caps centre
-# ~.73em from the top vs .42em here), so its text is drawn this many em lower to keep the original alignment.
-STRATUM_DY = 0.30
-# Text that used the monospace font (ammo, kill streak number, scoreboard numbers): Consolas' caps centre is ~.46em
-# from the top, almost the same as Stratum's .42em, so it needs only a tiny shift.
+# Vertical nudge for the UI font so caps sit where the menu layout expects them.
+# DINOT-Medium is taller than Stratum; a smaller shift keeps baseline alignment.
+STRATUM_DY = 0.12
 STRATUM_DY_MONO = 0.04
 
 
@@ -210,17 +208,19 @@ _UI_FONT = None
 
 
 def _ui_font_path():
-    """Find the UI font: assets/font/stratum.ttf first, else the first .ttf/.otf in assets/font/, else the old
-    assets/stratum.ttf location."""
+    """Find the UI font: prefer assets/font/DINOT-Medium.ttf, then stratum.ttf, then any .ttf/.otf in assets/font/."""
     global _UI_FONT
     if _UI_FONT is None:
         assets = Path(__file__).parent / "assets"
         fdir = assets / "font"
-        cand = fdir / "stratum.ttf"
-        if not cand.is_file():
+        for name in ("DINOT-Medium.ttf", "dinot-medium.ttf", "DINOT.ttf", "stratum.ttf"):
+            cand = fdir / name
+            if cand.is_file():
+                _UI_FONT = cand
+                break
+        if _UI_FONT is None:
             found = sorted(p for p in fdir.glob("*") if p.suffix.lower() in (".ttf", ".otf")) if fdir.is_dir() else []
-            cand = found[0] if found else assets / "stratum.ttf"
-        _UI_FONT = cand
+            _UI_FONT = found[0] if found else assets / "stratum.ttf"
     return _UI_FONT
 
 
@@ -235,10 +235,10 @@ class Gfx:
         self.ox, self.oy, self.sc = ox, oy, sc
 
     def font(self, size, bold, mono=False, face=None):
-        face = face or "stratum"       # Stratum is the default UI font; face="sys" forces the system font
+        face = face or "stratum"       # "stratum" key = custom UI font (DINOT-Medium); face="sys" = system font
         k = (size, bold, mono, face)
         if k not in self.fonts and face == "stratum":
-            try:      # the sMove HUD font, looked up in assets/font/ (falls back to assets/stratum.ttf)
+            try:      # custom UI font from assets/font/ (DINOT-Medium preferred)
                 self.fonts[k] = pygame.font.Font(str(_ui_font_path()), size)
             except Exception:
                 face = "sys"

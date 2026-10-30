@@ -400,6 +400,21 @@ def spray_pattern(n):
 
 HM_TIME = 0.28   # how long the hit marker shows (seconds)
 
+# Monochrome HUD style (port of Bevy hud.rs): no team blue/yellow on UI chrome
+PANEL = (25 / 255, 25 / 255, 25 / 255, 1.0)
+GREY = (118, 118, 118)
+LIGHT = (235, 235, 235)          # accent / near-white (was blue)
+BAND = (48 / 255, 48 / 255, 48 / 255, 1.0)
+FEED_PANEL = (25 / 255, 25 / 255, 25 / 255, 0.94)
+STREAK_PANEL = (0.10, 0.10, 0.10, 0.62)
+
+
+def _feed_look(team):
+    """team 0 = light band + dark text, team 1 = dark band + light text (monochrome)."""
+    if int(team) == 0:
+        return (LIGHT[0] / 255, LIGHT[1] / 255, LIGHT[2] / 255, 1.0), (25, 25, 25)
+    return BAND, LIGHT
+
 
 def draw_hitmarker(cx, cy, t, kill):
     """Call of Duty style hit marker: four short diagonal ticks around the crosshair.
@@ -469,41 +484,30 @@ def draw_smove_hud(game, gfx, W, H, P):
 
 
 def draw_scoreboard(game, gfx, W, H):
-    """Hold Tab: big team logos + names on each side, the score in the middle, player tables under them."""
+    """Hold Tab: player tables on each side, score in the middle gap (no team flags)."""
     colw = min(470, (W - 120) / 2)
     gap = 120
     rh = 28
     rows = max(1, max(sum(1 for e in game.ents if e.team == 0), sum(1 for e in game.ents if e.team == 1)))
-    head_h, th_h = 104, 26
+    head_h, th_h = 12, 26   # no logo header — just a thin top pad
     total_w = colw * 2 + gap
     total_h = head_h + th_h + rows * rh + 24
     x0 = W / 2 - total_w / 2
     top = max(20, H / 2 - total_h / 2)
-    gfx.rr(x0 - 16, top - 12, total_w + 32, total_h + 24, (14 / 255, 14 / 255, 14 / 255, .93))
-    LOGO = 84
+    gfx.rr(x0 - 16, top - 12, total_w + 32, total_h + 24, STREAK_PANEL, r=12)
     sc = game.score
-    accent = ((210, 210, 210), (210, 210, 210))
-    # header: logo + name on the outer edges, score in the middle
-    for team in (0, 1):
-        x = x0 + team * (colw + gap)
-        col = accent[team]
-        if team == 0:
-            lg = draw_team_logo(x, top + 4, LOGO, 0)
-            if not lg:   # logo only; the name is just a fallback when no logo could be drawn
-                gfx.text(TEAM_NAMES[0], x + 6, top + 30, 34, (255, 255, 255), bold=True)
-        else:
-            lg = draw_team_logo(x + colw - LOGO, top + 4, LOGO, 1)
-            if not lg:
-                gfx.text(TEAM_NAMES[1], x + colw - 6, top + 30, 34, (255, 255, 255), bold=True, anchor="r")
-        gfx.rect(x, top + head_h - 4, colw, 3, (col[0] / 255, col[1] / 255, col[2] / 255, 1))
+    # tables first (y of header row used to place the score)
+    table_y = top + head_h + 4
     mid = W / 2
-    gfx.text(str(sc[0]), mid - 22, top + 26, 44, (255, 255, 255), bold=True, anchor="r", mono=True)
-    gfx.text(str(sc[1]), mid + 22, top + 26, 44, (255, 255, 255), bold=True, anchor="l", mono=True)
-    gfx.rect(mid - 1, top + 22, 2, 50, (1, 1, 1, .25))
+    # score aligned with the first player row (name / kills / deaths)
+    score_y = table_y + th_h + (rh - 40) / 2
+    gfx.text(str(sc[0]), mid - 14, score_y, 40, (255, 255, 255), bold=True, anchor="r", mono=True)
+    gfx.text(str(sc[1]), mid + 14, score_y, 40, (255, 255, 255), bold=True, anchor="l", mono=True)
+    gfx.rect(mid - 1, score_y - 4, 2, 44, (1, 1, 1, .25))
     # tables
     for team in (0, 1):
         x = x0 + team * (colw + gap)
-        y = top + head_h + 4
+        y = table_y
         gfx.rect(x, y, colw, th_h, (30 / 255, 30 / 255, 30 / 255, 1))
         gfx.text("PLAYER", x + 12, y + 6, 11, (154, 154, 154), bold=True)
         gfx.text("KILLS", x + colw - 70, y + 6, 11, (154, 154, 154), bold=True, anchor="r")
@@ -514,7 +518,7 @@ def draw_scoreboard(game, gfx, W, H):
         for i, e in enumerate(members):
             if e.isP:
                 gfx.rect(x, y, colw, rh, (48 / 255, 48 / 255, 48 / 255, 1))
-                gfx.rect(x, y, 3, rh, (157 / 255, 211 / 255, 103 / 255, 1))
+                gfx.rect(x, y, 3, rh, (LIGHT[0] / 255, LIGHT[1] / 255, LIGHT[2] / 255, 1))
             else:
                 v = 24 if i % 2 else 19
                 gfx.rect(x, y, colw, rh, (v / 255, v / 255, v / 255, 1))
@@ -522,7 +526,7 @@ def draw_scoreboard(game, gfx, W, H):
             nx = x + 12
             _m = getattr(game, "menu", None)
             if e.isP and _m is not None and getattr(_m, "pfp_tex", None):
-                gfx.rect(x + 11, y + 3, 22, 22, (157 / 255, 211 / 255, 103 / 255, 1))
+                gfx.rect(x + 11, y + 3, 22, 22, (LIGHT[0] / 255, LIGHT[1] / 255, LIGHT[2] / 255, 1))
                 gl.glEnable(gl.GL_TEXTURE_2D)
                 gl.glBindTexture(gl.GL_TEXTURE_2D, _m.pfp_tex)
                 gl.glColor4f(1, 1, 1, 1)
@@ -574,22 +578,19 @@ def render_hud(game, gfx, W, H, menu_visible):
     if game.over:
         gfx.text(TEAM_NAMES[0 if sc[0] > sc[1] else 1] + " wins!", W / 2, 62, 20, (255, 255, 255), bold=True, anchor="c")
 
-    # Minimal health indicator: dark gray track + bar (green, red under 30 HP), no number or cross.
+    # Health bar (Bevy hud.rs): fixed bottom-left, PANEL track + white fill
     hp_value = max(0, min(100, math.ceil(P.hp / 2)))
     hp_ratio = hp_value / 100.0
-    bar_x = max(28, W / 2 - 300)  # move health bar farther left
-    bar_y = H - 51
-    bar_w, bar_h = 110, 8
-    if P.alive:
-        gfx.rect(bar_x, bar_y, bar_w, bar_h, (22 / 255, 22 / 255, 22 / 255, .94))  # dark gray background
+    bar_x, bar_y, bar_w, bar_h = 50, H - 48, 150, 8
+    if P.alive and not (P.zoom and P.w == 0):
+        gfx.rect(bar_x, bar_y, bar_w, bar_h, PANEL)
         if hp_ratio > 0:
-            hp_col = (0.86, 0.15, 0.15, 0.98) if hp_value < 30 else (0.25, 0.78, 0.34, 0.98)
-            gfx.rect(bar_x, bar_y, bar_w * hp_ratio, bar_h, hp_col)
+            gfx.rect(bar_x, bar_y, bar_w * hp_ratio, bar_h, (1, 1, 1, 1))
     w = CFG["weapons"][P.w]
     # Weapon HUD: guns show only the ammo counter, the knife shows its name; both on a dark panel like the HP bar.
     hud_txt = w.n if w.melee else f"{P.ammo[P.w]} / {w.mag}"
     hud_w = gfx.text_w(hud_txt, 22, True, True)
-    gfx.rect(W - 22 - hud_w - 12, H - 50 - 6, hud_w + 24, 22 + 12, (22 / 255, 22 / 255, 22 / 255, .94))  # same dark gray as HP background
+    gfx.rect(W - 22 - hud_w - 12, H - 50 - 6, hud_w + 24, 22 + 12, PANEL)
     gfx.text(hud_txt, W - 22, H - 50, 22, (255, 255, 255), bold=True, anchor="r", mono=True)
     # reload progress: thin white line right under the dark panel (fills left to right, replaces the "(reloading)" text)
     if P.reloadT > 0 and not w.melee:
@@ -606,12 +607,12 @@ def render_hud(game, gfx, W, H, menu_visible):
         al_ = max(0.0, min(1.0, ln["t"] / 1.5))
         tg_ = "[%s] " % ln["tag"]
         tw_ = gfx.text_w(tg_, 10, True) + gfx.text_w(ln["text"], 10)
-        gfx.rr(10, cy_ - 2, tw_ + 12, 16, (22 / 255, 22 / 255, 22 / 255, .8 * al_))
-        gfx.text(tg_, 16, cy_, 10, (66, 165, 245), alpha=al_, bold=True)
+        gfx.rr(10, cy_ - 2, tw_ + 12, 16, (25 / 255, 25 / 255, 25 / 255, .8 * al_))
+        gfx.text(tg_, 16, cy_, 10, LIGHT, alpha=al_, bold=True)
         gfx.text(ln["text"], 16 + gfx.text_w(tg_, 10, True), cy_, 10, (255, 255, 255), alpha=al_)
         cy_ -= 19
 
-    # kill feed (same look as the scoreboard: dark panel, team-tinted name bands)
+    # kill feed (Bevy monochrome): dark panel, light/dark name bands (no yellow/blue)
     y = 18
     rh = 26
     for en in game.feed:
@@ -621,43 +622,61 @@ def render_hud(game, gfx, W, H, menu_visible):
         vw = gfx.text_w(en["victim"], 14, en["vl"]) + 20
         tw = kw + ww + vw
         x = W - 18 - tw
-        gfx.rr(x - 4, y - 4, tw + 8, rh + 8, (22 / 255, 22 / 255, 22 / 255, .94))
-        for sx, sw, team, mine in ((x, kw, en["kt"], en["kl"]), (x + kw + ww, vw, en["vt"], en["vl"])):
-            col = TEAM_CT if team == 0 else TEAM_T
-            gfx.rect(sx, y, sw, rh, team_tint(col))
-            if mine:
-                gfx.rect(sx, y + rh - 3, sw, 3, (1, 1, 1, 1) if col == TEAM_CT else (1, 214 / 255, 0, 1))
-        _kc = (0, 0, 0) if en["kt"] == 0 else (255, 214, 0)
-        _vc = (0, 0, 0) if en["vt"] == 0 else (255, 214, 0)
+        gfx.rr(x - 4, y - 4, tw + 8, rh + 8, FEED_PANEL)
+        for sx, sw, team in ((x, kw, en["kt"]), (x + kw + ww, vw, en["vt"])):
+            band, _ = _feed_look(team)
+            gfx.rect(sx, y, sw, rh, band)
+        _kb, _kc = _feed_look(en["kt"])
+        _vb, _vc = _feed_look(en["vt"])
         gfx.text(en["killer"], x + 10, y + 5, 14, _kc, bold=en["kl"], mono=True)
-        gfx.text(label, x + kw + ww / 2, y + 8, 11, (154, 154, 154), bold=True, anchor="c")
+        gfx.text(label, x + kw + ww / 2, y + 8, 11, GREY, bold=True, anchor="c")
         gfx.text(en["victim"], x + kw + ww + 10, y + 5, 14, _vc, bold=en["vl"], mono=True)
         y += rh + 12
 
-    # kill streak counter (under the kill feed)
+    # kill streak (Bevy): frosted panel + grey skull icon + near-white number
     if P.alive:
-        ky = 18 + 5 * 38 + 8   # fixed spot: just below the room for 5 kill feed rows
-        gfx.rect(W - 18 - 150, ky - 4, 150, 30, (22 / 255, 22 / 255, 22 / 255, .94))
-        gfx.text("KILL STREAK", W - 18 - 140, ky + 5, 11, (154, 154, 154), bold=True)
-        gfx.text(str(game.streak), W - 18 - 10, ky + 2, 20, (66, 165, 245), bold=True, anchor="r", mono=True)
+        ky = 18 + 5 * 38 + 8
+        sw = max(64, 28 + gfx.text_w(str(game.streak), 20, True, True) + 24)
+        sx = W - 18 - sw
+        gfx.rr(sx, ky - 4, sw, 36, STREAK_PANEL, r=12)
+        # skull icon (assets/image/skull.png), grey tint
+        sk = 22
+        from .gfx import mod_image
+        lg = mod_image("skull")
+        if lg:
+            tid, iw, ih = lg
+            k = sk / float(ih)
+            dw, dh = iw * k, ih * k
+            ox, oy = sx + 12, ky + (28 - dh) / 2
+            gl.glEnable(gl.GL_TEXTURE_2D)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
+            gl.glColor4f(0.55, 0.55, 0.55, 1)
+            gl.glBegin(gl.GL_QUADS)
+            gl.glTexCoord2f(0, 0); gl.glVertex2f(ox, oy)
+            gl.glTexCoord2f(1, 0); gl.glVertex2f(ox + dw, oy)
+            gl.glTexCoord2f(1, 1); gl.glVertex2f(ox + dw, oy + dh)
+            gl.glTexCoord2f(0, 1); gl.glVertex2f(ox, oy + dh)
+            gl.glEnd()
+            gl.glColor4f(1, 1, 1, 1)
+        else:
+            gfx.text("K", sx + 14, ky + 6, 16, GREY, bold=True)
+        gfx.text(str(game.streak), sx + sw - 12, ky + 4, 20, LIGHT, bold=True, anchor="r", mono=True)
 
-    # Health vignette removed: no red border at low HP.
-
-    # death screen (same look as the scoreboard)
+    # death screen (Bevy monochrome panel)
     if not P.alive:
         gfx.rect(0, 0, W, H, (0, 0, 0, .45))
         pw, ph = 380, 168
         px, py = W / 2 - pw / 2, H / 2 - ph / 2
-        gfx.rr(px - 12, py - 12, pw + 24, ph + 24, (22 / 255, 22 / 255, 22 / 255, .94))
-        gfx.text("AKB / ARENA", W / 2, py - 4, 12, (154, 154, 154), bold=True, anchor="c")
-        col = TEAM_CT if P.team == 0 else TEAM_T
-        gfx.rr(px, py + 22, pw, 34, team_tint(col))
-        gfx.text("ELIMINATED", px + 10, py + 30, 15, col, bold=True)
-        gfx.text(f"{P.kills} / {P.deaths}", px + pw - 10, py + 28, 22, col, bold=True, anchor="r")
-        gfx.text("KILLED BY", px + 10, py + 66, 11, (154, 154, 154), bold=True)
+        gfx.rr(px - 12, py - 12, pw + 24, ph + 24, PANEL)
+        gfx.text("AKB / ARENA", W / 2, py - 4, 12, GREY, bold=True, anchor="c")
+        # light band for ELIMINATED + score
+        gfx.rr(px, py + 22, pw, 34, (LIGHT[0] / 255, LIGHT[1] / 255, LIGHT[2] / 255, 1))
+        gfx.text("ELIMINATED", px + 10, py + 30, 15, (0, 0, 0), bold=True)
+        gfx.text(f"{P.kills} / {P.deaths}", px + pw - 10, py + 28, 22, (0, 0, 0), bold=True, anchor="r")
+        gfx.text("KILLED BY", px + 10, py + 66, 11, GREY, bold=True)
         gfx.rr(px, py + 84, pw, 24, (42 / 255, 42 / 255, 42 / 255, 1))
-        gfx.text(game.death_killer, px + 10, py + 88, 14, (66, 165, 245), bold=True, mono=True)
-        gfx.text(f"RESPAWNING IN {max(1, math.ceil(P.resp))}", W / 2, py + 130, 12, (154, 154, 154), bold=True, anchor="c")
+        gfx.text(game.death_killer, px + 10, py + 88, 14, LIGHT, bold=True, mono=True)
+        gfx.text(f"RESPAWNING IN {max(1, math.ceil(P.resp))}", W / 2, py + 130, 12, GREY, bold=True, anchor="c")
 
     # scoreboard (hold Tab)
     if game.keys.get("tab") or game.over:

@@ -1,6 +1,11 @@
-"""LAN play: UDP broadcast room discovery + direct UDP peer-to-peer (also works over a virtual LAN such as Radmin VPN / FreeLAN with Direct join by IP).
+"""Multiplayer: Steam Spacewar lobbies when available, else LAN / virtual-LAN rooms.
 
-Game traffic never goes through a server: players talk straight to each other over UDP. There is no internet room browser."""
+Matches the Rust rewrite (steam.rs / net.rs):
+  * rooms are listed with Create / Refresh / Join (marker akb = AKBARENA3)
+  * Steam app id 480 (Spacewar) when steam_api is present
+  * otherwise UDP discovery + peer-to-peer (LAN, Radmin VPN, FreeLAN, Join by IP)
+  * no dedicated game server — players talk to each other
+"""
 import json
 import os
 import random
@@ -17,13 +22,20 @@ except Exception:             # headless dedicated server: no OpenGL needed, onl
     class FX:
         day = False
 
+try:
+    from .steam import APP_ID as STEAM_APP_ID, MAGIC as STEAM_MAGIC, MAX_PLAYERS as STEAM_MAX, get_steam
+except Exception:
+    STEAM_APP_ID, STEAM_MAGIC, STEAM_MAX = 480, "AKBARENA3", 8
+    def get_steam():
+        return None
 
-NET_DISC_PORT = 27777          # LAN broadcast
+
+NET_DISC_PORT = 27777          # LAN broadcast (room discovery)
 NET_GAME_PORT = 27778          # preferred UDP game port (any free one is used if busy)
-NET_MAGIC = "AKBARENA2"
-NET_PROTO = 2
-NET_MAX_PLAYERS = 6
-NET_STATE_HZ = 40      # how often your position is sent online (was 25)
+NET_MAGIC = "AKBARENA3"        # same marker as the Rust / Spacewar lobbies
+NET_PROTO = 3                  # bumped with AKBARENA3 room fields
+NET_MAX_PLAYERS = 8            # match Rust MAX_PLAYERS
+NET_STATE_HZ = 30              # state packets per second (Rust SEND_HZ)
 NET_DROPPABLE = ("st", "shot")  # sent without resend, newest state wins
 
 JOIN_TIMEOUT = 30.0            # seconds a join may take before giving up
@@ -207,6 +219,8 @@ class Net:
         self.map_sig = "none"
         self.pname = "Player"
         self.score_cb = lambda: [0, 0]
+        # True when traffic goes through Steam's relay (slower state rate). LAN / direct P2P = False.
+        self.relayed = False
 
     @property
     def active(self):
@@ -214,7 +228,26 @@ class Net:
 
     @property
     def rooms(self):
+        """Open rooms for the Play tab (Create / Refresh / Join), newest first."""
         return dict(self.lan_rooms)
+
+    def room_list(self):
+        """Stable list of rooms for the menu (same shape as Rust RoomInfo)."""
+        rows = list(self.lan_rooms.values())
+        rows.sort(key=lambda r: (-r.get("seen", 0), r.get("n", "")))
+        return rows
+
+    def try_steam(self):
+        """Connect to Steam as Spacewar when the API library is present."""
+        st = get_steam()
+        if st is None:
+            return False
+        if st.available:
+            return True
+        ok = st.connect()
+        if ok:
+            self.status = st.status_hint
+        return ok
 
     # ----- LAN discovery (UDP broadcast) -----
     def start_discovery(self):
@@ -248,12 +281,27 @@ class Net:
                     continue
                 if not isinstance(j, dict) or j.get("g") != NET_MAGIC or j.get("id") == self.rid:
                     continue
+                # accept AKBARENA3 (and older AKBARENA2) room beacons — same fields as Steam RoomInfo
                 try:
-                    self.lan_rooms[j["id"]] = {
-                        "id": j["id"], "n": str(j.get("n", ""))[:28], "h": str(j.get("h", ""))[:16],
-                        "p": int(j.get("p", 1)), "m": int(j.get("m", NET_MAX_PLAYERS)),
-                        "ip": addr[0], "port": int(j.get("port", NET_GAME_PORT)),
-                        "map": str(j.get("map", "")), "seen": now, "src": "lan", "lan": None,
+                    rid = j["id"]
+                    self.lan_rooms[rid] = {
+                        "id": rid,
+                        "lobby": rid,  # same id used as lobby key in the menu
+                        "n": str(j.get("n", ""))[:40],
+                        "name": str(j.get("n", ""))[:40],
+                        "h": str(j.get("h", ""))[:24],
+                        "host_name": str(j.get("h", ""))[:24],
+                        "p": int(j.get("p", 1)),
+                        "players": int(j.get("p", 1)),
+                        "m": int(j.get("m", NET_MAX_PLAYERS)),
+                        "max": int(j.get("m", NET_MAX_PLAYERS)),
+                        "ip": addr[0],
+                        "port": int(j.get("port", NET_GAME_PORT)),
+                        "map": str(j.get("map", "")),
+                        "seen": now,
+                        "src": "lan",
+                        "lan": None,
+                        "akb": NET_MAGIC,
                     }
                 except (KeyError, ValueError, TypeError):
                     continue
@@ -356,7 +404,7 @@ class Net:
         self.next_id = 1
         self.map_sig, self.pname = map_sig, pname
         self.host_t0 = time.time()
-        self.status = "Hosting '%s' on your network (LAN / virtual LAN). Your address: %s:%d" % (room, lan_ip(), self.port)
+        self.status = "Room '%s' open (Spacewar-style / LAN). Friends on your network see it under Refresh. Address %s:%d" % (room, lan_ip(), self.port)
         return True
 
     @staticmethod
@@ -414,6 +462,7 @@ class Net:
         self.mode = None
         self.rid = ""
         self.my_id = 0
+        self.relayed = False
         if status is not None:
             self.status = status
 
@@ -498,7 +547,7 @@ class Net:
                     for old in [p for p in self.peers.values() if p.jid == jid]:
                         self._drop(old, msgs)       # same join, retried on a fresh socket: the old link is a ghost
                 why = None
-                if m.get("v") != NET_PROTO or m.get("g") != NET_MAGIC:
+                if m.get("v") not in (2, 3, NET_PROTO) or m.get("g") not in (NET_MAGIC, "AKBARENA2"):
                     why = "Game version mismatch."
                 elif self.nplayers() >= self.max_players:
                     why = "Server is full."

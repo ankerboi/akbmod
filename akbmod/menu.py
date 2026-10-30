@@ -47,6 +47,7 @@ class Menu:
         self.pfp_path = ""    # profile picture file
         self.pfp_tex = None
         self.pfp_status = ""
+        self.steam_id = 0  # last Steam id applied to pfp
         self.status = "No map loaded - pick one under Play > Create match > Load map."
         self.vm_prev = 0      # weapon shown in the viewmodel preview
         self.vm_dd = False    # preview dropdown open?
@@ -188,6 +189,8 @@ class Menu:
             self.gfx.set_xf(0, 0, 1)
 
     def _draw(self, W, H):
+        if self.page == "profile":
+            self.page = "play"
         g, gfx = self.g, self.gfx
         s_side = max(.4, min(W / 1000, H / 600))     # side menu scale (unchanged)
         KC = max(.4, min(1.0, MENU_CONTENT_SCALE))
@@ -201,12 +204,12 @@ class Menu:
         mx, my = self.mp
 
         gl.glDisable(gl.GL_DEPTH_TEST)
-        gfx.rect(0, 0, W, H, c255(10, 10, 10))
+        gfx.rect(0, 0, W, H, c255(25, 25, 25))
         gl.glPushMatrix()
         gl.glTranslatef(ox, oy, 0)
         gl.glScalef(s, s, 1)
 
-        gfx.rect(0, 0, LW, LH, c255(10, 10, 10))          # content: #0a0a0a
+        gfx.rect(0, 0, LW, LH, c255(25, 25, 25))          # content: #191919
         # ---- side menu: drawn at its own (original) size, hit areas converted to content units ----
         LHs = LH / m                                   # window height in side-menu units
         smx, smy = mx / m, my / m                      # mouse in side-menu units
@@ -215,7 +218,7 @@ class Menu:
         gfx.set_xf(ox, oy, s * m)
         gfx.rect(0, 0, 240, LHs, c255(22, 22, 22))          # sidebar: #161616
         # profile block: avatar with green rim + username
-        gfx.rect(18, 16, 40, 40, c255(157, 211, 103))
+        gfx.rect(18, 16, 40, 40, c255(235, 235, 235))
         if self.pfp_tex:
             gl.glEnable(gl.GL_TEXTURE_2D)
             gl.glBindTexture(gl.GL_TEXTURE_2D, self.pfp_tex)
@@ -242,13 +245,11 @@ class Menu:
             self.hot.append((0, y * m, 240 * m, 44 * m, lambda p=page: self.set_page(p), None))
 
         nav("Play", "play", 80)
-        nav("Profile", "profile", 124)
-        nav("Loadout", "loadout", 168)
-        nav("Skins", "skins", 212)
-        nav("Settings", "settings", 256)
+        nav("Loadout", "loadout", 124)
+        nav("Skins", "skins", 168)
+        nav("Settings", "settings", 212)
         if g.net.active:
             gfx.text("ONLINE: " + g.net.room[:18], 20, LHs - 48, 11, (104, 104, 104), mono=True)
-        gfx.text("AKB-MOD", 20, LHs - 26, 12, (154, 154, 154), bold=True)
 
         qy = LHs - 100
         qh = shover(20, qy, 200, 38)
@@ -283,7 +284,7 @@ class Menu:
         def slider(x, y, w, val, lo, hi, setter):
             t = (val - lo) / (hi - lo)
             gfx.rr(x, y + 8, w, 4, c255(42, 42, 42))
-            gfx.rr(x, y + 8, w * t, 4, c255(66, 165, 245))
+            gfx.rr(x, y + 8, w * t, 4, c255(235, 235, 235))
             gfx.rr(x + w * t - 6, y + 4, 12, 12, c255(230, 230, 230))
 
             def drag(mxl):
@@ -303,7 +304,7 @@ class Menu:
             net = g.net
             gfx.text("READY WHEN YOU ARE", cx, 32, 11, (119, 119, 119), bold=True)
             gfx.text("Enter the arena.", cx, 48, 34, (255, 255, 255), bold=True)
-            gfx.text("Play offline, or host / join a LAN game. Over the internet, use a virtual LAN (e.g. Radmin VPN) and Join by IP.",
+            gfx.text("Offline, or Online rooms (Steam Spacewar / LAN). Create a room, Refresh the list, Join a friend. Internet: Steam relay or virtual LAN.",
                      cx, 96, 13, (154, 154, 154))
 
             def field(x, y, w, h, key, ph):
@@ -397,9 +398,9 @@ class Menu:
                 if self.cm_open:
                     online = self.play_online
                     byy = 330 if online else 272
-                    panel(cx, 128, cw, byy + 38 + 24 - 128, "Create match", "Pick your options, then press Start match. Change your name in Profile.")
-                    dropdown(cx + 20, 204, 150, "mode", "MODE", "LAN" if online else "Offline",
-                             [("Offline", "offline"), ("LAN", "online")], set_mode)
+                    panel(cx, 128, cw, byy + 38 + 24 - 128, "Create match", "Pick your options, then press Start match. Name and picture come from Steam.")
+                    dropdown(cx + 20, 204, 150, "mode", "MODE", "Online" if online else "Offline",
+                             [("Offline", "offline"), ("Online", "online")], set_mode)
                     dropdown(cx + 182, 204, 150, "time", "TIME", "Day" if FX.day else "Night",
                              [("Night", "night"), ("Day", "day")], set_time)
                     if online:
@@ -411,7 +412,7 @@ class Menu:
                     gfx.text("Map: " + str(getattr(g.world, "name", "No map"))[:24], cx + 430, byy + 12, 12, (154, 154, 154))
                     miss = self.missing()
                     if miss:
-                        gfx.text("Pick mods in Skins first: " + ", ".join(miss), cx + 430, byy + 12, 11, (66, 165, 245))
+                        gfx.text("Pick mods in Skins first: " + ", ".join(miss), cx + 430, byy + 12, 11, (235, 235, 235))
                     ly = LH
                 else:
                     ly = 128
@@ -428,8 +429,8 @@ class Menu:
 
                 def draw_row(rx, ry, rw, nm, tm, me):
                     col_ = TEAM_CT if tm == 0 else TEAM_T
-                    gfx.box(rx, ry, rw, 28, c255(36, 36, 36), c255(157, 211, 103) if me else c255(48, 48, 48))
-                    gfx.rect(rx + 4, ry + 2, 24, 24, c255(157, 211, 103) if me else c255(60, 60, 60))
+                    gfx.box(rx, ry, rw, 28, c255(36, 36, 36), c255(235, 235, 235) if me else c255(48, 48, 48))
+                    gfx.rect(rx + 4, ry + 2, 24, 24, c255(235, 235, 235) if me else c255(60, 60, 60))
                     if me and self.pfp_tex:
                         gl.glEnable(gl.GL_TEXTURE_2D)
                         gl.glBindTexture(gl.GL_TEXTURE_2D, self.pfp_tex)
@@ -450,10 +451,12 @@ class Menu:
                     over = dragging and ((mx_ > cx + cw / 2) == bool(t_))
                     gfx.box(x0, ly + 44, colw_, LH - 22 - ly - 64,
                             c255(34, 46, 28) if over else c255(22, 22, 22),
-                            c255(157, 211, 103) if over else c255(42, 42, 42))
-                    gfx.rect(x0, ly + 44, colw_, 34, team_tint(TEAM_CT if t_ == 0 else TEAM_T))
-                    draw_team_logo(x0 + 4, ly + 46, 30, t_)
-                    gfx.text(TEAM_NAMES[t_], x0 + 44, ly + 52, 15, TEAM_CT if t_ == 0 else TEAM_T, bold=True)
+                            c255(235, 235, 235) if over else c255(42, 42, 42))
+                    # no team flags — monochrome header: Team 1 / Team 2
+                    hdr = c255(235, 235, 235) if t_ == 0 else c255(48, 48, 48)
+                    txt_c = (25, 25, 25) if t_ == 0 else (235, 235, 235)
+                    gfx.rect(x0, ly + 44, colw_, 34, hdr)
+                    gfx.text("Team %d" % (t_ + 1), x0 + 14, ly + 52, 15, txt_c, bold=True)
                     yy = ly + 86
                     for nm, tm, me in rows:
                         if tm != t_:
@@ -475,9 +478,11 @@ class Menu:
 
                 by, bh = ly, LH - 22 - ly
                 gfx.rr(cx, by, cw, bh, c255(17, 17, 17))
-                gfx.text("Server browser", cx + 20, by + 12, 14, (255, 255, 255), bold=True)
-                button(cx + 20, by + 36, 150, 28, "Create match",
+                gfx.text("Open rooms", cx + 20, by + 12, 14, (255, 255, 255), bold=True)
+                button(cx + 20, by + 36, 150, 28, "Create room",
                        lambda: setattr(self, "cm_open", not self.cm_open), True)
+                button(cx + 180, by + 36, 120, 28, "Refresh",
+                       lambda: (g.net.start_discovery(), g.net.try_steam(), setattr(self, "status", "Looking for rooms...")), False)
 
                 # column header
                 hy = by + 68
@@ -505,8 +510,8 @@ class Menu:
                 vis = max(1, int((by + bh - 52 - ry0) // RH))
                 self.sb_scroll = max(0, min(self.sb_scroll, max(0, len(shown) - vis)))
                 if not shown:
-                    gfx.text("No servers found yet.", cx + cw / 2, ry0 + 40, 14, (150, 150, 150), bold=True, anchor="c")
-                    gfx.text("Host a LAN match, or ask a friend to - LAN servers show up here by themselves. Radmin VPN: use Join by IP.",
+                    gfx.text("No rooms found yet.", cx + cw / 2, ry0 + 40, 14, (150, 150, 150), bold=True, anchor="c")
+                    gfx.text("Create a room, or ask a friend to. Rooms use the AKBARENA3 marker (Spacewar-style). VPN: Join by IP still works.",
                              cx + cw / 2, ry0 + 64, 12, (110, 110, 110), anchor="c")
                 sel = next((r for r in shown if r["id"] == self.sb_sel), None)
                 if not sel:
@@ -519,16 +524,16 @@ class Menu:
                     hv = hover(cx, yy, cw, RH)
                     if is_sel:
                         gfx.rect(cx, yy, cw, RH, c255(38, 48, 30))
-                        gfx.rect(cx, yy, 3, RH, c255(157, 211, 103))
+                        gfx.rect(cx, yy, 3, RH, c255(235, 235, 235))
                     else:
                         gfx.rect(cx, yy, cw, RH, c255(30, 30, 30) if hv else (c255(21, 21, 21) if i % 2 else c255(17, 17, 17)))
-                    dot = (229, 57, 53) if full else ((66, 165, 245) if other else (157, 211, 103))
+                    dot = (229, 57, 53) if full else ((235, 235, 235) if other else (235, 235, 235))
                     gfx.rect(cx + 14, yy + 9, 8, 8, (dot[0] / 255, dot[1] / 255, dot[2] / 255, 1.0))
                     gfx.text(r["n"][:26], cx + cols[0][2], yy + 6, 13, (255, 255, 255), bold=is_sel, mono=True)
                     gfx.text(r["h"][:14], cx + cols[1][2], yy + 7, 12, (170, 170, 170), mono=True)
                     mp = r["map"]
                     gfx.text("none" if mp in ("none", "arena") else "custom_" + mp[:5], cx + cols[2][2], yy + 7, 12,
-                             (66, 165, 245) if other else (200, 200, 200), mono=True)
+                             (235, 235, 235) if other else (200, 200, 200), mono=True)
                     gfx.text("%d/%d" % (r["p"], r["m"]), cx + cols[3][2], yy + 7, 12,
                              (229, 57, 53) if full else (200, 200, 200), mono=True)
                     gfx.text("LAN", cx + cols[4][2], yy + 7, 12, (140, 140, 140), mono=True)
@@ -544,56 +549,7 @@ class Menu:
                     gfx.text("scroll for more (%d-%d of %d)" % (self.sb_scroll + 1, min(len(shown), self.sb_scroll + vis), len(shown)),
                              cx + cw - 20, by + bh - 74, 11, (110, 110, 110), anchor="r")
 
-                # bottom bar: Refresh / Connect
-                fy = by + bh - 46
-                gfx.rr(cx, fy, cw, 46, c255(22, 22, 22))
-                gfx.rect(cx, fy, cw, 1, c255(42, 42, 42))
-
-                def do_refresh():
-                    net.lan_rooms.clear()
-                    self.sb_scroll = 0
-
-                def do_connect():
-                    if sel and sel["p"] < sel["m"]:
-                        do_join(sel)
-                button(cx + 14, fy + 7, 110, 32, "Refresh", do_refresh)
-                ok_conn = bool(sel) and sel["p"] < sel["m"]
-                if ok_conn:
-                    button(cx + 134, fy + 7, 130, 32, "Connect", do_connect, True)
-                else:
-                    gfx.box(cx + 134, fy + 7, 130, 32, c255(20, 20, 20), c255(32, 32, 32))
-                    gfx.text("Connect", cx + 199, fy + 16, 13, (80, 80, 80), bold=True, anchor="c")
-                gfx.text("%d server%s" % (len(shown), "" if len(shown) == 1 else "s"), cx + cw - 20, fy + 16, 12, (140, 140, 140), anchor="r")
-
-                def do_join_ip():
-                    txt = self.ip.strip()
-                    if not txt:
-                        self.status = "Type the host's IP first (example: 26.12.34.56 or 192.168.1.20:27778)."
-                        return
-                    host_, _, prt_ = txt.partition(":")
-                    try:
-                        prt = int(prt_) if prt_ else NET_GAME_PORT
-                        host_ = socket.gethostbyname(host_.strip())
-                    except Exception:
-                        self.status = "Cannot use that address: " + txt
-                        return
-                    if not self.check_ready():
-                        return
-                    g.player_name = pname()
-                    g.P.name = g.player_name
-                    g.join_msg = ""
-                    g.net_join([(host_, prt)])
-                    self.status = g.join_msg or net.status
-                gfx.text("Join by IP", cx + 280, fy + 16, 12, (140, 140, 140))
-                field(cx + 354, fy + 7, 190, 32, "ip", "host IP[:port]")
-                button(cx + 554, fy + 7, 90, 32, "Join", do_join_ip)
-                if sel and sel["map"] != g.map_sig():
-                    have = sel["map"] not in ("none", "arena") and g.find_map_by_sig(sel["map"]) is not None
-                    gfx.text("Other map - you have it, it loads on join." if have else
-                             "Other map - you don't have it.", cx + 660, fy + 16, 11,
-                             (157, 211, 103) if have else (66, 165, 245))
-
-            # --- open dropdown lists (on top of everything) ---
+                # --- open dropdown lists (on top of everything) ---
             for (ox_, oy_, ow_, opts_, setter_, cur_) in overlays:
                 gfx.box(ox_, oy_, ow_, 32 * len(opts_) + 2, c255(17, 17, 17), c255(90, 90, 90))
                 for i, (lab, val) in enumerate(opts_):
@@ -606,7 +562,7 @@ class Menu:
             # --- status line (map loaded, join errors, connection progress) ---
             msg = net.status if net.mode else self.status
             bad = msg.startswith(("Denied", "Could", "Conn", "Lost", "The host", "Cannot", "Error"))
-            col = (66, 165, 245) if bad else (170, 170, 170)
+            col = (235, 235, 235) if bad else (170, 170, 170)
             if net.mode or bad:   # only show room status / errors, not the weapons-loaded text
                 lines = [msg[i:i + 56] for i in range(0, min(len(msg), 168), 56)]
                 tw = max(gfx.text_w(l, 12, False, True) for l in lines) + 32
@@ -617,40 +573,6 @@ class Menu:
                     gfx.text(l, tx + 16, ty + 9 + i * 17, 12, col if bad else (255, 255, 255), mono=True)
             if self.ms_open:
                 self.draw_map_select(LW, LH, hover, button)
-        elif self.page == "profile":
-            gfx.text("YOUR IDENTITY", cx, 32, 11, (119, 119, 119), bold=True)
-            gfx.text("Profile.", cx, 48, 34, (255, 255, 255), bold=True)
-            gfx.text("Change your username and profile picture.", cx, 96, 13, (154, 154, 154))
-            panel(cx, 128, cw, 250, "")
-            px, py = cx + 20, 176
-            gfx.box(px - 2, py - 2, 164, 164, c255(10, 10, 10), c255(42, 42, 42))
-            if self.pfp_tex:
-                gl.glEnable(gl.GL_TEXTURE_2D)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, self.pfp_tex)
-                gl.glColor4f(1, 1, 1, 1)
-                gl.glBegin(gl.GL_QUADS)
-                gl.glTexCoord2f(0, 0); gl.glVertex2f(px, py)
-                gl.glTexCoord2f(1, 0); gl.glVertex2f(px + 160, py)
-                gl.glTexCoord2f(1, 1); gl.glVertex2f(px + 160, py + 160)
-                gl.glTexCoord2f(0, 1); gl.glVertex2f(px, py + 160)
-                gl.glEnd()
-            else:
-                gfx.rect(px, py, 160, 160, c255(30, 30, 30))
-                gfx.text((self.name.strip() or "P")[0].upper(), px + 80, py + 44, 64, (150, 150, 150), bold=True, anchor="c")
-            gfx.text("USERNAME", cx + 210, 176, 11, (189, 189, 189), bold=True)
-            on = self.edit == "name"
-            gfx.box(cx + 210, 196, 300, 36, c255(10, 10, 10), c255(170, 170, 170) if on else c255(42, 42, 42))
-            shown = self.name if (self.name or on) else "Your name"
-            gfx.text(shown + ("|" if on and int(time.time() * 2) % 2 == 0 else ""), cx + 222, 204, 14,
-                     (255, 255, 255) if self.name else (110, 110, 110))
-            self.hot.append((cx + 210, 196, 300, 36, lambda: setattr(self, "edit", "name"), None))
-            gfx.text("PROFILE PICTURE", cx + 210, 252, 11, (189, 189, 189), bold=True)
-            button(cx + 210, 272, 150, 32, "Choose picture", self.pick_pfp)
-            button(cx + 372, 272, 110, 32, "Remove", self.clear_pfp)
-            if self.pfp_path:
-                gfx.text("File: " + Path(self.pfp_path).name[:40], cx + 210, 316, 12, (170, 170, 170))
-            if self.pfp_status:
-                gfx.text(self.pfp_status[:80], cx + 210, 336, 12, (66, 165, 245))
         elif self.page == "loadout":
             # Class screen: grid of weapon cards with live 3D model previews (same renderer as the Skins tab)
             gfx.text("CLASS", cx, 32, 11, (119, 119, 119), bold=True)
@@ -671,7 +593,7 @@ class Menu:
             # equipped summary strip
             gfx.text("EQUIPPED", cx, 134, 11, (119, 119, 119), bold=True)
             gfx.rect(cx, 154, cw, 44, c255(17, 17, 17))
-            gfx.rect(cx, 154, 4, 44, c255(66, 165, 245))
+            gfx.rect(cx, 154, 4, 44, c255(235, 235, 235))
             gfx.text(str(cur.n), cx + 20, 162, 20, (255, 255, 255), bold=True)
             gfx.text(str(cur.cls or "Weapon"), cx + 20 + gfx.text_w(str(cur.n), 20, True) + 12, 168, 12, (130, 130, 130))
             gfx.text("+ " + str(wl[kn].n) + "  (key 2)", cx + cw - 16, 168, 12, (154, 154, 154), anchor="r")
@@ -699,7 +621,7 @@ class Menu:
                 on = (i == g.primary) and not is_melee
                 hv = hover(x, y, cwd, chd) and not is_melee
                 gfx.box(x, y, cwd, chd, c255(26, 26, 26) if (on or hv) else c255(17, 17, 17),
-                        c255(66, 165, 245) if on else (c255(120, 120, 120) if hv else c255(42, 42, 42)))
+                        c255(235, 235, 235) if on else (c255(120, 120, 120) if hv else c255(42, 42, 42)))
                 inst = self.pv_weapon(w._m) if w._m else None
                 self.draw_card_preview(W, H, x + 2, y + 2, cwd - 4, pvh, "weapon", inst)
                 if inst is None:
@@ -710,7 +632,7 @@ class Menu:
                 gfx.text(str(w.cls or ("Melee" if is_melee else "Weapon")), x + 12, ty + 24, 11, (130, 130, 130))
                 if on:
                     gfx.rr(x + cwd - 84, ty + 2, 72, 18, c255(66, 165, 245, .18))
-                    gfx.text("EQUIPPED", x + cwd - 48, ty + 5, 10, (66, 165, 245), bold=True, anchor="c")
+                    gfx.text("EQUIPPED", x + cwd - 48, ty + 5, 10, (235, 235, 235), bold=True, anchor="c")
                 elif is_melee:
                     gfx.text("ALWAYS", x + cwd - 12, ty + 5, 10, (130, 130, 130), bold=True, anchor="r")
                 if is_melee:
@@ -723,7 +645,7 @@ class Menu:
                         gfx.text(lab.upper(), bx, by, 9, (110, 110, 110), bold=True)
                         gfx.rr(bx, by + 14, bw_, 5, c255(42, 42, 42))
                         gfx.rr(bx, by + 14, bw_ * max(.03, min(1.0, v)), 5,
-                                 c255(66, 165, 245) if on else c255(200, 200, 200))
+                                 c255(235, 235, 235) if on else c255(200, 200, 200))
                     self.hot.append((x, y, cwd, chd, lambda i=i: g.set_primary(i), None))
         elif self.page == "skins":
             gfx.text("YOUR KIT", cx, 32, 11, (119, 119, 119), bold=True)
@@ -819,7 +741,7 @@ class Menu:
                     kind = "player"
                 hv = hover(x, y, cw2, ch2)
                 gfx.box(x, y, cw2, ch2, c255(17, 17, 17) if not hv else c255(24, 24, 24),
-                        c255(66, 165, 245) if here else (c255(120, 120, 120) if hv else c255(42, 42, 42)))
+                        c255(235, 235, 235) if here else (c255(120, 120, 120) if hv else c255(42, 42, 42)))
                 self.draw_card_preview(W, H, x + 2, y + 2, cw2 - 4, 116, kind, inst)
                 gfx.rect(x + 2, y + 118, cw2 - 4, 1, c255(42, 42, 42))
                 if ar and name == "":
@@ -833,7 +755,7 @@ class Menu:
                     tags = [(f"{i + 1}  {w.n}"[:12], (1, 1, 1, .14), (230, 230, 230))
                             for i, w in enumerate(ws) if w._m == name]
                 elif ar:
-                    tags = [("EQUIPPED", (1, 1, 1, .14), (66, 165, 245))] if here else []
+                    tags = [("EQUIPPED", (1, 1, 1, .14), (235, 235, 235))] if here else []
                 else:
                     tags = [(TEAM_NAMES[0 if tk == "CT" else 1], team_tint(TEAM_CT) if tk == "CT" else team_tint(TEAM_T),
                              TEAM_CT if tk == "CT" else TEAM_T)
@@ -1024,6 +946,49 @@ class Menu:
             self.status = msg
         return True
 
+    def set_pfp_rgba(self, rgba, w, h, label="steam"):
+        """Build the profile texture from raw RGBA bytes (Steam avatar)."""
+        try:
+            arr = np.frombuffer(rgba, np.uint8).reshape(h, w, 4).copy()
+            # Steam avatars are top-down; OpenGL textures in this project expect the same as pygame tostring
+            if w != 256 or h != 256:
+                # nearest upscale via pygame for simplicity
+                surf = pygame.image.frombuffer(bytes(arr.data), (w, h), "RGBA").convert_alpha()
+                surf = pygame.transform.smoothscale(surf, (256, 256))
+                arr = np.frombuffer(pygame.image.tostring(surf, "RGBA", False), np.uint8).reshape(256, 256, 4)
+            tid = make_texture(arr, 256, 256)
+        except Exception as ex:
+            self.pfp_status = "Steam avatar failed: " + str(ex)[:50]
+            return False
+        if self.pfp_tex:
+            try:
+                gl.glDeleteTextures([self.pfp_tex])
+            except Exception:
+                pass
+        self.pfp_tex = tid
+        self.pfp_path = label
+        self.pfp_status = "Steam profile picture"
+        return True
+
+    def apply_steam_avatar(self, st, force: bool = False):
+        """Always use Steam persona + avatar for the *active* account."""
+        if not st or not getattr(st, "available", False):
+            return False
+        if st.persona:
+            self.name = st.persona[:24]
+        sid = int(getattr(st, "me", 0) or 0)
+        # Re-download when the account id changed or caller forces a refresh
+        if force or (sid and sid != getattr(self, "steam_id", 0)):
+            force = True
+        got = st.avatar(sid or None, force=force)
+        if not got:
+            return False
+        w, h, rgba = got
+        ok = self.set_pfp_rgba(rgba, w, h, label="steam")
+        if ok and sid:
+            self.steam_id = sid
+        return ok
+
     def set_pfp(self, path):
         try:
             surf = pygame.image.load(str(path)).convert_alpha()
@@ -1080,7 +1045,7 @@ class Menu:
         self.waiting = None
 
     def set_page(self, p):
-        if p == "online":           # the old Online tab lives inside Play now
+        if p in ("online", "profile"):  # profile removed — Steam name/pfp only
             p = "play"
         self.page = p
         self.ms_open = False
@@ -1488,7 +1453,7 @@ class Menu:
                 x, y = gx0 + c * (CW + GAP), gy0 + r * (card_h + GAP)
                 sel, hv = i == self.ms_sel, hover(x, y, CW, card_h)
                 gfx.rr(x - 3, y - 3, CW + 6, card_h + 6,
-                       c255(157, 211, 103) if sel else (c255(80, 80, 80) if hv else c255(36, 36, 36)), 8)
+                       c255(235, 235, 235) if sel else (c255(80, 80, 80) if hv else c255(36, 36, 36)), 8)
                 gfx.rr(x, y, CW, card_h, c255(24, 24, 24), 6)
                 if e.get("tex"):
                     gl.glEnable(gl.GL_TEXTURE_2D)
@@ -1513,7 +1478,7 @@ class Menu:
                 gfx.text(nm, x + 10, y + CH + 10, 14, (255, 255, 255), bold=True)
                 here = e["sig"] == cur
                 sub = "Loaded now" if here else "%.1f MB" % (e["sz"] / 1048576.0)
-                gfx.text(sub, x + 10, y + CH + 30, 11, (157, 211, 103) if here else (130, 130, 130))
+                gfx.text(sub, x + 10, y + CH + 30, 11, (235, 235, 235) if here else (130, 130, 130))
                 self.hot.append((x, y, CW, card_h, lambda i=i: self.ms_pick(i), None))
         if rows > rows_vis:
             gfx.text("Row %d-%d of %d  (mouse wheel / arrow keys)" % (self.ms_scroll + 1, min(rows, self.ms_scroll + rows_vis), rows),

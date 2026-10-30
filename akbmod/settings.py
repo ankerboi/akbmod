@@ -74,9 +74,10 @@ def load_settings(game, menu):
                 except Exception:
                     pass
         game.last_map_path = str(j.get("last_map", "") or "")
+        # Profile picture comes from Steam only (Profile tab removed)
         pf = j.get("pfp")
-        if pf and Path(pf).is_file():
-            menu.set_pfp(pf)
+        if pf and pf != "steam" and Path(str(pf)).is_file():
+            pass  # ignore saved local pfp — Steam avatar is applied after load
     except Exception:
         pass
 
